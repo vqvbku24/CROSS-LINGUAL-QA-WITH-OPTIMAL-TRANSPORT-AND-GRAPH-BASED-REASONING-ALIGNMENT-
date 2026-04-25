@@ -1,7 +1,6 @@
 # data_setup.py
 """
 Setup dataset và tokenizer cho Phase 1.
-Load từ LOCAL files trên Google Drive — không cần kết nối HuggingFace cho data.
 
 Cấu trúc thư mục giả định:
     MyDrive/
@@ -13,14 +12,6 @@ Cấu trúc thư mục giả định:
                 └── ViQuad v2/
                     └── UIT-ViQuAD 2.0/
                         └── train.json
-
-FIX so với phiên bản trước:
-    1. flatten_squad dùng sai với load_dataset().map() → crash
-       Giờ dùng _flatten_squad_json() đọc JSON thuần, không phụ thuộc HuggingFace datasets
-    2. ViQuAD local cùng format SQuAD → flatten chung 1 hàm, format đồng nhất
-    3. ListDataset wrapper để tương thích CrossLingualQADataset (ds[i], ds[i].get("title"))
-    4. FileNotFoundError rõ ràng thay vì crash ngầm
-    5. answer_start luôn là list[int] — đúng format process_qa_sample mong đợi
 """
 
 import os

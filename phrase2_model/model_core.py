@@ -1,10 +1,10 @@
 # model_core.py
 import torch
 import torch.nn as nn
-from modules.backbone import SharedBackbone
-from modules.gat_encoder import GATEncoder
-from modules.subsampling import conditional_subsample
-from modules.fgw_solver import fgw_bapg, partial_fgw
+from .modules.backbone import SharedBackbone
+from .modules.gat_encoder import GATEncoder
+from .modules.subsampling import conditional_subsample
+from .modules.fgw_solver import fgw_bapg, partial_fgw
 
 
 class CrossLingualOTModel(nn.Module):
