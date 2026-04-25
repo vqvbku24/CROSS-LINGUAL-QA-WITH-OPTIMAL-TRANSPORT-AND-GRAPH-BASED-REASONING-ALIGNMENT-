@@ -1,15 +1,4 @@
 # cross_lingual_dataset.py
-"""
-Dataset và DataLoader cho cross-lingual QA (Phase 1).
-
-Fixes so với phiên bản gốc:
-  1. __getitem__ trả về "en_question_end" — model_core._subsample cần trường này.
-  2. VI sample không còn random hoàn toàn: dùng topic-bucket pairing
-     (fallback về modulo nếu không có thông tin topic) để tránh học mapping vô lý.
-  3. process_fn signature mới có 5 return values (thêm question_end).
-  4. data_setup không bị import ở module level — dùng lazy loader.
-"""
-
 import inspect
 import random
 from importlib import import_module

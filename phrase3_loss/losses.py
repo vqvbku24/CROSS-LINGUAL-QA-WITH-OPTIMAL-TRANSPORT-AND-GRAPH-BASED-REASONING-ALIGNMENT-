@@ -25,6 +25,64 @@ from typing import Optional
 
 
 # ──────────────────────────────────────────────────────────────
+# Helper: Token-space → Graph-space position mapping (Fix Bug #1)
+# ──────────────────────────────────────────────────────────────
+
+def _remap_positions_to_graph_space(
+    en_start: torch.Tensor,    # (B,) token indices (0-511)
+    en_end: torch.Tensor,      # (B,) token indices (0-511)
+    keep_idx_en: torch.Tensor, # (B, K) mapping graph node → token index
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Chuyển đổi label từ vị trí token gốc (0-511) sang vị trí node
+    trong graph EN sau subsampling (0-K-1).
+
+    Với mỗi sample b:
+        - keep_idx_en[b, k] = token index của node thứ k trong graph.
+        - Tìm k sao cho keep_idx_en[b, k] == en_start[b] → gs_start[b] = k.
+        - Nếu không tìm thấy (lý thuyết không xảy ra khi subsampling đúng),
+          fallback về 0 (unanswerable).
+
+    Args:
+        en_start    : (B,) start positions trong token-space
+        en_end      : (B,) end   positions trong token-space
+        keep_idx_en : (B, K) bảng tra token index → graph node index
+
+    Returns:
+        gs_start: (B,) start positions trong graph-space
+        gs_end  : (B,) end   positions trong graph-space
+    """
+    B, K = keep_idx_en.shape
+    device = en_start.device
+
+    gs_start = torch.zeros(B, dtype=torch.long, device=device)
+    gs_end   = torch.zeros(B, dtype=torch.long, device=device)
+
+    for b in range(B):
+        s_tok = en_start[b].item()
+        e_tok = en_end[b].item()
+
+        # Unanswerable → giữ nguyên (0, 0)
+        if s_tok == 0 and e_tok == 0:
+            continue
+
+        # Tìm vị trí node tương ứng với token s_tok và e_tok
+        s_pos = (keep_idx_en[b] == s_tok).nonzero(as_tuple=True)[0]
+        e_pos = (keep_idx_en[b] == e_tok).nonzero(as_tuple=True)[0]
+
+        if len(s_pos) > 0 and len(e_pos) > 0:
+            gs_start[b] = s_pos[0]
+            gs_end[b]   = e_pos[0]
+        else:
+            # Fallback: answer token bị loại bởi subsampling (không nên xảy ra)
+            # → dùng 0 (unanswerable) để không gây index-out-of-range
+            gs_start[b] = 0
+            gs_end[b]   = 0
+
+    return gs_start, gs_end
+
+
+# ──────────────────────────────────────────────────────────────
 # QA Head
 # ──────────────────────────────────────────────────────────────
 
@@ -348,14 +406,15 @@ class OTAlignmentLoss(nn.Module):
                     "gamma"       : (B, K, K),
                     "en_node_emb" : (B, K, out_dim),
                     "vi_node_emb" : (B, K, out_dim),
-                    "D_en"        : (B, K, K),   ← cần thêm vào model_core
-                    "D_vi"        : (B, K, K),   ← cần thêm vào model_core
-                    "M"           : (B, K, K),   ← cần thêm vào model_core
+                    "D_en"        : (B, K, K),
+                    "D_vi"        : (B, K, K),
+                    "M"           : (B, K, K),
+                    "keep_idx_en" : (B, K),  ← token index của từng node EN (Fix Bug #1)
                 }
             batch: dict từ DataLoader
                 {
-                    "en_start_position": (B,),
-                    "en_end_position"  : (B,),
+                    "en_start_position": (B,) — token-space (0-511)
+                    "en_end_position"  : (B,) — token-space (0-511)
                     ...
                 }
 
@@ -367,49 +426,50 @@ class OTAlignmentLoss(nn.Module):
                 "span_proj": L_span_proj
                 "cons"     : L_consistency
         """
-        gamma       = model_outputs["gamma"]        # (B, K, K)
-        en_node_emb = model_outputs["en_node_emb"]  # (B, K, H)
-        vi_node_emb = model_outputs["vi_node_emb"]  # (B, K, H)
-        D_en        = model_outputs["D_en"]         # (B, K, K)
-        D_vi        = model_outputs["D_vi"]         # (B, K, K)
-        M           = model_outputs["M"]            # (B, K, K)
+        gamma        = model_outputs["gamma"]        # (B, K, K)
+        en_node_emb  = model_outputs["en_node_emb"]  # (B, K, H)
+        vi_node_emb  = model_outputs["vi_node_emb"]  # (B, K, H)
+        D_en         = model_outputs["D_en"]         # (B, K, K)
+        D_vi         = model_outputs["D_vi"]         # (B, K, K)
+        M            = model_outputs["M"]            # (B, K, K)
+        keep_idx_en  = model_outputs["keep_idx_en"]  # (B, K) — Fix Bug #1
 
-        en_start = batch["en_start_position"]  # (B,)
-        en_end   = batch["en_end_position"]    # (B,)
+        en_start = batch["en_start_position"]  # (B,) token-space
+        en_end   = batch["en_end_position"]    # (B,) token-space
 
         # ── 1. QA Head → logits ────────────────────────────────
         en_start_logits, en_end_logits = self.qa_head(en_node_emb)  # (B, K) each
         vi_start_logits, vi_end_logits = self.qa_head(vi_node_emb)  # (B, K) each
 
-        # ── 2. L_qa (supervised EN) ────────────────────────────
-        # Map en_start/en_end từ token-space sang K-node space
-        # (trong subsampling, keep_idx giữ thứ tự, nên dùng trực tiếp;
-        #  nếu cần map chính xác, truyền keep_idx_en từ model_core)
-        # Clamp để tránh index-out-of-range
-        en_start_clamped = en_start.clamp(0, self.K - 1)
-        en_end_clamped   = en_end.clamp(0, self.K - 1)
+        # ── 2. FIX BUG #1: Remap token-space → graph-space ────
+        # en_start/en_end là indices trong token-space (0-511).
+        # QA head hoạt động trên K nodes (0-K-1) nên phải remap.
+        en_start_gs, en_end_gs = _remap_positions_to_graph_space(
+            en_start, en_end, keep_idx_en
+        )
 
+        # ── 3. L_qa (supervised EN) — dùng graph-space indices ─
         l_qa = qa_loss(en_start_logits, en_end_logits,
-                       en_start_clamped, en_end_clamped)
+                       en_start_gs, en_end_gs)
 
-        # ── 3. L_fgw ──────────────────────────────────────────
+        # ── 4. L_fgw ──────────────────────────────────────────
         l_fgw = fgw_alignment_loss(gamma, D_en, D_vi, M, alpha=self.fgw_alpha)
 
-        # ── 4. L_span_proj (pseudo-label VI) ──────────────────
+        # ── 5. L_span_proj — pseudo-label VI, cũng dùng GS indices
         l_span = span_projection_loss(
             vi_start_logits, vi_end_logits,
-            gamma, en_start_clamped, en_end_clamped,
+            gamma, en_start_gs, en_end_gs,  # <--- graph-space indices
             K=self.K, max_span_len=self.max_span_len,
         )
 
-        # ── 5. L_consistency (KL EN↔VI, stop-grad EN) ─────────
+        # ── 6. L_consistency (KL EN↔VI, stop-grad EN) ─────────
         l_cons = consistency_loss(
             en_start_logits, en_end_logits,
             vi_start_logits, vi_end_logits,
             temperature=self.temperature,
         )
 
-        # ── 6. Tổng hợp ───────────────────────────────────────
+        # ── 7. Tổng hợp ───────────────────────────────────────
         l_total = (
             l_qa
             + self.lambda_fgw  * l_fgw
@@ -433,6 +493,17 @@ class OTAlignmentLoss(nn.Module):
 if __name__ == "__main__":
     torch.manual_seed(42)
     B, K, H = 2, 32, 64
+    MAX_TOKENS = 512  # token-space size
+
+    # Mock keep_idx_en: mỗi node map tới một token index ngẫu nhiên (không trùng)
+    # Đảm bảo token 5 và 10 (answer tokens) nằm trong graph để test remap
+    base_idx = torch.stack([
+        torch.randperm(MAX_TOKENS)[:K],  # sample 0: chứa token 5, 10
+        torch.randperm(MAX_TOKENS)[:K],  # sample 1: unanswerable, không cần
+    ])  # (B, K)
+    # Ép token 5 → node 3, token 10 → node 7 trong sample 0 (để test)
+    base_idx[0, 3] = 5
+    base_idx[0, 7] = 10
 
     # Mock model outputs
     mock_outputs = {
@@ -442,11 +513,12 @@ if __name__ == "__main__":
         "D_en"        : torch.rand(B, K, K),
         "D_vi"        : torch.rand(B, K, K),
         "M"           : torch.rand(B, K, K),
+        "keep_idx_en" : base_idx,         # (B, K) — Fix Bug #1
     }
 
-    # Mock batch
+    # Mock batch — positions trong token-space (0-511)
     mock_batch = {
-        "en_start_position": torch.tensor([5, 0]),   # sample 1 answerable, sample 2 không
+        "en_start_position": torch.tensor([5,  0]),   # sample 0: token 5, sample 1: unanswerable
         "en_end_position"  : torch.tensor([10, 0]),
     }
 
@@ -459,6 +531,6 @@ if __name__ == "__main__":
 
     # Backward pass
     losses["total"].backward()
-    print("\n✅ Backward pass OK — gradient flow hoạt động!")
-    print("  • L_qa, L_fgw, L_span_proj, L_consistency đều tính được.")
-    print("  • stop-gradient EN logits trong L_consistency: OK")
+    print("\n[OK] Backward pass OK -- gradient flow worked!")
+    print("  - L_qa, L_fgw, L_span_proj, L_consistency calculated.")
+    print("  - stop-gradient EN logits trong L_consistency: OK")

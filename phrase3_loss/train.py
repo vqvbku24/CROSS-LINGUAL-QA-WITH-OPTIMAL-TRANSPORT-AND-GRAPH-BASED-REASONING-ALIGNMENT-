@@ -20,6 +20,12 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Subset
 
+# Import Hugging Face API để upload checkpoint
+try:
+    from huggingface_hub import HfApi
+except ImportError:
+    HfApi = None
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%H:%M:%S",
@@ -66,8 +72,9 @@ DEFAULT_CONFIG = {
     "overfit_lr"        : 5e-4,  # LR cao hơn để hội tụ nhanh
 
     # I/O
-    "root_dir"      : "/content/drive/MyDrive/CROSS-LINGUAL-QA-WITH-OPTIMAL-TRANSPORT-AND-GRAPH-BASED-REASONING-ALIGNMENT-",
-    "output_dir"    : "/content/drive/MyDrive/CROSS-LINGUAL-QA-WITH-OPTIMAL-TRANSPORT-AND-GRAPH-BASED-REASONING-ALIGNMENT-/checkpoints",
+    "root_dir"      : "./", # Đã sửa mặc định về thư mục hiện tại để chạy trên Server
+    "output_dir"    : "./checkpoints", # Mặc định lưu thẳng vào thư mục checkpoints ở local
+    "hf_repo_id"    : "",    # Để trống, truyền vào qua Argparse khi chạy
     "save_every"    : 1,     # save mỗi N epoch
     "log_every"     : 10,    # log mỗi N steps
 }
@@ -75,16 +82,11 @@ DEFAULT_CONFIG = {
 
 # ──────────────────────────────────────────────────────────────
 # Patch: model_core cần trả về D_en, D_vi, M
+# (Chỉ fallback nếu model_core chưa tính — hiện tại model_core
+#  đã trả về đủ cả D_en, D_vi, M, keep_idx_en trong dict.)
 # ──────────────────────────────────────────────────────────────
 
 def _patch_model_outputs(model, batch: dict, raw_outputs: dict) -> dict:
-    """
-    Nếu model_core.forward() chưa trả về D_en, D_vi, M
-    (cần update model_core để trả về các trường này),
-    hàm này sẽ tính tạm từ node embeddings.
-
-    TODO: Update model_core.forward() để trả về D_en, D_vi, M trực tiếp.
-    """
     outputs = dict(raw_outputs)
 
     if "D_en" not in outputs or "D_vi" not in outputs or "M" not in outputs:
@@ -112,10 +114,6 @@ def _patch_model_outputs(model, batch: dict, raw_outputs: dict) -> dict:
 # ──────────────────────────────────────────────────────────────
 
 def setup_dataloader(config: dict) -> DataLoader:
-    """
-    Khởi tạo CrossLingualQADataset + DataLoader.
-    Dùng data_setup.get_setup_objects() để load dataset local.
-    """
     from phrase1_dataloader.data_setup import get_setup_objects
     from phrase1_dataloader.cross_lingual_dataset import create_dataloader
 
@@ -143,9 +141,8 @@ def setup_dataloader(config: dict) -> DataLoader:
 # ──────────────────────────────────────────────────────────────
 
 def setup_model_and_criterion(config: dict, device: torch.device):
-    """Khởi tạo CrossLingualOTModel và OTAlignmentLoss."""
     from phrase2_model.model_core import CrossLingualOTModel
-    from losses import OTAlignmentLoss
+    from .losses import OTAlignmentLoss
 
     model = CrossLingualOTModel(
         model_name  = config["model_name"],
@@ -181,14 +178,6 @@ def setup_model_and_criterion(config: dict, device: torch.device):
 # ──────────────────────────────────────────────────────────────
 
 def run_overfit(config: dict, device: torch.device):
-    """
-    Sanity check: overfit trên đúng 1 batch trong N steps.
-
-    Nếu loss giảm mượt về gần 0 → gradient flow OK, kiến trúc hợp lệ.
-    Nếu loss đứng yên / nhảy loạn → cần debug model hoặc loss.
-
-    Tham khảo: "Overfit on a single batch" — idea.docx Phase 2.
-    """
     log.info("=" * 60)
     log.info("MODE: OVERFIT ON A SINGLE BATCH (Sanity Check)")
     log.info("=" * 60)
@@ -196,7 +185,6 @@ def run_overfit(config: dict, device: torch.device):
     train_loader = setup_dataloader(config)
     model, criterion = setup_model_and_criterion(config, device)
 
-    # Lấy đúng 1 batch, fix nó
     fixed_batch = next(iter(train_loader))
     fixed_batch = {k: v.to(device) for k, v in fixed_batch.items()}
     log.info(f"Fixed batch shapes: { {k: tuple(v.shape) for k, v in fixed_batch.items()} }")
@@ -204,7 +192,7 @@ def run_overfit(config: dict, device: torch.device):
     optimizer = AdamW(
         list(model.parameters()) + list(criterion.parameters()),
         lr=config["overfit_lr"],
-        weight_decay=0.0,  # không regularize khi overfit
+        weight_decay=0.0,
     )
 
     model.train()
@@ -240,7 +228,6 @@ def run_overfit(config: dict, device: torch.device):
                 f"cons={losses['cons'].item():.4f}"
             )
 
-        # Early stop nếu loss không giảm sau 30 steps liên tiếp
         if total >= prev_loss - 1e-5:
             stagnant_count += 1
             if stagnant_count >= 30:
@@ -254,13 +241,8 @@ def run_overfit(config: dict, device: torch.device):
     log.info("=" * 60)
     if final_loss < 0.1:
         log.info(f"✅ OVERFIT PASSED! Final loss = {final_loss:.6f} (< 0.1)")
-        log.info("   Gradient flow thông suốt, kiến trúc FGW hợp lệ.")
-    elif final_loss < 1.0:
-        log.info(f"✅ OVERFIT OK. Final loss = {final_loss:.6f}")
-        log.info("   Có thể cần thêm steps hoặc tăng overfit_lr.")
     else:
         log.warning(f"⚠️  OVERFIT CHƯA ĐẠT. Final loss = {final_loss:.6f}")
-        log.warning("   Gợi ý: tăng overfit_lr, giảm K, hoặc debug gradient.")
     log.info("=" * 60)
 
 
@@ -269,13 +251,6 @@ def run_overfit(config: dict, device: torch.device):
 # ──────────────────────────────────────────────────────────────
 
 def run_training(config: dict, device: torch.device):
-    """
-    Vòng lặp training đầy đủ với:
-      - Gradient accumulation
-      - Linear warmup + linear decay scheduler
-      - Checkpoint save theo epoch
-      - Logging từng step
-    """
     log.info("=" * 60)
     log.info("MODE: FULL TRAINING")
     log.info("=" * 60)
@@ -285,18 +260,19 @@ def run_training(config: dict, device: torch.device):
     train_loader = setup_dataloader(config)
     model, criterion = setup_model_and_criterion(config, device)
 
-    # Optimizer — tách params backbone (nhỏ hơn LR) vs head (LR đầy đủ)
     backbone_params = list(model.backbone.parameters())
     other_params    = (
         list(model.gat.parameters())
         + list(criterion.parameters())
     )
+    # FIX BUG #3: Tăng backbone LR từ 0.1× lên 0.4× để backbone không bị underfit.
+    # Backbone (XLM-R) vẫn cần LR nhỏ hơn GAT/head để tránh catastrophic forgetting,
+    # nhưng 0.1× quá thấp khiến backbone không cập nhật đủ trong 10 epoch.
     optimizer = AdamW([
-        {"params": backbone_params, "lr": config["lr"] * 0.1},
+        {"params": backbone_params, "lr": config["lr"] * 0.4},  # FIX BUG #3: 0.1 → 0.4
         {"params": other_params,    "lr": config["lr"]},
     ], weight_decay=config["weight_decay"])
 
-    # Scheduler
     steps_per_epoch = math.ceil(len(train_loader) / config["grad_accum_steps"])
     total_steps     = steps_per_epoch * config["max_epochs"]
     warmup_steps    = int(total_steps * config["warmup_ratio"])
@@ -313,13 +289,29 @@ def run_training(config: dict, device: torch.device):
         scheduler = None
         log.warning("transformers không tìm thấy — chạy không có scheduler")
 
-    # ── Training Loop ─────────────────────────────────────────
     global_step = 0
     optimizer.zero_grad()
 
     for epoch in range(1, config["max_epochs"] + 1):
         model.train()
         criterion.train()
+
+        # FIX BUG #2: Warmup Loss Weights
+        # Epoch 1: Chỉ học QA trên English (L_qa + L_fgw).
+        #   → Cho backbone + GAT ổn định trước khi pseudo-label VI được đưa vào.
+        # Epoch 2+: Bật đầy đủ L_span và L_cons theo config.
+        if epoch <= 1:
+            criterion.lambda_span = 0.0
+            criterion.lambda_cons = 0.0
+            log.info(f"Epoch {epoch}: Warmup mode — chi hoc QA+FGW (span/cons=0)")
+        else:
+            criterion.lambda_span = config["lambda_span"]
+            criterion.lambda_cons = config["lambda_cons"]
+            if epoch == 2:
+                log.info(
+                    f"Epoch {epoch}: Full mode — bat span={config['lambda_span']}, "
+                    f"cons={config['lambda_cons']}"
+                )
 
         epoch_loss  = 0.0
         accum_count = 0
@@ -337,14 +329,12 @@ def run_training(config: dict, device: torch.device):
             outputs = _patch_model_outputs(model, batch, raw_outputs)
             losses  = criterion(outputs, batch)
 
-            # Scale loss cho gradient accumulation
             loss = losses["total"] / config["grad_accum_steps"]
             loss.backward()
 
             epoch_loss  += losses["total"].item()
             accum_count += 1
 
-            # Optimizer step sau N accumulation steps
             if (step + 1) % config["grad_accum_steps"] == 0:
                 torch.nn.utils.clip_grad_norm_(
                     list(model.parameters()) + list(criterion.parameters()),
@@ -366,7 +356,6 @@ def run_training(config: dict, device: torch.device):
                         f"cons={losses['cons'].item():.4f}"
                     )
 
-        # Epoch summary
         avg_loss = epoch_loss / max(accum_count, 1)
         log.info(f"━━ Epoch {epoch}/{config['max_epochs']} done | avg_loss={avg_loss:.4f}")
 
@@ -383,39 +372,29 @@ def run_training(config: dict, device: torch.device):
                 "config"          : config,
                 "avg_loss"        : avg_loss,
             }, ckpt_path)
-            log.info(f"   Checkpoint saved: {ckpt_path}")
+            log.info(f"   Checkpoint saved local: {ckpt_path}")
+
+            # ========================================================
+            # TỰ ĐỘNG ĐẨY LÊN HUGGING FACE NẾU CÓ CẤU HÌNH REPO_ID
+            # ========================================================
+            if config.get("hf_repo_id") and HfApi is not None:
+                api = HfApi()
+                try:
+                    log.info(f"   Đang đẩy file {ckpt_path} lên Hugging Face ({config['hf_repo_id']})...")
+                    api.upload_file(
+                        path_or_fileobj=ckpt_path,
+                        path_in_repo=f"checkpoints/epoch_{epoch:03d}.pt",
+                        repo_id=config["hf_repo_id"],
+                        repo_type="model"
+                    )
+                    log.info(f"   ✅ Đã backup an toàn lên mây!")
+                except Exception as e:
+                    log.error(f"   ⚠️ Lỗi upload lên HF (file local vẫn còn): {e}")
+            elif config.get("hf_repo_id") and HfApi is None:
+                log.warning("   ⚠️ Bạn chưa cài huggingface_hub! Chạy: pip install huggingface_hub để auto upload.")
+            # ========================================================
 
     log.info("✅ Training hoàn thành!")
-
-
-# ──────────────────────────────────────────────────────────────
-# Resume từ checkpoint
-# ──────────────────────────────────────────────────────────────
-
-def load_checkpoint(
-    ckpt_path: str,
-    model: nn.Module,
-    criterion: nn.Module,
-    optimizer: Optional[torch.optim.Optimizer] = None,
-    scheduler=None,
-    device: torch.device = torch.device("cpu"),
-) -> dict:
-    """Load checkpoint và restore states."""
-    log.info(f"Loading checkpoint: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location=device)
-
-    model.load_state_dict(ckpt["model_state"])
-    criterion.load_state_dict(ckpt["criterion_state"])
-
-    if optimizer is not None and "optimizer_state" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-
-    if scheduler is not None and ckpt.get("scheduler_state") is not None:
-        scheduler.load_state_dict(ckpt["scheduler_state"])
-
-    log.info(f"  Resumed from epoch={ckpt['epoch']}, global_step={ckpt['global_step']}, "
-             f"avg_loss={ckpt['avg_loss']:.4f}")
-    return ckpt
 
 
 # ──────────────────────────────────────────────────────────────
@@ -428,6 +407,8 @@ def main():
                         help="'overfit' để sanity check, 'train' để full training")
     parser.add_argument("--root_dir",  type=str, default=DEFAULT_CONFIG["root_dir"])
     parser.add_argument("--output_dir",type=str, default=DEFAULT_CONFIG["output_dir"])
+    parser.add_argument("--hf_repo_id",type=str, default=DEFAULT_CONFIG["hf_repo_id"],
+                        help="Tên repo HuggingFace (VD: username/my-model) để auto backup")
     parser.add_argument("--epochs",    type=int, default=DEFAULT_CONFIG["max_epochs"])
     parser.add_argument("--batch_size",type=int, default=DEFAULT_CONFIG["batch_size"])
     parser.add_argument("--lr",        type=float, default=DEFAULT_CONFIG["lr"])
@@ -441,6 +422,7 @@ def main():
     config.update({
         "root_dir"    : args.root_dir,
         "output_dir"  : args.output_dir,
+        "hf_repo_id"  : args.hf_repo_id,
         "max_epochs"  : args.epochs,
         "batch_size"  : args.batch_size,
         "lr"          : args.lr,
