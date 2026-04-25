@@ -40,8 +40,10 @@ def _remap_positions_to_graph_space(
     Với mỗi sample b:
         - keep_idx_en[b, k] = token index của node thứ k trong graph.
         - Tìm k sao cho keep_idx_en[b, k] == en_start[b] → gs_start[b] = k.
-        - Nếu không tìm thấy (lý thuyết không xảy ra khi subsampling đúng),
-          fallback về 0 (unanswerable).
+        - Nếu không tìm thấy (token bị loại khi subsampling) → dùng
+          nearest-neighbor: chọn node có token index gần nhất với answer token.
+          Cách này tốt hơn fallback về 0 vì (0,0) sẽ corrupt toàn bộ label
+          khiến loss kẹt ở log(K) ≈ 5.07.
 
     Args:
         en_start    : (B,) start positions trong token-space
@@ -49,35 +51,35 @@ def _remap_positions_to_graph_space(
         keep_idx_en : (B, K) bảng tra token index → graph node index
 
     Returns:
-        gs_start: (B,) start positions trong graph-space
-        gs_end  : (B,) end   positions trong graph-space
+        gs_start    : (B,) start positions trong graph-space
+        gs_end      : (B,) end   positions trong graph-space
     """
     B, K = keep_idx_en.shape
     device = en_start.device
 
-    gs_start = torch.zeros(B, dtype=torch.long, device=device)
-    gs_end   = torch.zeros(B, dtype=torch.long, device=device)
+    # Vectorised nearest-neighbour lookup
+    # keep_idx_en: (B, K) — float cast để dùng abs diff
+    keep_f = keep_idx_en.float()  # (B, K)
 
-    for b in range(B):
-        s_tok = en_start[b].item()
-        e_tok = en_end[b].item()
+    # start
+    s_diff  = (keep_f - en_start.float().unsqueeze(1)).abs()   # (B, K)
+    gs_start = s_diff.argmin(dim=1)                             # (B,)
 
-        # Unanswerable → giữ nguyên (0, 0)
-        if s_tok == 0 and e_tok == 0:
-            continue
+    # end
+    e_diff  = (keep_f - en_end.float().unsqueeze(1)).abs()     # (B, K)
+    gs_end   = e_diff.argmin(dim=1)                             # (B,)
 
-        # Tìm vị trí node tương ứng với token s_tok và e_tok
-        s_pos = (keep_idx_en[b] == s_tok).nonzero(as_tuple=True)[0]
-        e_pos = (keep_idx_en[b] == e_tok).nonzero(as_tuple=True)[0]
+    # Unanswerable (s=0, e=0) → giữ nguyên (0, 0)
+    unanswerable = (en_start == 0) & (en_end == 0)
+    gs_start = gs_start.masked_fill(unanswerable, 0)
+    gs_end   = gs_end.masked_fill(unanswerable, 0)
 
-        if len(s_pos) > 0 and len(e_pos) > 0:
-            gs_start[b] = s_pos[0]
-            gs_end[b]   = e_pos[0]
-        else:
-            # Fallback: answer token bị loại bởi subsampling (không nên xảy ra)
-            # → dùng 0 (unanswerable) để không gây index-out-of-range
-            gs_start[b] = 0
-            gs_end[b]   = 0
+    # Đảm bảo gs_start <= gs_end (tránh span bị đảo ngược)
+    swap_mask = gs_start > gs_end
+    gs_start, gs_end = (
+        torch.where(swap_mask, gs_end,   gs_start),
+        torch.where(swap_mask, gs_start, gs_end),
+    )
 
     return gs_start, gs_end
 
