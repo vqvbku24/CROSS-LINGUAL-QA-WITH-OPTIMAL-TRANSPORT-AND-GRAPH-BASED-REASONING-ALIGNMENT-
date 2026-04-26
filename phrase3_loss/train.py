@@ -46,7 +46,7 @@ DEFAULT_CONFIG = {
     "gat_out"       : 256,
     "gat_layers"    : 2,
     "fgw_alpha"     : 0.5,
-    "fgw_epsilon"   : 0.2,   # 0.01 → 0.1: làm mềm Sinkhorn, tránh exp(±∞)
+    "fgw_epsilon"   : 0.1,   # 0.01 → 0.1: làm mềm Sinkhorn, tránh exp(±∞)
     "use_partial"   : True,
     "partial_m"     : 0.85,
 
@@ -266,7 +266,7 @@ def run_overfit(config: dict, device: torch.device):
         if total >= prev_loss - 1e-5:
             stagnant_count += 1
             if stagnant_count >= 30:
-                log.warning("⚠️  Loss không giảm sau 30 steps liên tiếp — kiểm tra lại kiến trúc!")
+                log.warning("Loss không giảm sau 30 steps liên tiếp — kiểm tra lại kiến trúc")
                 break
         else:
             stagnant_count = 0
@@ -277,9 +277,9 @@ def run_overfit(config: dict, device: torch.device):
     final_sum  = final_qa + final_span
     log.info("=" * 60)
     if final_sum < 2.0:
-        log.info(f"✅ OVERFIT PASSED! qa={final_qa:.4f} span={final_span:.4f} (sum={final_sum:.4f} < 2.0)")
+        log.info(f"OVERFIT PASSED! qa={final_qa:.4f} span={final_span:.4f} (sum={final_sum:.4f} < 2.0)")
     else:
-        log.warning(f"⚠️  OVERFIT CHƯA ĐẠT. qa={final_qa:.4f} span={final_span:.4f} (sum={final_sum:.4f})")
+        log.warning(f"OVERFIT CHƯA ĐẠT. qa={final_qa:.4f} span={final_span:.4f} (sum={final_sum:.4f})")
     log.info("=" * 60)
 
     # Restore lambdas và unfreeze
@@ -426,8 +426,8 @@ def run_overfit_full(config: dict, device: torch.device):
             stagnant_count += 1
             if stagnant_count >= 30:
                 log.warning(
-                    "⚠️  Loss không giảm sau 30 steps liên tiếp — "
-                    "gradient explosion hay learning rate quá lớn?"
+                    "Loss không giảm sau 30 steps liên tiếp — "
+                    "gradient explosion hay learning rate quá lớn"
                 )
                 break
         else:
@@ -445,10 +445,10 @@ def run_overfit_full(config: dict, device: torch.device):
         f"span={final_span:.4f} | fgw={final_fgw:.4f} | cons={final_cons:.4f}"
     )
     if final_total < 3.0:
-        log.info("✅ OVERFIT_FULL: Loss giảm ổn định — kiến trúc joint training OK!")
+        log.info("OVERFIT_FULL: Loss giảm ổn định — kiến trúc joint training OK!")
     else:
         log.warning(
-            "⚠️  OVERFIT_FULL chưa đủ giảm. Kiểm tra gradient explosion "
+            "OVERFIT_FULL chưa đủ giảm. Kiểm tra gradient explosion "
             "(gn_bb / gn_other) và cân nhắc giảm lambda_fgw hoặc overfit_lr."
         )
     log.info("=" * 60)
@@ -469,10 +469,8 @@ def run_training(config: dict, device: torch.device):
     model, criterion = setup_model_and_criterion(config, device)
 
     backbone_params = list(model.backbone.parameters())
-    other_params    = (
-        list(model.gat.parameters())
-        + list(criterion.parameters())
-    )
+    other_params    = list(model.gat.parameters()) + list(criterion.parameters())
+    all_params      = backbone_params + other_params
     # FIX BUG #3: Tăng backbone LR từ 0.1× lên 0.4× để backbone không bị underfit.
     # Backbone (XLM-R) vẫn cần LR nhỏ hơn GAT/head để tránh catastrophic forgetting,
     # nhưng 0.1× quá thấp khiến backbone không cập nhật đủ trong 10 epoch.
@@ -504,28 +502,41 @@ def run_training(config: dict, device: torch.device):
         model.train()
         criterion.train()
 
-        # FIX BUG #2: Warmup Loss Weights
-        # Epoch 1: Chỉ học QA trên English (L_qa + L_fgw).
-        #   → Cho backbone + GAT ổn định trước khi pseudo-label VI được đưa vào.
-        # Epoch 2+: Bật đầy đủ L_span và L_cons theo config.
-        if epoch <= 1:
-            criterion.lambda_span = 0.0
-            criterion.lambda_cons = 0.0
-            log.info(f"Epoch {epoch}: Warmup mode — chi hoc QA+FGW (span/cons=0)")
+        # (Sẽ dùng step-based curriculum bên trong loop thay vì bật/tắt cứng theo Epoch)
+        if epoch == 1:
+            log.info(f"Epoch {epoch}: Bắt đầu Dual Annealing theo step...")
         else:
-            criterion.lambda_span = config["lambda_span"]
-            criterion.lambda_cons = config["lambda_cons"]
-            if epoch == 2:
-                log.info(
-                    f"Epoch {epoch}: Full mode — bat span={config['lambda_span']}, "
-                    f"cons={config['lambda_cons']}"
-                )
+            log.info(f"Epoch {epoch}: Duy trì max lambdas (trừ khi warmup chưa xong).")
 
         epoch_loss  = 0.0
         accum_count = 0
 
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
+
+            # ── Curriculum Learning — Dual Annealing (cho Full Train) ──────
+            # Tính theo global_step thay vì epoch để trơn tru hơn.
+            # Giả sử 1 epoch ~ 889 steps (7115 batches / 8).
+            # FGW: 0 → max trong 500 steps đầu.
+            # Cons, Span: 0 → max trong 1000 steps đầu (bật muộn hơn).
+            # ───────────────────────────────────────────────────────────────
+            current_step = global_step + 1 # offset by 1 for math
+            
+            # FGW schedule (warmup 500 steps)
+            if current_step <= 500:
+                criterion.lambda_fgw = config["lambda_fgw"] * (current_step / 500.0)
+            else:
+                criterion.lambda_fgw = config["lambda_fgw"]
+                
+            # Span & Cons schedule (warmup 1000 steps)
+            _cons_max = 0.1 # Cap giống như overfit để tránh KL diverge
+            if current_step <= 1000:
+                ratio = current_step / 1000.0
+                criterion.lambda_span = config["lambda_span"] * ratio
+                criterion.lambda_cons = _cons_max * ratio
+            else:
+                criterion.lambda_span = config["lambda_span"]
+                criterion.lambda_cons = _cons_max
 
             # Forward
             try:
@@ -544,16 +555,18 @@ def run_training(config: dict, device: torch.device):
             accum_count += 1
 
             if (step + 1) % config["grad_accum_steps"] == 0:
-                # Clip riêng từng group — tránh backbone (53K) + GAT (21K)
-                # crush QA head (1.0) khi joint clipping với max_norm=1.0
+                # Clip riêng từng group
                 torch.nn.utils.clip_grad_norm_(
-                    list(model.backbone.parameters()),
-                    config["max_grad_norm"] * 0.5,   # backbone: 0.5 (catastrophic forgetting)
+                    backbone_params,
+                    config["max_grad_norm"] * 0.5,   # backbone: 0.5
                 )
                 torch.nn.utils.clip_grad_norm_(
-                    list(model.gat.parameters()) + list(criterion.parameters()),
+                    other_params,
                     config["max_grad_norm"],           # GAT + QA head: 1.0
                 )
+                # Liều safety net cuối cùng (học từ overfit)
+                torch.nn.utils.clip_grad_norm_(all_params, config["max_grad_norm"])
+                
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
@@ -601,14 +614,14 @@ def run_training(config: dict, device: torch.device):
                         repo_id=config["hf_repo_id"],
                         repo_type="model"
                     )
-                    log.info(f"   ✅ Đã backup an toàn lên mây!")
+                    log.info(f" Đã backup an toàn lên mây!")
                 except Exception as e:
-                    log.error(f"   ⚠️ Lỗi upload lên HF (file local vẫn còn): {e}")
+                    log.error(f" Lỗi upload lên HF (file local vẫn còn): {e}")
             elif config.get("hf_repo_id") and HfApi is None:
-                log.warning("   ⚠️ Bạn chưa cài huggingface_hub! Chạy: pip install huggingface_hub để auto upload.")
+                log.warning(" Bạn chưa cài huggingface_hub! Chạy: pip install huggingface_hub để auto upload.")
             # ========================================================
 
-    log.info("✅ Training hoàn thành!")
+    log.info("Training hoàn thành!")
 
 
 # ──────────────────────────────────────────────────────────────
