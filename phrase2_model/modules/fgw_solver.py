@@ -149,8 +149,8 @@ def partial_fgw(
     D_en: torch.Tensor,
     D_vi: torch.Tensor,
     m: float = 0.85,
-    nb_dummies: int = 100,
-    tol: float = 1e-6,
+    nb_dummies: int = 10,
+    tol: float = 1e-5,
 ) -> torch.Tensor:
     """
     Partial Gromov-Wasserstein — cho phép reject (1-m) phần node.
@@ -171,36 +171,55 @@ def partial_fgw(
     C1 = _to_numpy(D_en)
     C2 = _to_numpy(D_vi)
 
-    try:
-        # POT >= 0.9: dùng ot.gromov namespace
-        gamma_np = ot.gromov.partial_gromov_wasserstein(
-            C1=C1,
-            C2=C2,
-            p=p,
-            q=q,
-            m=m,
-            loss_fun='square_loss',
-            nb_dummies=nb_dummies, # Đã dùng tham số
-            log=False,
-            verbose=False,
-            numItermax=100000,     # Tăng limit lên 100k để tránh UserWarning
-            tol=tol,
-        )
-    except AttributeError:
-        # POT cũ hơn: fallback sang ot.partial namespace
-        gamma_np = ot.partial.partial_gromov_wasserstein(
-            C1=C1,
-            C2=C2,
-            p=p,
-            q=q,
-            m=m,
-            loss_fun='square_loss',
-            nb_dummies=nb_dummies, # FIX LỖI HARDCODE: Thay 1 bằng nb_dummies
-            log=False,
-            verbose=False,
-            numItermax=100000,     # Tăng limit lên 100k
-            tol=tol,
-        )
+    # Thử nhiều cấu hình khác nhau nếu bị lỗi EMD resolution
+    # Bắt đầu với cấu hình an toàn hơn (numItermax=10000) so với 1000 ban đầu
+    configs = [
+        {"nb_dummies": nb_dummies, "numItermax": 10000},
+        {"nb_dummies": nb_dummies * 5, "numItermax": 50000},
+        {"nb_dummies": nb_dummies * 10, "numItermax": 100000},
+    ]
+
+    gamma_np = None
+    for config in configs:
+        try:
+            try:
+                # POT >= 0.9: dùng ot.gromov namespace
+                gamma_np = ot.gromov.partial_gromov_wasserstein(
+                    C1=C1,
+                    C2=C2,
+                    p=p,
+                    q=q,
+                    m=m,
+                    loss_fun='square_loss',
+                    nb_dummies=config["nb_dummies"],
+                    log=False,
+                    verbose=False,
+                    numItermax=config["numItermax"],
+                    tol=tol,
+                )
+            except AttributeError:
+                # POT cũ hơn: fallback sang ot.partial namespace
+                gamma_np = ot.partial.partial_gromov_wasserstein(
+                    C1=C1,
+                    C2=C2,
+                    p=p,
+                    q=q,
+                    m=m,
+                    loss_fun='square_loss',
+                    nb_dummies=config["nb_dummies"],
+                    log=False,
+                    verbose=False,
+                    numItermax=config["numItermax"],
+                    tol=tol,
+                )
+            break  # Thành công, thoát vòng lặp
+        except ValueError as e:
+            if "dummy points" in str(e) or "EMD" in str(e):
+                continue # Thử cấu hình tiếp theo
+            raise e # Lỗi khác, ném ra
+    
+    if gamma_np is None:
+        raise ValueError(f"Failed to solve partial FGW even after increasing nb_dummies up to {configs[-1]['nb_dummies']}")
 
     # gamma_np có thể có shape (K + nb_dummies, K + nb_dummies) → slice về (K, K)
     gamma_np = gamma_np[:K, :K]
