@@ -83,20 +83,25 @@ class CrossLingualOTModel(nn.Module):
                 torch.nn.functional.normalize(vi_emb, dim=-1).T
             )  # (K, K)
 
-            if self.use_partial:
-                gamma = partial_fgw(D_en, D_vi, m=self.partial_m, nb_dummies=100)
-            else:
-                gamma = fgw_bapg(D_en, D_vi, M,
-                                 alpha=self.fgw_alpha,
-                                 epsilon=self.fgw_epsilon)
-
-            batch_gamma.append(gamma)
             batch_en_emb.append(en_emb)
             batch_vi_emb.append(vi_emb)
             batch_D_en.append(D_en)
             batch_D_vi.append(D_vi)
             batch_M.append(M)
             batch_keep_en.append(en_keep)   # (K,) LongTensor — token indices EN
+
+        # Parallelize FGW solving over the batch to save time
+        from concurrent.futures import ThreadPoolExecutor
+        
+        def solve_fgw(i):
+            if self.use_partial:
+                return partial_fgw(batch_D_en[i], batch_D_vi[i], m=self.partial_m, nb_dummies=50)
+            else:
+                return fgw_bapg(batch_D_en[i], batch_D_vi[i], batch_M[i],
+                                alpha=self.fgw_alpha, epsilon=self.fgw_epsilon)
+
+        with ThreadPoolExecutor(max_workers=min(B, 8)) as executor:
+            batch_gamma = list(executor.map(solve_fgw, range(B)))
 
         return {
             "gamma"       : torch.stack(batch_gamma),        # (B, K, K)

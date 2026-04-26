@@ -32,7 +32,17 @@ def conditional_subsample(
 
     forced = list(dict.fromkeys(question_indices + answer_indices))  # dedup, preserve order
     if len(forced) > K:
-        raise ValueError(f"Số forced tokens ({len(forced)}) > K ({K}). Tăng K lên.")
+        # Ưu tiên giữ lại toàn bộ answer_indices và [CLS] (index 0)
+        ans_set = set(answer_indices)
+        ans_and_cls = [idx for idx in forced if idx in ans_set or idx == 0]
+        
+        # Nếu riêng answer_indices + [CLS] đã lớn hơn K, đành cắt bớt answer
+        if len(ans_and_cls) > K:
+            forced = ans_and_cls[:K]
+        else:
+            # Lấp đầy phần còn thiếu bằng các question tokens
+            remaining = [idx for idx in forced if idx not in ans_and_cls]
+            forced = ans_and_cls + remaining[:K - len(ans_and_cls)]
 
     forced_tensor = torch.tensor(forced, device=device, dtype=torch.long)
     num_needed = K - len(forced)

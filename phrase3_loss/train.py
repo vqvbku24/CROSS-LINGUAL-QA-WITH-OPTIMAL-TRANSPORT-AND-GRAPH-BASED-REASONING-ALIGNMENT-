@@ -10,6 +10,10 @@ Gồm hai chế độ:
 
 import os
 import sys
+
+# Add project root directory to sys.path to enable importing modules like phrase1_dataloader and phrase2_model
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import math
 import argparse
 import logging
@@ -41,13 +45,13 @@ log = logging.getLogger(__name__)
 DEFAULT_CONFIG = {
     # Model
     "model_name"    : "xlm-roberta-base",
-    "K"             : 160,
+    "K"             : 64,        # 160→64: FGW nhanh hơn ~15× (O(K³))
     "gat_hidden"    : 512,
     "gat_out"       : 256,
     "gat_layers"    : 2,
     "fgw_alpha"     : 0.5,
     "fgw_epsilon"   : 0.1,   # 0.01 → 0.1: làm mềm Sinkhorn, tránh exp(±∞)
-    "use_partial"   : True,
+    "use_partial"   : False,     # dùng BAPG thay network simplex → GPU-friendly
     "partial_m"     : 0.85,
 
     # Loss weights
@@ -59,8 +63,9 @@ DEFAULT_CONFIG = {
 
     # Training
     "batch_size"        : 4,    # nhỏ vì FGW tốn memory
-    "grad_accum_steps"  : 8,    # effective batch = 32
-    "lr"                : 2e-5,
+    "grad_accum_steps"  : 4,    # effective batch=16, log nhiều hơn để debug
+    "lr"                : 1e-5, # lr cho backbone
+    "head_lr"           : 1e-4, # lr cho GAT và QA head
     "weight_decay"      : 0.01,
     "warmup_ratio"      : 0.06,  # 6% tổng steps
     "max_epochs"        : 10,
@@ -72,8 +77,8 @@ DEFAULT_CONFIG = {
     "overfit_lr"        : 5e-4,  # LR cao hơn để hội tụ nhanh
 
     # I/O
-    "root_dir"      : "./", # Đã sửa mặc định về thư mục hiện tại để chạy trên Server
-    "output_dir"    : "./checkpoints", # Mặc định lưu thẳng vào thư mục checkpoints ở local
+    "root_dir"      : os.path.dirname(os.path.dirname(os.path.abspath(__file__))), # Absolute path to project root
+    "output_dir"    : os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "checkpoints"), # Absolute path to checkpoints
     "hf_repo_id"    : "",    # Để trống, truyền vào qua Argparse khi chạy
     "save_every"    : 1,     # save mỗi N epoch
     "log_every"     : 10,    # log mỗi N steps
@@ -154,7 +159,7 @@ def setup_dataloader(config: dict) -> DataLoader:
 
 def setup_model_and_criterion(config: dict, device: torch.device):
     from phrase2_model.model_core import CrossLingualOTModel
-    from .losses import OTAlignmentLoss
+    from phrase3_loss.losses import OTAlignmentLoss
 
     model = CrossLingualOTModel(
         model_name  = config["model_name"],
@@ -471,12 +476,11 @@ def run_training(config: dict, device: torch.device):
     backbone_params = list(model.backbone.parameters())
     other_params    = list(model.gat.parameters()) + list(criterion.parameters())
     all_params      = backbone_params + other_params
-    # FIX BUG #3: Tăng backbone LR từ 0.1× lên 0.4× để backbone không bị underfit.
-    # Backbone (XLM-R) vẫn cần LR nhỏ hơn GAT/head để tránh catastrophic forgetting,
-    # nhưng 0.1× quá thấp khiến backbone không cập nhật đủ trong 10 epoch.
+    
+    # Sử dụng LR phân tách: 1e-5 cho backbone, 1e-4 cho GAT/QA head (như overfit_full)
     optimizer = AdamW([
-        {"params": backbone_params, "lr": config["lr"] * 0.4},  # FIX BUG #3: 0.1 → 0.4
-        {"params": other_params,    "lr": config["lr"]},
+        {"params": backbone_params, "lr": config.get("lr", 1e-5)}, 
+        {"params": other_params,    "lr": config.get("head_lr", 1e-4)},
     ], weight_decay=config["weight_decay"])
 
     steps_per_epoch = math.ceil(len(train_loader) / config["grad_accum_steps"])
@@ -495,10 +499,39 @@ def run_training(config: dict, device: torch.device):
         scheduler = None
         log.warning("transformers không tìm thấy — chạy không có scheduler")
 
+    start_epoch = 1
     global_step = 0
     optimizer.zero_grad()
 
-    for epoch in range(1, config["max_epochs"] + 1):
+    if config.get("resume_from"):
+        if os.path.exists(config["resume_from"]):
+            log.info(f"Loading checkpoint from {config['resume_from']}...")
+            checkpoint = torch.load(config["resume_from"], map_location=device)
+            model.load_state_dict(checkpoint["model_state"])
+            criterion.load_state_dict(checkpoint["criterion_state"])
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+            if scheduler is not None and checkpoint.get("scheduler_state") is not None:
+                scheduler.load_state_dict(checkpoint["scheduler_state"])
+            start_epoch = checkpoint.get("epoch", 0) + 1
+            global_step = checkpoint.get("global_step", 0)
+            log.info(f"Resumed from epoch {checkpoint.get('epoch')}, global step {global_step}")
+        else:
+            log.warning(f"Checkpoint not found at {config['resume_from']}, starting from scratch.")
+
+    # Scale curriculum delay theo dataset size (tránh hardcode)
+    _SPE = steps_per_epoch
+    _FGW_DELAY,  _FGW_WARMUP  = _SPE // 2,  _SPE
+    _SPAN_DELAY, _SPAN_WARMUP = _SPE,        _SPE
+    _CONS_DELAY, _CONS_WARMUP = _SPE * 2,   _SPE // 2
+    _CONS_MAX = 0.1
+    log.info(
+        f"Curriculum delays (steps): "
+        f"FGW={_FGW_DELAY}→{_FGW_DELAY+_FGW_WARMUP} | "
+        f"Span={_SPAN_DELAY}→{_SPAN_DELAY+_SPAN_WARMUP} | "
+        f"Cons={_CONS_DELAY}→{_CONS_DELAY+_CONS_WARMUP}"
+    )
+
+    for epoch in range(start_epoch, config["max_epochs"] + 1):
         model.train()
         criterion.train()
 
@@ -515,28 +548,33 @@ def run_training(config: dict, device: torch.device):
             batch = {k: v.to(device) for k, v in batch.items()}
 
             # ── Curriculum Learning — Dual Annealing (cho Full Train) ──────
-            # Tính theo global_step thay vì epoch để trơn tru hơn.
-            # Giả sử 1 epoch ~ 889 steps (7115 batches / 8).
-            # FGW: 0 → max trong 500 steps đầu.
-            # Cons, Span: 0 → max trong 1000 steps đầu (bật muộn hơn).
+            # Phase 1 (step 1–200)   : chỉ L_qa — backbone + GAT ổn định trước
+            # Phase 2 (step 201–500) : bật FGW dần (γ bắt đầu có ý nghĩa)
+            # Phase 3 (step 501+)    : bật Span (cần γ tốt để project đúng)
+            # Phase 4 (step 1001+)   : bật Cons (cần cả 2 nhánh đã học tạm)
             # ───────────────────────────────────────────────────────────────
-            current_step = global_step + 1 # offset by 1 for math
-            
-            # FGW schedule (warmup 500 steps)
-            if current_step <= 500:
-                criterion.lambda_fgw = config["lambda_fgw"] * (current_step / 500.0)
+            current_step = global_step + 1
+
+            if current_step <= _FGW_DELAY:
+                criterion.lambda_fgw = 0.0
+            elif current_step <= _FGW_DELAY + _FGW_WARMUP:
+                criterion.lambda_fgw = config["lambda_fgw"] * (current_step - _FGW_DELAY) / _FGW_WARMUP
             else:
                 criterion.lambda_fgw = config["lambda_fgw"]
-                
-            # Span & Cons schedule (warmup 1000 steps)
-            _cons_max = 0.1 # Cap giống như overfit để tránh KL diverge
-            if current_step <= 1000:
-                ratio = current_step / 1000.0
-                criterion.lambda_span = config["lambda_span"] * ratio
-                criterion.lambda_cons = _cons_max * ratio
+
+            if current_step <= _SPAN_DELAY:
+                criterion.lambda_span = 0.0
+            elif current_step <= _SPAN_DELAY + _SPAN_WARMUP:
+                criterion.lambda_span = config["lambda_span"] * (current_step - _SPAN_DELAY) / _SPAN_WARMUP
             else:
                 criterion.lambda_span = config["lambda_span"]
-                criterion.lambda_cons = _cons_max
+
+            if current_step <= _CONS_DELAY:
+                criterion.lambda_cons = 0.0
+            elif current_step <= _CONS_DELAY + _CONS_WARMUP:
+                criterion.lambda_cons = _CONS_MAX * (current_step - _CONS_DELAY) / _CONS_WARMUP
+            else:
+                criterion.lambda_cons = _CONS_MAX
 
             # Forward
             try:
@@ -580,7 +618,8 @@ def run_training(config: dict, device: torch.device):
                         f"qa={losses['qa'].item():.4f} | "
                         f"fgw={losses['fgw'].item():.4f} | "
                         f"span={losses['span_proj'].item():.4f} | "
-                        f"cons={losses['cons'].item():.4f}"
+                        f"cons={losses['cons'].item():.4f} | "
+                        f"λ=({criterion.lambda_fgw:.3f},{criterion.lambda_span:.3f},{criterion.lambda_cons:.3f})"
                     )
 
         avg_loss = epoch_loss / max(accum_count, 1)
@@ -643,6 +682,8 @@ def main():
     parser.add_argument("--K",         type=int, default=DEFAULT_CONFIG["K"])
     parser.add_argument("--use_full",  action="store_true",
                         help="dùng fgw_bapg thay vì partial_fgw")
+    parser.add_argument("--resume_from", type=str, default="",
+                        help="Path to checkpoint (e.g. ./checkpoints/epoch_001.pt) to resume training")
     args = parser.parse_args()
 
     config = dict(DEFAULT_CONFIG)
@@ -653,9 +694,11 @@ def main():
         "max_epochs"  : args.epochs,
         "batch_size"  : args.batch_size,
         "lr"          : args.lr,
+        "head_lr"     : DEFAULT_CONFIG["head_lr"],
         "overfit_steps": args.overfit_steps,
         "K"           : args.K,
         "use_partial" : not args.use_full,
+        "resume_from" : args.resume_from,
     })
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
