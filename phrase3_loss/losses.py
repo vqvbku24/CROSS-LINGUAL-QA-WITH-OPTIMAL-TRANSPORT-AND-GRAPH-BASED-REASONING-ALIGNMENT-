@@ -230,11 +230,18 @@ def fgw_alignment_loss(
 
     L_fgw = alpha * GW_cost + (1 - alpha) * W_cost
 
+    Gradient flow (Danskin's Theorem):
+        g  (transport plan) : DETACH — coi như hằng số tối ưu, không backprop
+                              qua Sinkhorn iterations (tránh chain-rule explosion).
+        C1, C2 (geometry)   : DETACH — đã detach từ _patch_model_outputs.
+        M  (EN↔VI cost)     : GIỮ GRADIENT — toàn bộ signal FGW dồn vào đây,
+                              kéo embedding EN và VI lại gần nhau một cách sạch sẽ.
+
     Args:
         gamma: (B, K, K) transport plan (từ model_core)
-        D_en : (B, K, K) distance matrix EN
-        D_vi : (B, K, K) distance matrix VI
-        M    : (B, K, K) feature cost matrix (cosine dist EN↔VI)
+        D_en : (B, K, K) distance matrix EN  [đã detach]
+        D_vi : (B, K, K) distance matrix VI  [đã detach]
+        M    : (B, K, K) feature cost matrix (cosine dist EN↔VI)  [có grad]
         alpha: weight GW vs Wasserstein
 
     Returns:
@@ -244,15 +251,22 @@ def fgw_alignment_loss(
     losses = []
 
     for b in range(B):
-        g  = gamma[b]   # (K, K)
-        C1 = D_en[b]    # (K, K)
-        C2 = D_vi[b]    # (K, K)
-        m  = M[b]       # (K, K)
+        # ── Danskin's Theorem ────────────────────────────────────────────
+        # g là nghiệm tối ưu của bài toán OT (Sinkhorn). Theo định lý Danskin,
+        # đạo hàm của min_g F(g, θ) theo θ = ∂F/∂θ|_{g=g*}, không cần
+        # backprop qua quá trình tìm g*. Detach ngay tại đây.
+        g  = gamma[b].detach()  # (K, K) — HẰNG SỐ, không có grad_fn
+        # ────────────────────────────────────────────────────────────────
+        C1 = D_en[b]    # (K, K) — đã detach từ _patch_model_outputs
+        C2 = D_vi[b]    # (K, K) — đã detach từ _patch_model_outputs
+        m  = M[b]       # (K, K) — GIỮ GRADIENT (EN↔VI cosine dist)
 
-        # Wasserstein term: <M, gamma>
+        # Wasserstein term: <M, g>  — gradient chảy qua m (= M[b])
         w_loss = (m * g).sum()
 
         # GW term (efficient formulation):
+        # C1, C2, g đều là hằng số → gw1, gw2, gw3 không có grad_fn
+        # Ngoại trừ w_loss, toàn bộ GW term = hằng số (offset không ảnh hưởng grad)
         p = g.sum(dim=1)  # (K,) marginal EN
         q = g.sum(dim=0)  # (K,) marginal VI
 
