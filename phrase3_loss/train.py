@@ -46,7 +46,7 @@ DEFAULT_CONFIG = {
     "gat_out"       : 256,
     "gat_layers"    : 2,
     "fgw_alpha"     : 0.5,
-    "fgw_epsilon"   : 0.01,
+    "fgw_epsilon"   : 0.2,   # 0.01 → 0.1: làm mềm Sinkhorn, tránh exp(±∞)
     "use_partial"   : True,
     "partial_m"     : 0.85,
 
@@ -68,7 +68,7 @@ DEFAULT_CONFIG = {
     "pairing_strategy"  : "topic",
 
     # Overfit test
-    "overfit_steps"     : 150,
+    "overfit_steps"     : 200,
     "overfit_lr"        : 5e-4,  # LR cao hơn để hội tụ nhanh
 
     # I/O
@@ -94,15 +94,27 @@ def _patch_model_outputs(model, batch: dict, raw_outputs: dict) -> dict:
         vi_emb = outputs["vi_node_emb"]  # (B, K, H)
         B = en_emb.size(0)
 
+        # ── L2-normalize trước khi tính cdist ────────────────────────────
+        # Không chuẩn hóa → cdist có thể = 50~200 → exp(-C/ε) → ±∞
+        #   → gradient FGW vọt lên 55k.
+        # Sau khi normalize: ||v||=1 → cdist ∈ [0, 2] → exp(-C/ε) ∈ [e^{-20}, 1]
+        #   → Sinkhorn ổn định hoàn toàn, gradient thuần hóa.
+        # ─────────────────────────────────────────────────────────────────
+        en_emb_norm = nn.functional.normalize(en_emb, p=2, dim=-1)
+        vi_emb_norm = nn.functional.normalize(vi_emb, p=2, dim=-1)
+
         D_en_list, D_vi_list, M_list = [], [], []
         for b in range(B):
-            D_en_list.append(torch.cdist(en_emb[b], en_emb[b], p=2))
-            D_vi_list.append(torch.cdist(vi_emb[b], vi_emb[b], p=2))
-            en_norm = nn.functional.normalize(en_emb[b], dim=-1)
-            vi_norm = nn.functional.normalize(vi_emb[b], dim=-1)
-            M_list.append(1.0 - en_norm @ vi_norm.T)
+            # D_en / D_vi: DETACH — đây là "cost geometry" của graph (cấu trúc),
+            # không cần backprop qua. Nếu để grad, C1 @ g @ C2.T trong fgw_alignment_loss
+            # tạo luồng gradient O(K³) ngược về backbone → gn_bb vọt lên 14k+.
+            # Chỉ M (cross-language cosine distance) giữ grad → kéo EN↔VI lại gần.
+            D_en_list.append(torch.cdist(en_emb_norm[b], en_emb_norm[b], p=2).detach())
+            D_vi_list.append(torch.cdist(vi_emb_norm[b], vi_emb_norm[b], p=2).detach())
+            # Cosine distance dùng normalized vector: 1 - cos(u,v) ∈ [0, 2]
+            M_list.append(1.0 - en_emb_norm[b] @ vi_emb_norm[b].T)
 
-        outputs["D_en"] = torch.stack(D_en_list)  # (B, K, K)
+        outputs["D_en"] = torch.stack(D_en_list)  # (B, K, K), max=2.0
         outputs["D_vi"] = torch.stack(D_vi_list)
         outputs["M"]    = torch.stack(M_list)
 
@@ -279,6 +291,170 @@ def run_overfit(config: dict, device: torch.device):
 
 
 # ──────────────────────────────────────────────────────────────
+# Mode 1b: Overfit FULL — unfreeze backbone + GAT + head
+# Bật lambda_fgw và lambda_cons để kiểm tra joint stability.
+# ──────────────────────────────────────────────────────────────
+
+def run_overfit_full(config: dict, device: torch.device):
+    log.info("=" * 60)
+    log.info("MODE: OVERFIT FULL (Backbone + GAT + QA head — all unfrozen)")
+    log.info("=" * 60)
+
+    train_loader = setup_dataloader(config)
+    model, criterion = setup_model_and_criterion(config, device)
+
+    fixed_batch = next(iter(train_loader))
+    fixed_batch = {k: v.to(device) for k, v in fixed_batch.items()}
+    log.info(f"Fixed batch shapes: { {k: tuple(v.shape) for k, v in fixed_batch.items()} }")
+
+    # ── STRATEGY ─────────────────────────────────────────────────────────
+    # Toàn bộ mạng được unfreeze (backbone + GAT + QA head).
+    # lambda_fgw và lambda_cons BẬT theo config (0.1 / 0.3).
+    #
+    # LR (Liều 1 — XLM-R không bao giờ dùng LR > 5e-5):
+    #   backbone : 1e-5  (cực thấp, tránh catastrophic forgetting)
+    #   GAT+head : 1e-4  (layer mới khởi tạo, hội tụ nhanh hơn)
+    #
+    # Gradient clipping (Liều 2 — chặn cú tát 5000+ ở step 1):
+    #   1. Clip riêng backbone (max_norm=0.5) và gat+head (max_norm=1.0)
+    #      → log được gn_bb / gn_other để quan sát explosion.
+    #   2. Clip joint toàn bộ (max_norm=1.0) ngay trước optimizer.step()
+    #      → đảm bảo không gradient nào vượt ngưỡng dù ở group nào.
+    # ─────────────────────────────────────────────────────────────────────
+
+    # Đảm bảo toàn bộ params trainable
+    for p in model.parameters():
+        p.requires_grad_(True)
+
+    backbone_params = list(model.backbone.parameters())
+    other_params    = list(model.gat.parameters()) + list(criterion.parameters())
+    all_params      = backbone_params + other_params
+
+    total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_trainable += sum(p.numel() for p in criterion.parameters() if p.requires_grad)
+    log.info(f"Trainable: ALL params — {total_trainable/1e6:.2f}M")
+    log.info("LR: backbone=1e-5 | gat+head=1e-4 | weight_decay=0.01")
+    log.info(
+        f"lambda_fgw={config['lambda_fgw']} | "
+        f"lambda_cons={config['lambda_cons']} | "
+        f"lambda_span={config['lambda_span']}"
+    )
+
+    optimizer = AdamW([
+        {"params": backbone_params, "lr": 1e-5},   # Liều 1: XLM-R luôn ≤ 5e-5
+        {"params": other_params,    "lr": 1e-4},   # Liều 1: GAT + head mới init
+    ], weight_decay=0.01)
+
+    model.train()
+    criterion.train()
+
+    log.info(
+        f"Bắt đầu overfit_full {config['overfit_steps']} steps..."
+    )
+
+    prev_loss      = float("inf")
+    stagnant_count = 0
+
+    for step in range(1, config["overfit_steps"] + 1):
+
+        # ── Curriculum Learning — Dual Annealing (Liều 3 v2) ────────────
+        # FGW  : Phase1 step 1–50 = 0, Phase2 step 51–100 = 0→0.1 (linear)
+        #        Phase3 step 101+       = 0.1 (max)
+        # Cons : Phase1 step 1–50 = 0, Phase2 step 51–150 = 0→0.1 (linear, chậm hơn)
+        #        Phase3 step 151+       = 0.1 (cap thấp hơn config để tránh KL diverge)
+        # → Tách lịch annealing: FGW hội tụ nhanh, Cons "bơm" từ từ hơn.
+        # ─────────────────────────────────────────────────────────────────
+
+        # FGW schedule (51 → 100)
+        if step <= 50:
+            criterion.lambda_fgw = 0.0
+        elif step <= 100:
+            criterion.lambda_fgw = config["lambda_fgw"] * (step - 50) / 50.0
+        else:
+            criterion.lambda_fgw = config["lambda_fgw"]
+
+        # Cons schedule (51 → 150, cap tại 0.1 thay vì 0.3)
+        _cons_max = 0.1   # cap thấp hơn config["lambda_cons"]=0.3
+        if step <= 50:
+            criterion.lambda_cons = 0.0
+        elif step <= 150:
+            criterion.lambda_cons = _cons_max * (step - 50) / 100.0
+        else:
+            criterion.lambda_cons = _cons_max
+
+        if step % 10 == 0 and 51 <= step <= 160:
+            log.info(
+                f"   [Annealing step {step}] "
+                f"FGW={criterion.lambda_fgw:.4f}  "
+                f"CONS={criterion.lambda_cons:.4f}"
+            )
+
+        optimizer.zero_grad()
+
+        raw_outputs = model(fixed_batch)
+        outputs     = _patch_model_outputs(model, fixed_batch, raw_outputs)
+        losses      = criterion(outputs, fixed_batch)
+
+        losses["total"].backward()
+
+        # Liều 2a: clip riêng từng group để quan sát explosion
+        gn_bb = torch.nn.utils.clip_grad_norm_(
+            backbone_params, max_norm=0.5
+        ).item()
+        gn_other = torch.nn.utils.clip_grad_norm_(
+            other_params, max_norm=1.0
+        ).item()
+        # Liều 2b: clip joint toàn bộ — safety net cuối cùng
+        torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+
+        optimizer.step()
+
+        total = losses["total"].item()
+
+        if step % 10 == 0 or step == 1:
+            log.info(
+                f"Step {step:>4d}/{config['overfit_steps']} | "
+                f"total={total:.4f} | "
+                f"qa={losses['qa'].item():.4f} | "
+                f"fgw={losses['fgw'].item():.4f} | "
+                f"span={losses['span_proj'].item():.4f} | "
+                f"cons={losses['cons'].item():.4f} | "
+                f"gn_bb={gn_bb:.3f} gn_other={gn_other:.3f}"
+            )
+
+        if total >= prev_loss - 1e-5:
+            stagnant_count += 1
+            if stagnant_count >= 30:
+                log.warning(
+                    "⚠️  Loss không giảm sau 30 steps liên tiếp — "
+                    "gradient explosion hay learning rate quá lớn?"
+                )
+                break
+        else:
+            stagnant_count = 0
+        prev_loss = total
+
+    final_total = losses["total"].item()
+    final_qa    = losses["qa"].item()
+    final_span  = losses["span_proj"].item()
+    final_fgw   = losses["fgw"].item()
+    final_cons  = losses["cons"].item()
+    log.info("=" * 60)
+    log.info(
+        f"Final: total={final_total:.4f} | qa={final_qa:.4f} | "
+        f"span={final_span:.4f} | fgw={final_fgw:.4f} | cons={final_cons:.4f}"
+    )
+    if final_total < 3.0:
+        log.info("✅ OVERFIT_FULL: Loss giảm ổn định — kiến trúc joint training OK!")
+    else:
+        log.warning(
+            "⚠️  OVERFIT_FULL chưa đủ giảm. Kiểm tra gradient explosion "
+            "(gn_bb / gn_other) và cân nhắc giảm lambda_fgw hoặc overfit_lr."
+        )
+    log.info("=" * 60)
+
+
+# ──────────────────────────────────────────────────────────────
 # Mode 2: Full Training Loop
 # ──────────────────────────────────────────────────────────────
 
@@ -441,8 +617,8 @@ def run_training(config: dict, device: torch.device):
 
 def main():
     parser = argparse.ArgumentParser(description="Train Cross-Lingual OT QA Model")
-    parser.add_argument("--mode",      choices=["overfit", "train"], default="overfit",
-                        help="'overfit' để sanity check, 'train' để full training")
+    parser.add_argument("--mode",      choices=["overfit", "overfit_full", "train"], default="overfit",
+                        help="'overfit': freeze bb+GAT (QA head only) | 'overfit_full': unfreeze all + fgw+cons | 'train': full training")
     parser.add_argument("--root_dir",  type=str, default=DEFAULT_CONFIG["root_dir"])
     parser.add_argument("--output_dir",type=str, default=DEFAULT_CONFIG["output_dir"])
     parser.add_argument("--hf_repo_id",type=str, default=DEFAULT_CONFIG["hf_repo_id"],
@@ -474,6 +650,8 @@ def main():
 
     if args.mode == "overfit":
         run_overfit(config, device)
+    elif args.mode == "overfit_full":
+        run_overfit_full(config, device)
     else:
         run_training(config, device)
 
