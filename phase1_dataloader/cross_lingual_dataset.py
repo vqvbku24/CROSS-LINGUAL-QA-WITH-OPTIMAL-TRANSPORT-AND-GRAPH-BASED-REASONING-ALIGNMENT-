@@ -29,14 +29,14 @@ def _resolve_process_fn(process_fn: Optional[Callable] = None) -> Callable:
         return process_fn
 
     # Thử import hàm thật trước
-    for mod in ("phrase1_dataloader.process_qa_sample", "process_qa_sample"):
+    for mod in ("phase1_dataloader.process_qa_sample", "process_qa_sample"):
         try:
             return _import_attr([mod], "process_qa_sample")
         except ImportError:
             continue
 
     # Fallback: mock
-    for mod in ("phrase1_dataloader.data_setup", "data_setup"):
+    for mod in ("phase1_dataloader.data_setup", "data_setup"):
         try:
             return _import_attr([mod], "mock_process_qa_sample")
         except ImportError:

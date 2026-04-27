@@ -11,7 +11,7 @@ Gồm hai chế độ:
 import os
 import sys
 
-# Add project root directory to sys.path to enable importing modules like phrase1_dataloader and phrase2_model
+# Add project root directory to sys.path to enable importing modules like phase1_dataloader and phase2_model
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import math
@@ -131,8 +131,8 @@ def _patch_model_outputs(model, batch: dict, raw_outputs: dict) -> dict:
 # ──────────────────────────────────────────────────────────────
 
 def setup_dataloader(config: dict) -> DataLoader:
-    from phrase1_dataloader.data_setup import get_setup_objects
-    from phrase1_dataloader.cross_lingual_dataset import create_dataloader
+    from phase1_dataloader.data_setup import get_setup_objects
+    from phase1_dataloader.cross_lingual_dataset import create_dataloader
 
     log.info("Loading datasets và tokenizer...")
     teacher_ds, student_ds, tokenizer = get_setup_objects(
@@ -158,8 +158,8 @@ def setup_dataloader(config: dict) -> DataLoader:
 # ──────────────────────────────────────────────────────────────
 
 def setup_model_and_criterion(config: dict, device: torch.device):
-    from phrase2_model.model_core import CrossLingualOTModel
-    from phrase3_loss.losses import OTAlignmentLoss
+    from phase2_model.model_core import CrossLingualOTModel
+    from phase3_loss.losses import OTAlignmentLoss
 
     model = CrossLingualOTModel(
         model_name  = config["model_name"],
