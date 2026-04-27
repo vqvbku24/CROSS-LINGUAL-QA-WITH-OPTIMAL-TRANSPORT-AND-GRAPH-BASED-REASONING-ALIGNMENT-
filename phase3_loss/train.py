@@ -146,7 +146,7 @@ def setup_dataloader(config: dict) -> DataLoader:
         batch_size=config["batch_size"],
         shuffle=True,
         pairing_strategy=config["pairing_strategy"],
-        num_workers=2,
+        num_workers=4,
         pin_memory=True,
     )
     log.info(f"DataLoader sẵn sàng: {len(train_loader)} batches/epoch")
