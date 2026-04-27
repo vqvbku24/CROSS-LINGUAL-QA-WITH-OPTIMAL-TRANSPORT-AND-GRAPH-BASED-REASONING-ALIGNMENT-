@@ -6,10 +6,10 @@ import torch
 import torch.nn as nn
 
 # Setup
-from phrase1_dataloader.data_setup import get_setup_objects
-from phrase1_dataloader.cross_lingual_dataset import create_dataloader
-from phrase2_model.model_core import CrossLingualOTModel
-from phrase3_loss.losses import OTAlignmentLoss
+from phase1_dataloader.data_setup import get_setup_objects
+from phase1_dataloader.cross_lingual_dataset import create_dataloader
+from phase2_model.model_core import CrossLingualOTModel
+from phase3_loss.losses import OTAlignmentLoss
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}\n")
@@ -54,7 +54,7 @@ for b in range(keep.size(0)):
 print()
 
 # Check if answer tokens are in keep
-from phrase3_loss.losses import _remap_positions_to_graph_space
+from phase3_loss.losses import _remap_positions_to_graph_space
 gs_start, gs_end = _remap_positions_to_graph_space(
     batch["en_start_position"], batch["en_end_position"], keep
 )
@@ -71,8 +71,8 @@ print()
 # Check adjacency matrix sparsity
 print("=== ADJACENCY MATRIX (en_sub) SPARSITY ===")
 # Re-run subsampling to get adj
-from phrase2_model.modules.subsampling import conditional_subsample
-from phrase2_model.modules.backbone import SharedBackbone
+from phase2_model.modules.subsampling import conditional_subsample
+from phase2_model.modules.backbone import SharedBackbone
 backbone = SharedBackbone().to(device)
 with torch.no_grad():
     en_hidden, en_attn = backbone(batch["en_input_ids"], batch["en_attention_mask"])
@@ -90,7 +90,7 @@ for b in range(4):
 print()
 
 # Loss + backward
-from phrase3_loss.train import _patch_model_outputs
+from phase3_loss.train import _patch_model_outputs
 outputs = _patch_model_outputs(model, batch, raw)
 losses = criterion(outputs, batch)
 losses["total"].backward()
