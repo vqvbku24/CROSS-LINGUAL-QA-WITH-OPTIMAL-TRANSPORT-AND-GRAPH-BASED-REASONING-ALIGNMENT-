@@ -78,10 +78,13 @@ class CrossLingualOTModel(nn.Module):
 
             # ── 4. FGW Solver ─────────────────────────────────────────
             # Feature cost matrix M: cosine distance giữa EN và VI embeddings
-            M = 1.0 - torch.mm(
-                torch.nn.functional.normalize(en_emb, dim=-1),
-                torch.nn.functional.normalize(vi_emb, dim=-1).T
-            )  # (K, K)
+            pos = torch.arange(self.K, device=en_emb.device, dtype=torch.float32) / self.K
+            pos_cost = (pos.unsqueeze(1) - pos.unsqueeze(0)).abs()
+            
+            en_norm = torch.nn.functional.normalize(en_emb.detach(), dim=-1)
+            vi_norm = torch.nn.functional.normalize(vi_emb, dim=-1)
+            
+            M = (1.0 - torch.mm(en_norm, vi_norm.T)) + 0.1 * pos_cost  # (K, K)
 
             batch_en_emb.append(en_emb)
             batch_vi_emb.append(vi_emb)

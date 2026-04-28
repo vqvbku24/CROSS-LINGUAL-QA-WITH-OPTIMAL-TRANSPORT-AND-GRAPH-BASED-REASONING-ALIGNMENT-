@@ -8,3 +8,4 @@ sentencepiece
 numpy
 scipy
 tqdm
+tensorboard

@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Subset
+from torch.utils.tensorboard import SummaryWriter
 
 # Import Hugging Face API để upload checkpoint
 try:
@@ -503,6 +504,11 @@ def run_training(config: dict, device: torch.device):
     global_step = 0
     optimizer.zero_grad()
 
+    # THÊM DÒNG NÀY VÀO ĐÂY: Khởi tạo TensorBoard Writer
+    tb_log_dir = os.path.join(config["output_dir"], "tensorboard_logs")
+    writer = SummaryWriter(log_dir=tb_log_dir)
+    log.info(f"Đã bật TensorBoard. Dữ liệu lưu tại: {tb_log_dir}")
+
     if config.get("resume_from"):
         if os.path.exists(config["resume_from"]):
             log.info(f"Loading checkpoint from {config['resume_from']}...")
@@ -622,6 +628,24 @@ def run_training(config: dict, device: torch.device):
                         f"λ=({criterion.lambda_fgw:.3f},{criterion.lambda_span:.3f},{criterion.lambda_cons:.3f})"
                     )
 
+                    # --- THÊM KHỐI NÀY ĐỂ VẼ BIỂU ĐỒ ---
+                    # 1. Vẽ biểu đồ các loại Loss
+                    writer.add_scalar("Loss/Total", losses['total'].item(), global_step)
+                    writer.add_scalar("Loss/QA (English)", losses['qa'].item(), global_step)
+                    writer.add_scalar("Loss/FGW (Alignment)", losses['fgw'].item(), global_step)
+                    writer.add_scalar("Loss/Span (Vietnamese)", losses['span_proj'].item(), global_step)
+                    writer.add_scalar("Loss/Consistency", losses['cons'].item(), global_step)
+                    
+                    # 2. Vẽ biểu đồ theo dõi Dual Annealing (Cực kỳ đã mắt!)
+                    writer.add_scalar("Lambda/FGW", criterion.lambda_fgw, global_step)
+                    writer.add_scalar("Lambda/Span", criterion.lambda_span, global_step)
+                    writer.add_scalar("Lambda/Cons", criterion.lambda_cons, global_step)
+                    
+                    # 3. Theo dõi Learning Rate
+                    writer.add_scalar("Learning_Rate/Backbone", optimizer.param_groups[0]['lr'], global_step)
+                    writer.add_scalar("Learning_Rate/Head", optimizer.param_groups[1]['lr'], global_step)
+                    # -----------------------------------
+
         avg_loss = epoch_loss / max(accum_count, 1)
         log.info(f"━━ Epoch {epoch}/{config['max_epochs']} done | avg_loss={avg_loss:.4f}")
 
@@ -661,6 +685,7 @@ def run_training(config: dict, device: torch.device):
             # ========================================================
 
     log.info("Training hoàn thành!")
+    writer.close() # THÊM DÒNG NÀY ĐỂ ĐÓNG KẾT NỐI
 
 
 # ──────────────────────────────────────────────────────────────
