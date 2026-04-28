@@ -1,0 +1,19 @@
+# Hugging Face token file
+.hf_token
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.env
+
+# Logs and checkpoints
+checkpoints/
+runs/
+tensorboard_logs/
+
+# IDEs
+.vscode/
+.idea/

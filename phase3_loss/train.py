@@ -668,6 +668,7 @@ def run_training(config: dict, device: torch.device):
             # TỰ ĐỘNG ĐẨY LÊN HUGGING FACE NẾU CÓ CẤU HÌNH REPO_ID
             # ========================================================
             if config.get("hf_repo_id") and HfApi is not None:
+                # Token sẽ tự động được lấy từ biến môi trường HF_TOKEN hoặc từ "huggingface-cli login"
                 api = HfApi()
                 try:
                     log.info(f"   Đang đẩy file {ckpt_path} lên Hugging Face ({config['hf_repo_id']})...")
@@ -677,7 +678,16 @@ def run_training(config: dict, device: torch.device):
                         repo_id=config["hf_repo_id"],
                         repo_type="model"
                     )
-                    log.info(f" Đã backup an toàn lên mây!")
+                    
+                    log.info(f"   Đang đồng bộ TensorBoard logs lên Hugging Face...")
+                    # Lệnh này cực kỳ thông minh: nó chỉ tải lên các file mới hoặc có sự thay đổi
+                    api.upload_folder(
+                        folder_path=tb_log_dir,
+                        path_in_repo="logs/tensorboard",
+                        repo_id=config["hf_repo_id"],
+                        repo_type="model"
+                    )
+                    log.info(f" Đã backup checkpoint & TensorBoard logs an toàn lên mây!")
                 except Exception as e:
                     log.error(f" Lỗi upload lên HF (file local vẫn còn): {e}")
             elif config.get("hf_repo_id") and HfApi is None:
