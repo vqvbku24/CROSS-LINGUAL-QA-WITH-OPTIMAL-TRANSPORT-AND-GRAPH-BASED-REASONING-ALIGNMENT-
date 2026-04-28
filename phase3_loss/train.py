@@ -14,6 +14,14 @@ import sys
 # Add project root directory to sys.path to enable importing modules like phase1_dataloader and phase2_model
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Load variables from .env file
+try:
+    from dotenv import load_dotenv
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    load_dotenv(env_path)
+except ImportError:
+    pass
+
 import math
 import argparse
 import logging
