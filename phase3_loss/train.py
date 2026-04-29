@@ -155,8 +155,8 @@ def setup_dataloader(config: dict) -> DataLoader:
         batch_size=config["batch_size"],
         shuffle=True,
         pairing_strategy=config["pairing_strategy"],
-        num_workers=4,
-        pin_memory=True,
+        # num_workers=2,
+        # pin_memory=True,
     )
     log.info(f"DataLoader sẵn sàng: {len(train_loader)} batches/epoch")
     return train_loader
@@ -212,7 +212,7 @@ def run_overfit(config: dict, device: torch.device):
     model, criterion = setup_model_and_criterion(config, device)
 
     fixed_batch = next(iter(train_loader))
-    fixed_batch = {k: v.to(device) for k, v in fixed_batch.items()}
+    fixed_batch = {k: v.to(device, non_blocking=True) for k, v in fixed_batch.items()}
     log.info(f"Fixed batch shapes: { {k: tuple(v.shape) for k, v in fixed_batch.items()} }")
 
     # ── OVERFIT STRATEGY ─────────────────────────────────────────────────
@@ -318,7 +318,7 @@ def run_overfit_full(config: dict, device: torch.device):
     model, criterion = setup_model_and_criterion(config, device)
 
     fixed_batch = next(iter(train_loader))
-    fixed_batch = {k: v.to(device) for k, v in fixed_batch.items()}
+    fixed_batch = {k: v.to(device, non_blocking=True) for k, v in fixed_batch.items()}
     log.info(f"Fixed batch shapes: { {k: tuple(v.shape) for k, v in fixed_batch.items()} }")
 
     # ── STRATEGY ─────────────────────────────────────────────────────────
@@ -559,7 +559,7 @@ def run_training(config: dict, device: torch.device):
         accum_count = 0
 
         for step, batch in enumerate(train_loader):
-            batch = {k: v.to(device) for k, v in batch.items()}
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
             # ── Curriculum Learning — Dual Annealing (cho Full Train) ──────
             # Phase 1 (step 1–200)   : chỉ L_qa — backbone + GAT ổn định trước
@@ -644,7 +644,7 @@ def run_training(config: dict, device: torch.device):
                     writer.add_scalar("Loss/Span (Vietnamese)", losses['span_proj'].item(), global_step)
                     writer.add_scalar("Loss/Consistency", losses['cons'].item(), global_step)
                     
-                    # 2. Vẽ biểu đồ theo dõi Dual Annealing (Cực kỳ đã mắt!)
+                    # 2. Vẽ biểu đồ theo dõi Dual Annealing 
                     writer.add_scalar("Lambda/FGW", criterion.lambda_fgw, global_step)
                     writer.add_scalar("Lambda/Span", criterion.lambda_span, global_step)
                     writer.add_scalar("Lambda/Cons", criterion.lambda_cons, global_step)
@@ -745,7 +745,13 @@ def main():
     })
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info(f"Device: {device}")
+    
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.cuda.set_device(0)
+        log.info(f"✅ CUDA benchmark enabled | Device: {device}")
+    else:
+        log.info(f"Device: {device}")
 
     if args.mode == "overfit":
         run_overfit(config, device)
