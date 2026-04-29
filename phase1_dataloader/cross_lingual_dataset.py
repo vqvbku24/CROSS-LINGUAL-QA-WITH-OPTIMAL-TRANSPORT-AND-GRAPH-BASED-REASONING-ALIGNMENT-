@@ -245,13 +245,7 @@ def create_dataloader(
     pairing_strategy: str = "topic",
     **dataloader_kwargs,
 ) -> DataLoader:
-    """
-    Tạo DataLoader sẵn sàng cho Phase 1.
-
-    Args:
-        pairing_strategy: "topic" | "modulo" | "random"
-                          Khuyến nghị: "topic" để L_consistency học mapping hợp lý.
-    """
+    
     dataset = CrossLingualQADataset(
         teacher_ds=teacher_ds,
         student_ds=student_ds,
@@ -261,11 +255,19 @@ def create_dataloader(
         process_fn=process_fn,
         pairing_strategy=pairing_strategy,
     )
+
+    num_workers = dataloader_kwargs.pop('num_workers', 2)  
+    pin_memory = dataloader_kwargs.pop('pin_memory', True if num_workers > 0 else False)
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else None,
         **dataloader_kwargs,
     )
 
