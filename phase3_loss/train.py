@@ -67,7 +67,7 @@ DEFAULT_CONFIG = {
     "lambda_fgw"    : 0.1,
     "lambda_span"   : 0.5,
     "lambda_cons"   : 0.3,
-    "cons_temp"     : 2.0,
+    "cons_temp"     : 4.0,
     "max_span_len"  : 30,
 
     # Training
@@ -537,7 +537,7 @@ def run_training(config: dict, device: torch.device):
     _FGW_DELAY,  _FGW_WARMUP  = _SPE // 2,  _SPE
     _SPAN_DELAY, _SPAN_WARMUP = _SPE,        _SPE
     _CONS_DELAY, _CONS_WARMUP = _SPE * 2,   _SPE // 2
-    _CONS_MAX = 0.1
+    _CONS_MAX = config["lambda_cons"]
     log.info(
         f"Curriculum delays (steps): "
         f"FGW={_FGW_DELAY}→{_FGW_DELAY+_FGW_WARMUP} | "
