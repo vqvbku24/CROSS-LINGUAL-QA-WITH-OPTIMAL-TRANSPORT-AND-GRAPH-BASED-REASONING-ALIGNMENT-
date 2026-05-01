@@ -67,7 +67,7 @@ DEFAULT_CONFIG = {
     "lambda_fgw"    : 0.1,
     "lambda_span"   : 0.5,
     "lambda_cons"   : 0.3,
-    "cons_temp"     : 4.0,
+    "cons_temp"     : 2.0,
     "max_span_len"  : 30,
 
     # Training
