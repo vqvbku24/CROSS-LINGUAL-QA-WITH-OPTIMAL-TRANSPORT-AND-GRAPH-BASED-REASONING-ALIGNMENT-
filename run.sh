@@ -2,7 +2,7 @@
 #SBATCH --job-name=train_ot_qa
 #SBATCH -p kisski-h100
 #SBATCH --mem=148G              
-#SBATCH -c 16
+#SBATCH -c 8
 #SBATCH -G H100:1
 #SBATCH --gpus-per-task=1       # Thêm cái này cho rõ ràng
 #SBATCH --gpu-bind=closest      # Tối ưu băng GPU
