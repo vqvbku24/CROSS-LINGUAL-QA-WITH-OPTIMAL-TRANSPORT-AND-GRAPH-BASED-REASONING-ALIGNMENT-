@@ -52,45 +52,40 @@ log = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
-    # Model
     "model_name"    : "xlm-roberta-base",
-    "K"             : 128,       # 64→128: coverage 25% tokens, cần thiết khi dùng soft-boost
+    "K"             : 96,
     "gat_hidden"    : 512,
     "gat_out"       : 256,
     "gat_layers"    : 2,
     "fgw_alpha"     : 0.5,
-    "fgw_epsilon"   : 0.1,   # 0.01 → 0.1: làm mềm Sinkhorn, tránh exp(±∞)
-    "use_partial"   : False,     # dùng BAPG thay network simplex → GPU-friendly
+    "fgw_epsilon"   : 0.25,
+    "use_partial"   : True,
     "partial_m"     : 0.85,
 
-    # Loss weights
-    "lambda_fgw"    : 0.1,
+    "lambda_fgw"    : 0.03,
     "lambda_span"   : 0.5,
-    "lambda_cons"   : 0.3,
+    "lambda_cons"   : 0.2,
     "cons_temp"     : 2.0,
-    "max_span_len"  : 30,
+    "max_span_len"  : 40,
 
-    # Training
-    "batch_size"        : 4,    # nhỏ vì FGW tốn memory
-    "grad_accum_steps"  : 4,    # effective batch=16, log nhiều hơn để debug
-    "lr"                : 1e-5, # lr cho backbone
-    "head_lr"           : 1e-4, # lr cho GAT và QA head
+    "batch_size"        : 4,
+    "grad_accum_steps"  : 4,
+    "lr"                : 1e-5,
+    "head_lr"           : 8e-5,
     "weight_decay"      : 0.01,
-    "warmup_ratio"      : 0.06,  # 6% tổng steps
+    "warmup_ratio"      : 0.08,
     "max_epochs"        : 10,
     "max_grad_norm"     : 1.0,
     "pairing_strategy"  : "topic",
 
-    # Overfit test
-    "overfit_steps"     : 200,
-    "overfit_lr"        : 5e-4,  # LR cao hơn để hội tụ nhanh
+    "overfit_steps"     : 400,
+    "overfit_lr"        : 3e-4,
 
-    # I/O
-    "root_dir"      : os.path.dirname(os.path.dirname(os.path.abspath(__file__))), # Absolute path to project root
-    "output_dir"    : os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "checkpoints"), # Absolute path to checkpoints
-    "hf_repo_id"    : "",    # Để trống, truyền vào qua Argparse khi chạy
-    "save_every"    : 1,     # save mỗi N epoch
-    "log_every"     : 10,    # log mỗi N steps
+    "root_dir"      : os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "output_dir"    : os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "checkpoints"),
+    "hf_repo_id"    : "",
+    "save_every"    : 1,
+    "log_every"     : 10,
 }
 
 
@@ -413,10 +408,10 @@ def run_overfit_full(config: dict, device: torch.device):
 
         # Liều 2a: clip riêng từng group để quan sát explosion
         gn_bb = torch.nn.utils.clip_grad_norm_(
-            backbone_params, max_norm=0.5
+            backbone_params, max_norm=0.15    # ← giảm từ 0.5: chặn explosion backbone
         ).item()
         gn_other = torch.nn.utils.clip_grad_norm_(
-            other_params, max_norm=1.0
+            other_params, max_norm=1.5       # ← tăng từ 1.0: cho head học nhanh hơn
         ).item()
         # Liều 2b: clip joint toàn bộ — safety net cuối cùng
         torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
@@ -607,16 +602,16 @@ def run_training(config: dict, device: torch.device):
             accum_count += 1
 
             if (step + 1) % config["grad_accum_steps"] == 0:
-                # Clip riêng từng group
+                # Clip riêng từng group (đồng bộ với overfit_full)
                 torch.nn.utils.clip_grad_norm_(
                     backbone_params,
-                    config["max_grad_norm"] * 0.5,   # backbone: 0.5
+                    config["max_grad_norm"] * 0.15,   # backbone: 0.3
                 )
                 torch.nn.utils.clip_grad_norm_(
                     other_params,
-                    config["max_grad_norm"],           # GAT + QA head: 1.0
+                    config["max_grad_norm"] * 1.5,    # GAT + QA head: 1.5
                 )
-                # Liều safety net cuối cùng (học từ overfit)
+                # Safety net cuối cùng
                 torch.nn.utils.clip_grad_norm_(all_params, config["max_grad_norm"])
                 
                 optimizer.step()
