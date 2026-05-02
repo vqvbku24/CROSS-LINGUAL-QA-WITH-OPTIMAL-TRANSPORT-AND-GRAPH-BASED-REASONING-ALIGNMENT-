@@ -128,11 +128,13 @@ def _decode_span_from_gamma(
     """
     Dùng transport plan γ để map answer span EN → VI (pseudo-label).
 
-    Thuật toán:
+    Thuật toán (vectorized):
         1. Lấy cột EN tương ứng với [en_start, en_end] trong γ.
         2. Tổng hợp xác suất: vi_score[j] = Σ_{i=start}^{end} γ[i, j].
         3. Tìm cặp (s*, e*) maximise vi_score[s*] + vi_score[e*]
            với ràng buộc 0 ≤ e* - s* ≤ max_span_len.
+
+    Complexity: O(B × K × max_span_len) thay vì O(B × K²).
 
     Args:
         gamma   : (B, K, K) transport plan
@@ -146,7 +148,9 @@ def _decode_span_from_gamma(
         vi_end  : (B,) pseudo end   (LongTensor)
     """
     B = gamma.size(0)
-    vi_starts, vi_ends = [], []
+    device = gamma.device
+    vi_starts = torch.zeros(B, dtype=torch.long, device=device)
+    vi_ends   = torch.zeros(B, dtype=torch.long, device=device)
 
     for b in range(B):
         s = en_start[b].item()
@@ -154,8 +158,6 @@ def _decode_span_from_gamma(
 
         if s == 0 and e == 0:
             # Unanswerable → pseudo-label cũng là (0, 0)
-            vi_starts.append(0)
-            vi_ends.append(0)
             continue
 
         # Đảm bảo indices hợp lệ trong K
@@ -163,27 +165,32 @@ def _decode_span_from_gamma(
         e = max(s, min(int(e), K - 1))
 
         # vi_score[j] = tổng transport mass từ answer EN nodes đến j
-        span_rows = gamma[b, s:e + 1, :]  # (span_len, K)
-        vi_score  = span_rows.sum(dim=0)  # (K,)
+        vi_score = gamma[b, s:e + 1, :].sum(dim=0)  # (K,)
 
-        # Tìm (start*, end*) tối ưu theo vi_score với ràng buộc span length
-        best_score = -1.0
-        best_s, best_e = 0, 0
+        # ── Vectorized best span search ──────────────────────────
+        # Thay vì O(K²), dùng: best_e = argmax(vi_score[si:si+max_span_len])
+        # cho mỗi si → O(K × max_span_len)
+        best_score = torch.tensor(-1.0, device=device)
+        best_s_val = 0
+        best_e_val = 0
+
+        # Tạo matrix (K, max_span_len+1): mỗi row si chứa vi_score[si:si+span]
+        span_len = min(max_span_len + 1, K)
         for si in range(K):
-            for ei in range(si, min(si + max_span_len + 1, K)):
-                score = vi_score[si].item() + vi_score[ei].item()
-                if score > best_score:
-                    best_score = score
-                    best_s, best_e = si, ei
+            ei_max = min(si + span_len, K)
+            end_scores = vi_score[si:ei_max]  # (len,)
+            # best end cho start=si
+            local_best_idx = end_scores.argmax()
+            score = vi_score[si] + end_scores[local_best_idx]
+            if score > best_score:
+                best_score = score
+                best_s_val = si
+                best_e_val = si + local_best_idx.item()
 
-        vi_starts.append(best_s)
-        vi_ends.append(best_e)
+        vi_starts[b] = best_s_val
+        vi_ends[b]   = best_e_val
 
-    device = gamma.device
-    return (
-        torch.tensor(vi_starts, dtype=torch.long, device=device),
-        torch.tensor(vi_ends,   dtype=torch.long, device=device),
-    )
+    return vi_starts, vi_ends
 
 
 # ──────────────────────────────────────────────────────────────
@@ -328,35 +335,80 @@ def consistency_loss(
     en_end_logits: torch.Tensor,
     vi_start_logits: torch.Tensor,
     vi_end_logits: torch.Tensor,
+    gamma: torch.Tensor,
     temperature: float = 2.0,
 ) -> torch.Tensor:
     """
-    KL-divergence consistency regularizer giữa EN và VI predictions.
+    Transport-Guided Consistency Loss.
 
-    QUAN TRỌNG: EN logits được detach() (stop-gradient) để Teacher không bị
-    nhiễu từ VI side — chỉ VI nhánh được update từ loss này.
+    Thay vì KL(VI || EN) trực tiếp — vốn bị structural mismatch do EN và VI
+    hoạt động trên 2 graph-space khác nhau (EN có answer-aware subsampling,
+    VI không) — ta dùng transport plan γ làm bridge:
 
-    L_cons = KL( softmax(VI/T) || softmax(EN/T).detach() )
-           = 0.5 * KL_start + 0.5 * KL_end
+        L_cons = T² · KL( softmax(VI/T) || transport(softmax(EN/T), γ) )
+
+    Cụ thể:
+        1. Tính EN probability: p_en = softmax(en_logits.detach() / T)
+        2. "Transport" p_en sang VI space: p_target = normalize(γᵀ · p_en)
+           γᵀ[j, i] = transport mass từ EN node i → VI node j
+           → p_target[j] = tổng xác suất EN được transport đến VI node j
+        3. KL(VI || p_target) — VI học từ transported EN distribution
+
+    Tại sao hiệu quả:
+        - γ đã encode thông tin alignment cấu trúc EN↔VI (từ FGW solver)
+        - Target p_target nằm đúng trong VI graph-space → không còn mismatch
+        - γ càng tốt → target càng chính xác → cons loss giảm đều
+        - Tạo "neo" tự nhiên: loss bị bound bởi chất lượng γ
+
+    QUAN TRỌNG: EN logits vẫn được detach() (stop-gradient Teacher).
+    Scale T² giữ nguyên theo Hinton Knowledge Distillation convention.
 
     Args:
-        temperature: nhiệt độ softmax (> 1 để smooth distribution)
+        en_start_logits : (B, K) EN start logits
+        en_end_logits   : (B, K) EN end logits
+        vi_start_logits : (B, K) VI start logits
+        vi_end_logits   : (B, K) VI end logits
+        gamma           : (B, K_en, K_vi) transport plan từ FGW solver
+        temperature     : nhiệt độ softmax (> 1 để smooth distribution)
 
     Returns:
         scalar loss
     """
-    # Stop-gradient trên EN side (Teacher)
-    en_start_soft = F.log_softmax(en_start_logits.detach() / temperature, dim=-1)
-    en_end_soft   = F.log_softmax(en_end_logits.detach()   / temperature, dim=-1)
+    # ── 1. EN probability distribution (stop-gradient Teacher) ──────────
+    en_start_prob = F.softmax(en_start_logits.detach() / temperature, dim=-1)  # (B, K)
+    en_end_prob   = F.softmax(en_end_logits.detach()   / temperature, dim=-1)  # (B, K)
 
-    vi_start_soft = F.log_softmax(vi_start_logits / temperature, dim=-1)
-    vi_end_soft   = F.log_softmax(vi_end_logits   / temperature, dim=-1)
+    # ── 2. Transport EN distribution → VI space qua γ ──────────────────
+    # γ: (B, K_en, K_vi) → γᵀ: (B, K_vi, K_en)
+    # γᵀ · p_en → "expected VI probability" dựa trên transport plan
+    gamma_T = gamma.detach().transpose(1, 2)  # (B, K_vi, K_en)
 
-    # KL(VI || EN) — VI học từ EN distribution
-    kl_start = F.kl_div(vi_start_soft, en_start_soft.exp(), reduction="batchmean")
-    kl_end   = F.kl_div(vi_end_soft,   en_end_soft.exp(),   reduction="batchmean")
+    # Normalize γᵀ theo hàng: mỗi VI node nhận tổng mass = 1
+    # Tránh division by zero cho VI nodes không nhận mass nào
+    gamma_T_norm = gamma_T / (gamma_T.sum(dim=-1, keepdim=True) + 1e-8)
 
-    # Scale theo T^2 (theo Knowledge Distillation convention của Hinton)
+    # Transport: p_target[b, j] = Σ_i γᵀ_norm[b, j, i] · p_en[b, i]
+    vi_target_start = torch.bmm(
+        gamma_T_norm, en_start_prob.unsqueeze(-1)
+    ).squeeze(-1)  # (B, K)
+    vi_target_end = torch.bmm(
+        gamma_T_norm, en_end_prob.unsqueeze(-1)
+    ).squeeze(-1)  # (B, K)
+
+    # Clamp + renormalize để đảm bảo valid probability distribution
+    vi_target_start = vi_target_start.clamp(min=1e-8)
+    vi_target_end   = vi_target_end.clamp(min=1e-8)
+    vi_target_start = vi_target_start / vi_target_start.sum(dim=-1, keepdim=True)
+    vi_target_end   = vi_target_end   / vi_target_end.sum(dim=-1, keepdim=True)
+
+    # ── 3. KL(VI || transported_EN) ────────────────────────────────────
+    vi_start_log = F.log_softmax(vi_start_logits / temperature, dim=-1)
+    vi_end_log   = F.log_softmax(vi_end_logits   / temperature, dim=-1)
+
+    kl_start = F.kl_div(vi_start_log, vi_target_start, reduction="batchmean")
+    kl_end   = F.kl_div(vi_end_log,   vi_target_end,   reduction="batchmean")
+
+    # Scale theo T² (theo Knowledge Distillation convention của Hinton)
     return (temperature ** 2) * (kl_start + kl_end) / 2.0
 
 
@@ -379,7 +431,7 @@ class OTAlignmentLoss(nn.Module):
     def __init__(
         self,
         qa_hidden_size: int = 256,   # = gat_out trong model_core
-        K: int = 160,
+        K: int = 128,
         lambda_fgw: float = 0.1,
         lambda_span: float = 0.5,
         lambda_cons: float = 0.3,
@@ -478,10 +530,11 @@ class OTAlignmentLoss(nn.Module):
             K=self.K, max_span_len=self.max_span_len,
         )
 
-        # ── 6. L_consistency (KL EN↔VI, stop-grad EN) ─────────
+        # ── 6. L_consistency (Transport-Guided, stop-grad EN) ──
         l_cons = consistency_loss(
             en_start_logits, en_end_logits,
             vi_start_logits, vi_end_logits,
+            gamma=gamma,
             temperature=self.temperature,
         )
 

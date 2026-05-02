@@ -6,55 +6,69 @@ def conditional_subsample(
     attention_map: torch.Tensor,
     question_indices: list,
     answer_indices: list,
-    K: int = 160
+    K: int = 128,
+    soft_boost: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Giảm graph từ N nodes xuống K nodes, đảm bảo giữ lại:
-      - Tất cả question_indices (bao gồm [CLS])
-      - Tất cả answer_indices (answer span)
-      - Top-(K - len(forced)) nodes theo attention score
+    Giảm graph từ N nodes xuống K nodes.
+
+    Hai chế độ tùy soft_boost:
+
+      soft_boost == 0 (DEFAULT — dùng cho INFERENCE + VI training):
+        - Hard-force question_indices vào graph.
+        - answer_indices được ignore (truyền [] khi inference).
+        - Phần còn lại chọn top-K attention.
+
+      soft_boost > 0 (dùng cho EN TRAINING):
+        - Hard-force question_indices.
+        - answer_indices KHÔNG bị force, nhưng attention score được
+          nhân boost_factor → rất likely (nhưng KHÔNG guaranteed) được
+          chọn bởi top-K.
+        - Tại sao: training graph gần giống inference graph (cùng dùng
+          attention-based selection), nhưng answer tokens vẫn thường
+          nằm trong graph → labels sạch hơn pure nearest-neighbor.
 
     Args:
         attention_map:    (N, N) — attention matrix của 1 sample
         question_indices: list[int] — indices của question tokens (bắt buộc giữ)
-        answer_indices:   list[int] — indices của answer span (bắt buộc giữ)
+        answer_indices:   list[int] — indices để boost (KHÔNG hard-force)
         K:                int — số node sau subsampling
+        soft_boost:       float — hệ số boost cho answer tokens.
+                          0 = không boost (inference mode).
+                          >0 = boost attention score (training mode). Khuyến nghị: 10.0
 
     Returns:
         sub_matrix: (K, K)
         keep_idx:   (K,) LongTensor
-    
-    Raises:
-        ValueError nếu len(forced) > K
     """
     device = attention_map.device
     N = attention_map.shape[0]
 
-    forced = list(dict.fromkeys(question_indices + answer_indices))  # dedup, preserve order
+    # ── Hard-force: chỉ question tokens ──────────────────────────
+    forced = list(dict.fromkeys(question_indices))  # dedup, preserve order
     if len(forced) > K:
-        # Ưu tiên giữ lại toàn bộ answer_indices và [CLS] (index 0)
-        ans_set = set(answer_indices)
-        ans_and_cls = [idx for idx in forced if idx in ans_set or idx == 0]
-        
-        # Nếu riêng answer_indices + [CLS] đã lớn hơn K, đành cắt bớt answer
-        if len(ans_and_cls) > K:
-            forced = ans_and_cls[:K]
-        else:
-            # Lấp đầy phần còn thiếu bằng các question tokens
-            remaining = [idx for idx in forced if idx not in ans_and_cls]
-            forced = ans_and_cls + remaining[:K - len(ans_and_cls)]
+        forced = forced[:K]  # cắt question nếu quá dài (hiếm)
 
     forced_tensor = torch.tensor(forced, device=device, dtype=torch.long)
     num_needed = K - len(forced)
 
-    # Score = tổng attention nhận được (column sum = "được chú ý nhiều")
-    # Dùng column sum thay vì row sum để đo importance tốt hơn
+    # ── Attention score để chọn phần còn lại ─────────────────────
     attn_score = attention_map.sum(dim=0).clone()  # (N,)
-    attn_score[forced_tensor] = float('-inf')       # loại forced khỏi topk
 
+    # ── Soft-boost: tăng score answer tokens TRƯỚC khi loại forced ─
+    # Phải boost trước vì answer có thể trùng question → bị set -inf
+    # trước khi kịp boost.
+    if soft_boost > 0 and len(answer_indices) > 0:
+        boost_idx = torch.tensor(answer_indices, device=device, dtype=torch.long)
+        attn_score[boost_idx] = attn_score[boost_idx] * soft_boost
+
+    # Loại forced (question tokens) khỏi top-k selection
+    attn_score[forced_tensor] = float('-inf')
+
+    # ── Top-K selection ──────────────────────────────────────────
     if num_needed > 0:
-        # Chỉ chọn từ các token không bị mask (attention_mask)
-        _, topk_idx = torch.topk(attn_score, k=min(num_needed, (attn_score != float('-inf')).sum()))
+        available = (attn_score != float('-inf')).sum().item()
+        _, topk_idx = torch.topk(attn_score, k=min(num_needed, available))
         keep_idx = torch.cat([forced_tensor, topk_idx])
     else:
         keep_idx = forced_tensor

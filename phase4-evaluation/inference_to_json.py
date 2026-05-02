@@ -21,7 +21,12 @@ def extract_ground_truth(item):
       1. answer là string thẳng          -> "Thái Bình Dương"
       2. answer là dict SQuAD gốc        -> {"text": ["Thái Bình Dương"], "answer_start": [10]}
       3. answers là dict SQuAD gốc       -> {"text": [...], "answer_start": [...]}
+    Với câu is_impossible=True → trả về "" (đúng chuẩn SQuAD2).
     """
+    # Ưu tiên check is_impossible trước
+    if item.get("is_impossible", False):
+        return ""
+
     val = item.get("answer") or item.get("answers")
 
     if val is None:
@@ -43,54 +48,72 @@ def extract_ground_truth(item):
     return ""
 
 
-def decode_span(input_ids, keep_idx, best_s, best_e, tokenizer):
-    """
-    Ánh xạ span từ graph-space về token-space rồi decode ra text.
-
-    Vấn đề gốc rễ: conditional_subsample trả về keep_idx KHÔNG sorted theo
-    thứ tự tăng dần của token position. Ví dụ keep_idx có thể là:
-        [0, 5, 2, 8, 3, ...]  (xáo trộn)
-    → best_s=1 (token 5), best_e=2 (token 2) → decode ra "mento" thay vì
-      decode đúng span liên tục trong context.
-
-    FIX: Sort keep_idx theo token position trước khi tìm span, đảm bảo
-    graph node i luôn tương ứng với token có position nhỏ hơn graph node i+1.
-    """
-    # Sắp xếp keep_idx theo thứ tự token position tăng dần
-    # keep_idx shape: (K,) hoặc Tensor 1-D
-    sorted_keep, _ = keep_idx.sort()
-
-    start_tok = sorted_keep[best_s].item()
-    end_tok   = sorted_keep[best_e].item()
-
-    # Đề phòng best_s > best_e sau khi sort (không nên xảy ra nhưng an toàn)
-    if start_tok > end_tok:
-        start_tok, end_tok = end_tok, start_tok
-
-    # Token 0 là [CLS] → model predict unanswerable
-    if start_tok == 0 and end_tok == 0:
-        return ""
-
-    pred_ids = input_ids[0, start_tok : end_tok + 1]
-    return tokenizer.decode(pred_ids, skip_special_tokens=True).strip()
-
-
 def find_best_span(start_logits, end_logits, K, max_span_len=30):
     """
     Tìm span (s, e) tối ưu với ràng buộc s <= e và e - s < max_span_len.
-    Dùng vòng lặp O(K * max_span_len) thay vì O(K^2).
+
+    ✅ FIX: Bắt đầu s từ 0 — khớp với training.
+    Training dùng _remap_positions_to_graph_space (argmin nearest-neighbor)
+    có thể map answer start/end vào bất kỳ node nào (kể cả node 0).
+    Nếu skip node 0 ở inference → mất recall cho những sample đó.
+
+    No-answer detection được xử lý riêng bởi is_unanswerable().
+
+    Trả về (best_s, best_e, best_score) để caller có thể so sánh với
+    no-answer score (cls_score) khi cần.
     """
     best_score = float('-inf')
     best_s, best_e = 0, 0
 
-    for s in range(K):
+    for s in range(K):              # ← FIX: bắt đầu từ 0, khớp với training
         for e in range(s, min(s + max_span_len, K)):
             score = start_logits[s].item() + end_logits[e].item()
             if score > best_score:
                 best_score = score
                 best_s, best_e = s, e
 
-    return best_s, best_e
+    return best_s, best_e, best_score
+
+
+def is_unanswerable(start_logits, end_logits, best_span_score, na_threshold=0.0):
+    """
+    Quyết định xem câu hỏi có unanswerable hay không.
+
+    ✅ FIX Bug 3: Thay thế guard cứng "start_tok==0 → return ''"
+    bằng so sánh score giữa no-answer (CLS) và best span.
+
+    Logic:
+      - cls_score = start_logits[0] + end_logits[0]  (SQuAD2 convention)
+      - Nếu cls_score > best_span_score + na_threshold → unanswerable
+      - na_threshold > 0 → thiên về answerable (tăng recall span)
+      - na_threshold < 0 → thiên về unanswerable (tăng precision span)
+    """
+    cls_score = start_logits[0].item() + end_logits[0].item()
+    return cls_score > best_span_score + na_threshold
+
+
+def decode_span(input_ids, keep_idx, best_s, best_e, tokenizer):
+    """
+    Ánh xạ span từ graph-space về token-space rồi decode ra text.
+
+    ✅ FIX: KHÔNG sort keep_idx.
+    Training (model_core.py L73) dùng keep_idx nguyên bản (không sort)
+    để tạo node embeddings: en_feat = en_hidden[i, en_keep, :]
+    → QA Head học predict trên thứ tự node KHÔNG SORT.
+    Nếu inference sort → mapping graph_node→token bị xáo trộn → decode sai.
+
+    Quyết định unanswerable đã được xử lý trước bởi is_unanswerable().
+    """
+    # Dùng keep_idx nguyên bản — KHÔNG sort (khớp với training)
+    start_tok = keep_idx[best_s].item()
+    end_tok   = keep_idx[best_e].item()
+
+    # Swap nếu cần (graph order có thể khác token order)
+    if start_tok > end_tok:
+        start_tok, end_tok = end_tok, start_tok
+
+    pred_ids = input_ids[0, start_tok : end_tok + 1]
+    return tokenizer.decode(pred_ids, skip_special_tokens=True).strip()
 
 
 def main():
@@ -105,6 +128,12 @@ def main():
     parser.add_argument("--model_name",  type=str, default="xlm-roberta-base")
     parser.add_argument("--max_span_len", type=int, default=30,
                         help="Độ dài span tối đa (tính theo graph node, không phải token)")
+    parser.add_argument("--na_threshold", type=float, default=0.0,
+                        help=(
+                            "No-answer threshold: cls_score > best_span_score + threshold → predict ''. "
+                            "Dương → thiên về answerable, âm → thiên về unanswerable. "
+                            "Mặc định 0.0 (balanced). Tune sau khi có F1 baseline."
+                        ))
     parser.add_argument("--debug", action="store_true",
                         help="In chi tiết 5 sample đầu để kiểm tra decode")
     args = parser.parse_args()
@@ -115,7 +144,7 @@ def main():
     print("Đang load tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
 
-    print(" Đang load dữ liệu...")
+    print("Đang load dữ liệu...")
     try:
         dataset = load_squad_data(args.input_file)
     except Exception as e:
@@ -128,9 +157,10 @@ def main():
     sample_gt = extract_ground_truth(dataset[0])
     print(f"🔍 Sanity check ground_truth[0]: '{sample_gt}'")
     if not sample_gt:
-        print("CẢNH BÁO: ground_truth mẫu đầu tiên rỗng! Kiểm tra lại format file input.")
+        print("CẢNH BÁO: ground_truth mẫu đầu tiên rỗng! "
+              "Nếu đây là câu answerable thì cần kiểm tra load_squad_data.")
 
-    print(f" Đang load trọng số mô hình từ {args.checkpoint}...")
+    print(f"Đang load trọng số mô hình từ {args.checkpoint}...")
     checkpoint = torch.load(args.checkpoint, map_location=device)
     config = checkpoint.get("config", {})
 
@@ -140,6 +170,7 @@ def main():
     gat_layers = config.get("gat_layers", 2)
 
     print(f"   Config: K={K}, gat_hidden={gat_hidden}, gat_out={gat_out}, gat_layers={gat_layers}")
+    print(f"   NA threshold: {args.na_threshold:+.2f}")
 
     model = CrossLingualOTModel(
         model_name=args.model_name,
@@ -160,14 +191,12 @@ def main():
     model.eval()
     criterion.eval()
 
-    print(f"\n Bắt đầu suy luận (Inference) cho {len(dataset)} câu hỏi...")
+    print(f"\nBắt đầu suy luận (Inference) cho {len(dataset)} câu hỏi...")
     results = []
 
     for item in tqdm(dataset, desc="Đang dự đoán"):
         question     = item["question"]
         context      = item["context"]
-
-        # ✅ FIX 1: Đọc ground truth đúng cách
         ground_truth = extract_ground_truth(item)
 
         # Tokenize (KHÔNG truyền answer vì đây là bước test)
@@ -184,13 +213,23 @@ def main():
         attention_mask = attention_mask.unsqueeze(0).to(device)
         question_end   = question_end.item()
 
+        seq_len = input_ids.shape[1]
+
         with torch.no_grad():
             # Backbone XLM-R
             hidden, attn = model.backbone(input_ids, attention_mask)
 
-            # Subsampling
+            # ✅ FIX: answer_indices = [] (trống) — khớp với training.
+            # Training (model_core.py L70): VI side dùng answer_indices=[].
+            # Inference cũng không có answer → phải truyền [] để graph
+            # structure giống VI side lúc training.
+            # Phiên bản cũ truyền toàn bộ ctx_idx vào answer_indices
+            # khiến forced = q_idx + ctx_idx > K → graph bị cắt ngẫu nhiên
+            # và cấu trúc hoàn toàn khác lúc train.
             q_idx = list(range(0, question_end + 1))
-            sub_matrix, keep_idx = conditional_subsample(attn[0], q_idx, [], K=K)
+            sub_matrix, keep_idx = conditional_subsample(
+                attn[0], q_idx, [], K=K  # ← answer_indices = []
+            )
 
             # GAT Encoder
             feat = hidden[0, keep_idx, :]
@@ -201,15 +240,19 @@ def main():
             start_logits = start_logits.squeeze(0)
             end_logits   = end_logits.squeeze(0)
 
-            # ✅ FIX 2: Tìm span tối ưu (tách thành hàm riêng, dễ debug)
-            best_s, best_e = find_best_span(
+            # ✅ FIX Bug 2: find_best_span bắt đầu từ node 1, trả về score
+            best_s, best_e, best_span_score = find_best_span(
                 start_logits, end_logits, K, args.max_span_len
             )
 
-            # ✅ FIX 2 (tiếp): Decode span về text
-            predicted_answer = decode_span(
-                input_ids, keep_idx, best_s, best_e, tokenizer
-            )
+            # ✅ FIX Bug 3: Dùng no-answer threshold thay guard cứng
+            if is_unanswerable(start_logits, end_logits, best_span_score,
+                               na_threshold=args.na_threshold):
+                predicted_answer = ""
+            else:
+                predicted_answer = decode_span(
+                    input_ids, keep_idx, best_s, best_e, tokenizer
+                )
 
         results.append({
             "id":           item.get("id", str(len(results))),
@@ -220,12 +263,17 @@ def main():
 
         # Debug 5 sample đầu
         if args.debug and len(results) <= 5:
+            cls_score = start_logits[0].item() + end_logits[0].item()
+            start_tok = keep_idx[best_s].item() if best_s < len(keep_idx) else -1
+            end_tok   = keep_idx[best_e].item() if best_e < len(keep_idx) else -1
             print(f"\n[DEBUG #{len(results)}]")
-            print(f"  Q    : {question[:70]}")
-            print(f"  Pred : '{predicted_answer}'")
-            print(f"  keep_idx (unsorted, first 10): {keep_idx[:10].tolist()}")
-            sorted_k, _ = keep_idx.sort()
-            print(f"  keep_idx (sorted,   first 10): {sorted_k[:10].tolist()}")
+            print(f"  Q         : {question[:70]}")
+            print(f"  GT        : '{ground_truth}'")
+            print(f"  Pred      : '{predicted_answer}'")
+            print(f"  cls_score : {cls_score:.3f}  best_span_score: {best_span_score:.3f}")
+            print(f"  best_s={best_s} (tok={start_tok})  best_e={best_e} (tok={end_tok})")
+            print(f"  keep_idx [0:10]: {keep_idx[:10].tolist()}")
+            print(f"  q_idx range: 0~{question_end}  seq_len: {seq_len}")
 
     # Xuất ra file JSON
     out_dir = os.path.dirname(args.output_file)
@@ -237,12 +285,20 @@ def main():
     # --- Thống kê nhanh sau inference ---
     empty_pred  = sum(1 for r in results if not r["answer"])
     empty_truth = sum(1 for r in results if not r["ground_truth"])
-    print(f"\n Thống kê nhanh:")
+    print(f"\nThống kê nhanh:")
     print(f"   Predictions rỗng  : {empty_pred}/{len(results)} ({empty_pred/len(results)*100:.1f}%)")
     print(f"   Ground truth rỗng : {empty_truth}/{len(results)} ({empty_truth/len(results)*100:.1f}%)")
+    print(f"   (Ground truth rỗng lý tưởng = ~30.6% nếu dùng ViQuAD2 dev set)")
 
-    print(f"\n Hoàn thành! Đã lưu tại: {args.output_file}")
-    print(f" Chạy evaluation:\n   python phase4-evaluation/evaluate_json_pipeline.py --file {args.output_file}")
+    print(f"\nHoàn thành! Đã lưu tại: {args.output_file}")
+    print(f"Chạy evaluation (squad2 mode):")
+    print(f"   python phase4-evaluation/evaluate_json_pipeline.py \\")
+    print(f"       --mode squad2 \\")
+    print(f"       --squad_file <dev_set.json> \\")
+    print(f"       --pred_file  {args.output_file}")
+    print(f"\nNếu F1 vẫn thấp, thử tune --na_threshold:")
+    print(f"   +2.0  → model thiên về answerable hơn (tăng recall span)")
+    print(f"   -2.0  → model thiên về unanswerable hơn (giảm false positives)")
 
 
 if __name__ == "__main__":
