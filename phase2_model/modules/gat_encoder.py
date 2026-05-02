@@ -13,7 +13,7 @@ except ImportError:
     HAS_PYG = False
     # Fallback: Dense attention-based GAT (không cần PyG)
 
-def _sparsify_adj(adj: torch.Tensor, top_k: int = 16) -> torch.Tensor:
+def _sparsify_adj(adj: torch.Tensor, top_k: int = 24) -> torch.Tensor:
     """
     Giữ chỉ top-k neighbors per row (theo attention score).
     Cần thiết vì attention map từ XLM-R (softmax output) toàn dương:
@@ -40,7 +40,7 @@ class DenseGATLayer(nn.Module):
     Dùng khi không có PyG hoặc khi graph nhỏ (K <= 256).
     """
     def __init__(self, in_dim: int, out_dim: int, num_heads: int = 4,
-                 dropout: float = 0.1, top_k: int = 16):
+                 dropout: float = 0.1, top_k: int = 24):
         super().__init__()
         assert out_dim % num_heads == 0
         self.num_heads = num_heads
@@ -91,11 +91,10 @@ class DenseGATLayer(nn.Module):
 class GATEncoder(nn.Module):
     """2-layer GAT encoder. Input: node features + adj matrix. Output: embeddings + distance matrix.
 
-    IMPORTANT: dùng BatchNorm1d thay vì LayerNorm.
-    - LayerNorm normalize MỖI node riêng lẻ → xóa variation giữa nodes
-      → std_across_nodes = 0.076 → logits gần đều → CE = log(K) ≈ 5.07 mãi.
-    - BatchNorm1d normalize ACROSS K nodes per feature
-      → std_across_nodes → 1.0 → QA head phân biệt được nodes → loss giảm.
+    Dùng LayerNorm (không phải BatchNorm1d).
+    - BatchNorm1d tuy tốt cho diversity nhưng gây GAT gradient explosion
+      (O(K²) qua cdist → grad_norm 500K-1.6M → training bất ổn).
+    - LayerNorm ổn định hơn, phù hợp với graph nhỏ (K ≤ 256).
     """
 
     def __init__(self, in_dim: int = 768, hidden_dim: int = 512,
@@ -106,8 +105,7 @@ class GATEncoder(nn.Module):
             DenseGATLayer(dims[i], dims[i+1], num_heads=num_heads)
             for i in range(num_layers)
         ])
-        # LayerNorm — vẫn giữ vì BatchNorm1d gây GAT gradient explosion
-        # (O(K²) qua cdist → grad_norm 500K-1.6M → training bất ổn)
+        # LayerNorm — giữ vì BatchNorm1d gây GAT gradient explosion
         self.norms = nn.ModuleList([nn.LayerNorm(dims[i+1]) for i in range(num_layers)])
         self.act = nn.GELU()
 
@@ -123,7 +121,7 @@ class GATEncoder(nn.Module):
         x = node_features
         for layer, norm in zip(self.layers, self.norms):
             residual = x if x.shape == (node_features.shape[0], layer.W.out_features) else None
-            # BatchNorm1d expects (N, C) — (K nodes, out_dim) ✓
+            # LayerNorm: normalize per-node features
             x = norm(self.act(layer(x, adj_matrix)))
             if residual is not None:
                 x = x + residual

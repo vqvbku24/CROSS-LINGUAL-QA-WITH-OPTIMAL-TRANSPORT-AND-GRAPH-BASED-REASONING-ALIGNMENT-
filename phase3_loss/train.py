@@ -54,7 +54,7 @@ log = logging.getLogger(__name__)
 DEFAULT_CONFIG = {
     # Model
     "model_name"    : "xlm-roberta-base",
-    "K"             : 64,        # 160→64: FGW nhanh hơn ~15× (O(K³))
+    "K"             : 128,       # 64→128: coverage 25% tokens, cần thiết khi dùng soft-boost
     "gat_hidden"    : 512,
     "gat_out"       : 256,
     "gat_layers"    : 2,

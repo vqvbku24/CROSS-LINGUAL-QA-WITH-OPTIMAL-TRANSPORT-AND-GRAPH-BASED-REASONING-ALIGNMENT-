@@ -10,7 +10,7 @@ from .modules.fgw_solver import fgw_bapg, partial_fgw
 class CrossLingualOTModel(nn.Module):
     def __init__(self,
                  model_name: str = "xlm-roberta-base",
-                 K: int = 160,
+                 K: int = 128,
                  gat_hidden: int = 512,
                  gat_out: int = 256,
                  gat_layers: int = 2,
@@ -57,6 +57,10 @@ class CrossLingualOTModel(nn.Module):
 
         for i in range(B):
             # ── 2. Conditional Subsampling ────────────────────────────
+            # EN side: dùng soft_boost=10.0 cho answer tokens.
+            # Answer tokens KHÔNG bị hard-force vào graph, chỉ được boost
+            # attention score → rất likely được chọn bởi top-K nhưng
+            # KHÔNG guaranteed. Graph structure gần giống inference.
             q_end = batch["en_question_end"][i].item()
             en_q_idx = list(range(0, q_end + 1))   # [CLS] + question tokens
             en_a_idx = list(range(
@@ -66,8 +70,14 @@ class CrossLingualOTModel(nn.Module):
 
             vi_q_idx = list(range(0, batch["vi_question_end"][i].item() + 1))
 
-            en_sub, en_keep = conditional_subsample(en_attn[i], en_q_idx, en_a_idx, K=self.K)
-            vi_sub, vi_keep = conditional_subsample(vi_attn[i], vi_q_idx, [], K=self.K)
+            en_sub, en_keep = conditional_subsample(
+                en_attn[i], en_q_idx, en_a_idx, K=self.K,
+                soft_boost=10.0   # boost, KHÔNG force
+            )
+            vi_sub, vi_keep = conditional_subsample(
+                vi_attn[i], vi_q_idx, [], K=self.K,
+                soft_boost=0.0    # inference-like
+            )
 
             # ── 3. GAT Encoder ────────────────────────────────────────
             en_feat = en_hidden[i, en_keep, :]  # (K, H)
