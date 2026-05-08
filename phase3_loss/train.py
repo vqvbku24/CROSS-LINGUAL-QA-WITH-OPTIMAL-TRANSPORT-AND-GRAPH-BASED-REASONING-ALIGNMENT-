@@ -722,6 +722,17 @@ def main():
                         help="dùng fgw_bapg thay vì partial_fgw")
     parser.add_argument("--resume_from", type=str, default="",
                         help="Path to checkpoint (e.g. ./checkpoints/epoch_001.pt) to resume training")
+
+    # ── Ablation Study: expose lambda coefficients ─────────────────────
+    parser.add_argument("--lambda_fgw",  type=float, default=DEFAULT_CONFIG["lambda_fgw"],
+                        help="Trọng số FGW alignment loss. Set = 0 để test No FGW.")
+    parser.add_argument("--lambda_span", type=float, default=DEFAULT_CONFIG["lambda_span"],
+                        help="Trọng số Span Projection loss. Set = 0 để test No Span Proj.")
+    parser.add_argument("--lambda_cons", type=float, default=DEFAULT_CONFIG["lambda_cons"],
+                        help="Trọng số Consistency loss. Set = 0 để test No Consistency.")
+    parser.add_argument("--cons_temp",   type=float, default=DEFAULT_CONFIG["cons_temp"],
+                        help="Nhiệt độ KL-div consistency loss.")
+
     args = parser.parse_args()
 
     config = dict(DEFAULT_CONFIG)
@@ -737,7 +748,25 @@ def main():
         "K"           : args.K,
         "use_partial" : not args.use_full,
         "resume_from" : args.resume_from,
+        # Ablation lambdas
+        "lambda_fgw"  : args.lambda_fgw,
+        "lambda_span" : args.lambda_span,
+        "lambda_cons" : args.lambda_cons,
+        "cons_temp"   : args.cons_temp,
     })
+
+    # Log ablation config nếu có lambda bị tắt
+    _ablation_flags = []
+    if config["lambda_fgw"] == 0.0:
+        _ablation_flags.append("No FGW")
+    if config["lambda_span"] == 0.0:
+        _ablation_flags.append("No Span Proj")
+    if config["lambda_cons"] == 0.0:
+        _ablation_flags.append("No Consistency")
+    if _ablation_flags:
+        log.info(f"⚗️  ABLATION MODE: {' + '.join(_ablation_flags)}")
+    else:
+        log.info(f"🔬 FULL MODEL: λ_fgw={config['lambda_fgw']}, λ_span={config['lambda_span']}, λ_cons={config['lambda_cons']}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
