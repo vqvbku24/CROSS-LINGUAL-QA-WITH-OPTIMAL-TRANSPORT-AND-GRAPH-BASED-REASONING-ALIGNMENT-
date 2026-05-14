@@ -367,11 +367,15 @@ def run_overfit_full(config: dict, device: torch.device):
     for step in range(1, config["overfit_steps"] + 1):
 
         # ── Curriculum Learning — Dual Annealing (Liều 3 v2) ────────────
-        # FGW  : Phase1 step 1–50 = 0, Phase2 step 51–100 = 0→0.1 (linear)
-        #        Phase3 step 101+       = 0.1 (max)
+        # FGW  : Phase1 step 1–50 = 0, Phase2 step 51–100 = 0→max (linear)
+        #        Phase3 step 101+       = max
+        # Span : Phase1 step 1–100 = 0 (cần γ tốt trước), Phase2 step 101–200
+        #        = 0→max (linear), Phase3 step 201+ = max
+        #        (Fix Bug #5: trước đây không có annealing → train trên
+        #         pseudo-labels rác từ γ ngẫu nhiên ở early steps.)
         # Cons : Phase1 step 1–50 = 0, Phase2 step 51–150 = 0→0.1 (linear, chậm hơn)
         #        Phase3 step 151+       = 0.1 (cap thấp hơn config để tránh KL diverge)
-        # → Tách lịch annealing: FGW hội tụ nhanh, Cons "bơm" từ từ hơn.
+        # → Tách lịch annealing: FGW hội tụ nhanh, Span cần γ, Cons "bơm" từ từ.
         # ─────────────────────────────────────────────────────────────────
 
         # FGW schedule (51 → 100)
@@ -382,6 +386,15 @@ def run_overfit_full(config: dict, device: torch.device):
         else:
             criterion.lambda_fgw = config["lambda_fgw"]
 
+        # Span schedule (101 → 200) — Fix Bug #5
+        # γ cần ~100 steps FGW training trước khi pseudo-labels có ý nghĩa
+        if step <= 100:
+            criterion.lambda_span = 0.0
+        elif step <= 200:
+            criterion.lambda_span = config["lambda_span"] * (step - 100) / 100.0
+        else:
+            criterion.lambda_span = config["lambda_span"]
+
         # Cons schedule (51 → 150, cap tại 0.1 thay vì 0.3)
         _cons_max = 0.1   # cap thấp hơn config["lambda_cons"]=0.3
         if step <= 50:
@@ -391,10 +404,11 @@ def run_overfit_full(config: dict, device: torch.device):
         else:
             criterion.lambda_cons = _cons_max
 
-        if step % 10 == 0 and 51 <= step <= 160:
+        if step % 10 == 0 and 51 <= step <= 210:
             log.info(
                 f"   [Annealing step {step}] "
                 f"FGW={criterion.lambda_fgw:.4f}  "
+                f"SPAN={criterion.lambda_span:.4f}  "
                 f"CONS={criterion.lambda_cons:.4f}"
             )
 
