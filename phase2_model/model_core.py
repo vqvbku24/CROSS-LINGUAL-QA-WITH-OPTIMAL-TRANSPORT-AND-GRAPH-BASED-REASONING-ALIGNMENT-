@@ -98,8 +98,12 @@ class CrossLingualOTModel(nn.Module):
 
             batch_en_emb.append(en_emb)
             batch_vi_emb.append(vi_emb)
-            batch_D_en.append(D_en)
-            batch_D_vi.append(D_vi)
+            # Fix Bug #3: Detach D_en/D_vi — Danskin's Theorem.
+            # Gradient FGW chỉ chảy qua M (feature cost), KHÔNG qua
+            # distance matrices (graph geometry). Nếu không detach,
+            # GW term tạo O(K³) gradient chain → explosion (gn_bb 55K+).
+            batch_D_en.append(D_en.detach())
+            batch_D_vi.append(D_vi.detach())
             batch_M.append(M)
             batch_keep_en.append(en_keep)   # (K,) LongTensor — token indices EN
 

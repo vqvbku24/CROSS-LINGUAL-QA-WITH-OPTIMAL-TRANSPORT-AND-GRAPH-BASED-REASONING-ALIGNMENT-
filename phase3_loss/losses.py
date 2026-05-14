@@ -128,13 +128,14 @@ def _decode_span_from_gamma(
     """
     Dùng transport plan γ để map answer span EN → VI (pseudo-label).
 
-    Thuật toán (vectorized):
+    Thuật toán (vectorized với cumsum):
         1. Lấy cột EN tương ứng với [en_start, en_end] trong γ.
         2. Tổng hợp xác suất: vi_score[j] = Σ_{i=start}^{end} γ[i, j].
-        3. Tìm cặp (s*, e*) maximise vi_score[s*] + vi_score[e*]
+        3. Tìm cặp (s*, e*) maximise **total mass** Σ_{j=s*}^{e*} vi_score[j]
            với ràng buộc 0 ≤ e* - s* ≤ max_span_len.
+           (Fix Bug #4: dùng cumsum thay vì chỉ sum 2 endpoint.)
 
-    Complexity: O(B × K × max_span_len) thay vì O(B × K²).
+    Complexity: O(B × K × max_span_len).
 
     Args:
         gamma   : (B, K, K) transport plan
@@ -167,21 +168,24 @@ def _decode_span_from_gamma(
         # vi_score[j] = tổng transport mass từ answer EN nodes đến j
         vi_score = gamma[b, s:e + 1, :].sum(dim=0)  # (K,)
 
-        # ── Vectorized best span search ──────────────────────────
-        # Thay vì O(K²), dùng: best_e = argmax(vi_score[si:si+max_span_len])
-        # cho mỗi si → O(K × max_span_len)
+        # ── Fix Bug #4: Dùng cumsum để tìm span có total mass cao nhất ──
+        # Thay vì chỉ tối ưu vi_score[start] + vi_score[end] (2 endpoint),
+        # tối ưu Σ_{j=start}^{end} vi_score[j] (toàn bộ mass trong span).
+        cum = torch.cumsum(vi_score, dim=0)  # cum[i] = Σ_{j=0}^{i} vi_score[j]
+
+        span_len = min(max_span_len + 1, K)
         best_score = torch.tensor(-1.0, device=device)
         best_s_val = 0
         best_e_val = 0
 
-        # Tạo matrix (K, max_span_len+1): mỗi row si chứa vi_score[si:si+span]
-        span_len = min(max_span_len + 1, K)
         for si in range(K):
             ei_max = min(si + span_len, K)
-            end_scores = vi_score[si:ei_max]  # (len,)
-            # best end cho start=si
+            # Total mass from si to ei: cum[ei] - cum[si-1]
+            prefix = cum[si - 1] if si > 0 else torch.tensor(0.0, device=device)
+            end_scores = cum[si:ei_max] - prefix  # (len,) — total mass cho mỗi end
+
             local_best_idx = end_scores.argmax()
-            score = vi_score[si] + end_scores[local_best_idx]
+            score = end_scores[local_best_idx]
             if score > best_score:
                 best_score = score
                 best_s_val = si

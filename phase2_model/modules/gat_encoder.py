@@ -107,6 +107,15 @@ class GATEncoder(nn.Module):
         ])
         # LayerNorm — giữ vì BatchNorm1d gây GAT gradient explosion
         self.norms = nn.ModuleList([nn.LayerNorm(dims[i+1]) for i in range(num_layers)])
+        # Residual projection: align dimension khi in_dim != out_dim
+        # Fix Bug #1: dims luôn khác nhau (768→512→256) nên residual cũ
+        # (so sánh shape trực tiếp) KHÔNG BAO GIỜ kích hoạt → dead code.
+        # Thay bằng nn.Linear projection cho mỗi layer.
+        self.residual_projs = nn.ModuleList([
+            nn.Linear(dims[i], dims[i+1], bias=False) if dims[i] != dims[i+1]
+            else nn.Identity()
+            for i in range(num_layers)
+        ])
         self.act = nn.GELU()
 
     def forward(self, node_features: torch.Tensor, adj_matrix: torch.Tensor):
@@ -119,12 +128,11 @@ class GATEncoder(nn.Module):
             D:        (K, K) — pairwise L2 distance matrix (dùng cho FGW)
         """
         x = node_features
-        for layer, norm in zip(self.layers, self.norms):
-            residual = x if x.shape == (node_features.shape[0], layer.W.out_features) else None
+        for layer, norm, res_proj in zip(self.layers, self.norms, self.residual_projs):
+            residual = res_proj(x)  # (K, out_dim) — projected residual
             # LayerNorm: normalize per-node features
             x = norm(self.act(layer(x, adj_matrix)))
-            if residual is not None:
-                x = x + residual
+            x = x + residual  # residual luôn hoạt động nhờ projection
 
         D = torch.cdist(x, x, p=2)  # (K, K)
         return x, D
