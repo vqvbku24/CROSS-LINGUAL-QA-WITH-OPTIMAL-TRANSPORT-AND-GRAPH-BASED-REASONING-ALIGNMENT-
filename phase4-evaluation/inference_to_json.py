@@ -48,29 +48,33 @@ def extract_ground_truth(item):
     return ""
 
 
-def find_best_span(start_logits, end_logits, K, max_span_len=30):
+def find_best_span(start_logits, end_logits, K, max_span_len, keep_idx, question_end):
     """
-    Tìm span (s, e) tối ưu với ràng buộc s <= e và e - s < max_span_len.
-
-    ✅ FIX: Bắt đầu s từ 0 — khớp với training.
-    Training dùng _remap_positions_to_graph_space (argmin nearest-neighbor)
-    có thể map answer start/end vào bất kỳ node nào (kể cả node 0).
-    Nếu skip node 0 ở inference → mất recall cho những sample đó.
-
-    No-answer detection được xử lý riêng bởi is_unanswerable().
-
-    Trả về (best_s, best_e, best_score) để caller có thể so sánh với
-    no-answer score (cls_score) khi cần.
+    Tìm span (s, e) tối ưu.
+    Ràng buộc độ dài và thứ tự phải dựa trên TOKEN INDEX (không phải GRAPH NODE INDEX).
+    Tuyệt đối KHÔNG chọn span nằm trong phần câu hỏi (ngoại trừ s=0, e=0 là CLS).
     """
     best_score = float('-inf')
     best_s, best_e = 0, 0
 
-    for s in range(K):              # ← FIX: bắt đầu từ 0, khớp với training
-        for e in range(s, min(s + max_span_len, K)):
-            score = start_logits[s].item() + end_logits[e].item()
-            if score > best_score:
-                best_score = score
-                best_s, best_e = s, e
+    for s in range(K):
+        for e in range(K):
+            tok_s = keep_idx[s].item()
+            tok_e = keep_idx[e].item()
+
+            # Cho phép s=0, e=0 (CLS) để giữ mốc no-answer
+            if s == 0 and e == 0:
+                pass
+            # Bỏ qua nếu span dính vào phần câu hỏi
+            elif tok_s <= question_end or tok_e <= question_end:
+                continue
+
+            # Ràng buộc trên TOKEN SPACE: start phải đứng trước end
+            if tok_s <= tok_e and (tok_e - tok_s) < max_span_len:
+                score = start_logits[s].item() + end_logits[e].item()
+                if score > best_score:
+                    best_score = score
+                    best_s, best_e = s, e
 
     return best_s, best_e, best_score
 
@@ -240,9 +244,14 @@ def main():
             start_logits = start_logits.squeeze(0)
             end_logits   = end_logits.squeeze(0)
 
-            # ✅ FIX Bug 2: find_best_span bắt đầu từ node 1, trả về score
+            # Áp dụng na_threshold làm penalty cho vị trí CLS (node 0)
+            # Threshold càng cao -> penalty càng lớn -> model càng khó chọn [CLS] (trả lời rỗng)
+            start_logits[0] -= args.na_threshold / 2
+            end_logits[0]   -= args.na_threshold / 2
+
+            # ✅ FIX Bug 2: find_best_span dựa trên token index
             best_s, best_e, best_span_score = find_best_span(
-                start_logits, end_logits, K, args.max_span_len
+                start_logits, end_logits, K, args.max_span_len, keep_idx, question_end
             )
 
             # ✅ FIX Bug 3: Dùng no-answer threshold thay guard cứng

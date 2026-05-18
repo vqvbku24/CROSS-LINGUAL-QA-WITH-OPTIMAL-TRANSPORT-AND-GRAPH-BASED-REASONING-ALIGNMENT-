@@ -4,7 +4,7 @@ import torch.nn as nn
 from .modules.backbone import SharedBackbone
 from .modules.gat_encoder import GATEncoder
 from .modules.subsampling import conditional_subsample
-from .modules.fgw_solver import fgw_bapg, partial_fgw
+from .modules.fgw_solver import gw_sinkhorn_gpu_batched
 
 
 class CrossLingualOTModel(nn.Module):
@@ -46,7 +46,7 @@ class CrossLingualOTModel(nn.Module):
         vi_hidden, vi_attn = self.backbone(batch["vi_input_ids"], batch["vi_attention_mask"])
         # en_hidden: (B, L, H) | en_attn: (B, L, L)
 
-        batch_gamma    = []
+        batch_gamma    = []   # kept for compatibility but NOT used (GPU solver returns tensor)
         batch_en_emb   = []
         batch_vi_emb   = []
         batch_D_en     = []
@@ -107,26 +107,39 @@ class CrossLingualOTModel(nn.Module):
             batch_M.append(M)
             batch_keep_en.append(en_keep)   # (K,) LongTensor — token indices EN
 
-        # Parallelize FGW solving over the batch to save time
-        from concurrent.futures import ThreadPoolExecutor
-        
-        def solve_fgw(i):
-            if self.use_partial:
-                return partial_fgw(batch_D_en[i], batch_D_vi[i], m=self.partial_m, nb_dummies=50)
-            else:
-                return fgw_bapg(batch_D_en[i], batch_D_vi[i], batch_M[i],
-                                alpha=self.fgw_alpha, epsilon=self.fgw_epsilon)
+        # ── FGW solving: BATCHED GPU Sinkhorn ────────────────────────
+        # Thay vì gọi POT CPU tuần tự (45s × 32 = 24 phút/batch),
+        # dùng GPU-native Sinkhorn xử lý song song toàn bộ batch
+        # trên GPU (~0.1-0.5s/batch). Fully differentiable, không cần STE.
+        from .modules.fgw_solver import gw_sinkhorn_gpu_batched  # noqa: already at module level
+        import time as _time
+        import sys as _sys
 
-        with ThreadPoolExecutor(max_workers=min(B, 8)) as executor:
-            batch_gamma = list(executor.map(solve_fgw, range(B)))
+        D_en_batch = torch.stack(batch_D_en)   # (B, K, K)
+        D_vi_batch = torch.stack(batch_D_vi)   # (B, K, K)
+        M_batch    = torch.stack(batch_M)      # (B, K, K)
+
+        _fgw_t0 = _time.time()
+        batch_gamma_tensor = gw_sinkhorn_gpu_batched(
+            D_en=D_en_batch,
+            D_vi=D_vi_batch,
+            M=M_batch if not self.use_partial else None,  # partial = pure GW
+            alpha=self.fgw_alpha,
+            epsilon=self.fgw_epsilon if self.fgw_epsilon >= 0.01 else 0.05,
+            max_iter=50,
+            sinkhorn_iter=30,
+        )
+        _fgw_elapsed = _time.time() - _fgw_t0
+        print(f"      [FGW-GPU] Batch {B} samples, K={self.K}: {_fgw_elapsed:.2f}s", flush=True)
+        _sys.stdout.flush()
 
         return {
-            "gamma"       : torch.stack(batch_gamma),        # (B, K, K)
+            "gamma"       : batch_gamma_tensor,                # (B, K, K)
             "en_node_emb" : torch.stack(batch_en_emb),       # (B, K, out_dim)
             "vi_node_emb" : torch.stack(batch_vi_emb),       # (B, K, out_dim)
-            "D_en"        : torch.stack(batch_D_en),         # (B, K, K)
-            "D_vi"        : torch.stack(batch_D_vi),         # (B, K, K)
-            "M"           : torch.stack(batch_M),            # (B, K, K)
+            "D_en"        : D_en_batch,                      # (B, K, K)
+            "D_vi"        : D_vi_batch,                      # (B, K, K)
+            "M"           : M_batch,                         # (B, K, K)
             # keep_idx_en[b][j] = token index gốc (trong [0, L-1]) của node j trong EN graph.
             # losses.py dùng để map en_start/en_end từ token-space [0,511] → graph-space [0,K-1].
             "keep_idx_en" : torch.stack(batch_keep_en),      # (B, K) LongTensor

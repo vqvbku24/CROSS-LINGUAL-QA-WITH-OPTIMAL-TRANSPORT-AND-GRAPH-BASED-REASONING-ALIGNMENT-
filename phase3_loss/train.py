@@ -568,7 +568,16 @@ def run_training(config: dict, device: torch.device):
         accum_count = 0
 
         for step, batch in enumerate(train_loader):
+            # ═══ PROBE 1: DataLoader đã trả batch ═══
+            import sys as _sys, time as _time
+            _t_step = _time.time()
+            print(f"\n--- [Epoch {epoch} Step {step}] DataLoader OK ---", flush=True)
+            _sys.stdout.flush()
+
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            # ═══ PROBE 2: Batch đã lên GPU ═══
+            print(f"--- [Epoch {epoch} Step {step}] Batch → GPU OK ---", flush=True)
+            _sys.stdout.flush()
 
             # ── Curriculum Learning — Dual Annealing (cho Full Train) ──────
             # Phase 1 (step 1–200)   : chỉ L_qa — backbone + GAT ổn định trước
@@ -601,16 +610,37 @@ def run_training(config: dict, device: torch.device):
 
             # Forward
             try:
+                # ═══ PROBE 3a: Bắt đầu Forward ═══
+                print(f"--- [Epoch {epoch} Step {step}] Forward bắt đầu... ---", flush=True)
+                _sys.stdout.flush()
+                _t_fwd = _time.time()
                 raw_outputs = model(batch)
+                _fwd_time = _time.time() - _t_fwd
+                # ═══ PROBE 3b: Forward xong ═══
+                print(f"--- [Epoch {epoch} Step {step}] Forward XONG ({_fwd_time:.1f}s) ---", flush=True)
+                _sys.stdout.flush()
             except RuntimeError as e:
                 log.error(f"[Epoch {epoch} Step {step}] Forward error: {e}")
                 continue
 
             outputs = _patch_model_outputs(model, batch, raw_outputs)
+            # ═══ PROBE 4: Loss computation bắt đầu ═══
+            print(f"--- [Epoch {epoch} Step {step}] Loss computation... ---", flush=True)
+            _sys.stdout.flush()
             losses  = criterion(outputs, batch)
+            # ═══ PROBE 5: Loss xong ═══
+            print(f"--- [Epoch {epoch} Step {step}] Loss XONG (total={losses['total'].item():.4f}) ---", flush=True)
+            _sys.stdout.flush()
 
             loss = losses["total"] / config["grad_accum_steps"]
+            # ═══ PROBE 6: Backward bắt đầu ═══
+            print(f"--- [Epoch {epoch} Step {step}] Backward bắt đầu... ---", flush=True)
+            _sys.stdout.flush()
             loss.backward()
+            # ═══ PROBE 7: Backward xong ═══
+            _step_time = _time.time() - _t_step
+            print(f"--- [Epoch {epoch} Step {step}] Backward XONG (step total: {_step_time:.1f}s) ---", flush=True)
+            _sys.stdout.flush()
 
             epoch_loss  += losses["total"].item()
             accum_count += 1
