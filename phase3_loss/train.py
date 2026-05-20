@@ -62,9 +62,9 @@ DEFAULT_CONFIG = {
     "use_partial"   : True,
     "partial_m"     : 0.85,
 
-    "lambda_fgw"    : 0.03,
-    "lambda_span"   : 0.5,
-    "lambda_cons"   : 0.2,
+    "lambda_fgw"    : 0.008,
+    "lambda_span"   : 0.3,
+    "lambda_cons"   : 0.05,
     "cons_temp"     : 2.0,
     "max_span_len"  : 40,
 
@@ -134,7 +134,7 @@ def _patch_model_outputs(model, batch: dict, raw_outputs: dict) -> dict:
 # Setup DataLoader
 # ──────────────────────────────────────────────────────────────
 
-def setup_dataloader(config: dict) -> DataLoader:
+def setup_dataloader(config: dict):
     from phase1_dataloader.data_setup import get_setup_objects
     from phase1_dataloader.cross_lingual_dataset import create_dataloader
 
@@ -154,7 +154,7 @@ def setup_dataloader(config: dict) -> DataLoader:
         # pin_memory=True,
     )
     log.info(f"DataLoader sẵn sàng: {len(train_loader)} batches/epoch")
-    return train_loader
+    return train_loader, tokenizer
 
 
 # ──────────────────────────────────────────────────────────────
@@ -186,6 +186,7 @@ def setup_model_and_criterion(config: dict, device: torch.device):
         fgw_alpha      = config["fgw_alpha"],
         consistency_temperature = config["cons_temp"],
         max_span_len   = config["max_span_len"],
+        q_hidden_size  = model.backbone.hidden_size,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -203,7 +204,7 @@ def run_overfit(config: dict, device: torch.device):
     log.info("MODE: OVERFIT ON A SINGLE BATCH (Sanity Check)")
     log.info("=" * 60)
 
-    train_loader = setup_dataloader(config)
+    train_loader, tokenizer = setup_dataloader(config)
     model, criterion = setup_model_and_criterion(config, device)
 
     fixed_batch = next(iter(train_loader))
@@ -309,7 +310,7 @@ def run_overfit_full(config: dict, device: torch.device):
     log.info("MODE: OVERFIT FULL (Backbone + GAT + QA head — all unfrozen)")
     log.info("=" * 60)
 
-    train_loader = setup_dataloader(config)
+    train_loader, tokenizer = setup_dataloader(config)
     model, criterion = setup_model_and_criterion(config, device)
 
     fixed_batch = next(iter(train_loader))
@@ -427,8 +428,6 @@ def run_overfit_full(config: dict, device: torch.device):
         gn_other = torch.nn.utils.clip_grad_norm_(
             other_params, max_norm=1.5       # ← tăng từ 1.0: cho head học nhanh hơn
         ).item()
-        # Liều 2b: clip joint toàn bộ — safety net cuối cùng
-        torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
 
         optimizer.step()
 
@@ -488,7 +487,7 @@ def run_training(config: dict, device: torch.device):
 
     os.makedirs(config["output_dir"], exist_ok=True)
 
-    train_loader = setup_dataloader(config)
+    train_loader, tokenizer = setup_dataloader(config)
     model, criterion = setup_model_and_criterion(config, device)
 
     backbone_params = list(model.backbone.parameters())
@@ -519,6 +518,7 @@ def run_training(config: dict, device: torch.device):
 
     start_epoch = 1
     global_step = 0
+    best_em = 0.0
     optimizer.zero_grad()
 
     # THÊM DÒNG NÀY VÀO ĐÂY: Khởi tạo TensorBoard Writer
@@ -564,27 +564,13 @@ def run_training(config: dict, device: torch.device):
         else:
             log.info(f"Epoch {epoch}: Duy trì max lambdas (trừ khi warmup chưa xong).")
 
-        epoch_loss  = 0.0
+        epoch_losses = {"total": 0.0, "qa": 0.0, "has_ans": 0.0, "fgw": 0.0, "span_proj": 0.0, "cons": 0.0}
         accum_count = 0
 
         for step, batch in enumerate(train_loader):
-            # ═══ PROBE 1: DataLoader đã trả batch ═══
-            import sys as _sys, time as _time
-            _t_step = _time.time()
-            print(f"\n--- [Epoch {epoch} Step {step}] DataLoader OK ---", flush=True)
-            _sys.stdout.flush()
-
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            # ═══ PROBE 2: Batch đã lên GPU ═══
-            print(f"--- [Epoch {epoch} Step {step}] Batch → GPU OK ---", flush=True)
-            _sys.stdout.flush()
 
-            # ── Curriculum Learning — Dual Annealing (cho Full Train) ──────
-            # Phase 1 (step 1–200)   : chỉ L_qa — backbone + GAT ổn định trước
-            # Phase 2 (step 201–500) : bật FGW dần (γ bắt đầu có ý nghĩa)
-            # Phase 3 (step 501+)    : bật Span (cần γ tốt để project đúng)
-            # Phase 4 (step 1001+)   : bật Cons (cần cả 2 nhánh đã học tạm)
-            # ───────────────────────────────────────────────────────────────
+            # ── Curriculum Learning — Dual Annealing ──────────────────────
             current_step = global_step + 1
 
             if current_step <= _FGW_DELAY:
@@ -610,39 +596,22 @@ def run_training(config: dict, device: torch.device):
 
             # Forward
             try:
-                # ═══ PROBE 3a: Bắt đầu Forward ═══
-                print(f"--- [Epoch {epoch} Step {step}] Forward bắt đầu... ---", flush=True)
-                _sys.stdout.flush()
-                _t_fwd = _time.time()
                 raw_outputs = model(batch)
-                _fwd_time = _time.time() - _t_fwd
-                # ═══ PROBE 3b: Forward xong ═══
-                print(f"--- [Epoch {epoch} Step {step}] Forward XONG ({_fwd_time:.1f}s) ---", flush=True)
-                _sys.stdout.flush()
             except RuntimeError as e:
                 log.error(f"[Epoch {epoch} Step {step}] Forward error: {e}")
                 continue
 
             outputs = _patch_model_outputs(model, batch, raw_outputs)
-            # ═══ PROBE 4: Loss computation bắt đầu ═══
-            print(f"--- [Epoch {epoch} Step {step}] Loss computation... ---", flush=True)
-            _sys.stdout.flush()
             losses  = criterion(outputs, batch)
-            # ═══ PROBE 5: Loss xong ═══
-            print(f"--- [Epoch {epoch} Step {step}] Loss XONG (total={losses['total'].item():.4f}) ---", flush=True)
-            _sys.stdout.flush()
 
             loss = losses["total"] / config["grad_accum_steps"]
-            # ═══ PROBE 6: Backward bắt đầu ═══
-            print(f"--- [Epoch {epoch} Step {step}] Backward bắt đầu... ---", flush=True)
-            _sys.stdout.flush()
             loss.backward()
-            # ═══ PROBE 7: Backward xong ═══
-            _step_time = _time.time() - _t_step
-            print(f"--- [Epoch {epoch} Step {step}] Backward XONG (step total: {_step_time:.1f}s) ---", flush=True)
-            _sys.stdout.flush()
 
-            epoch_loss  += losses["total"].item()
+            for k, v in losses.items():
+                if isinstance(v, torch.Tensor):
+                    epoch_losses[k] = epoch_losses.get(k, 0.0) + v.item()
+                else:
+                    epoch_losses[k] = epoch_losses.get(k, 0.0) + v
             accum_count += 1
 
             if (step + 1) % config["grad_accum_steps"] == 0:
@@ -655,8 +624,6 @@ def run_training(config: dict, device: torch.device):
                     other_params,
                     config["max_grad_norm"] * 1.5,    # GAT + QA head: 1.5
                 )
-                # Safety net cuối cùng
-                torch.nn.utils.clip_grad_norm_(all_params, config["max_grad_norm"])
                 
                 optimizer.step()
                 if scheduler is not None:
@@ -669,32 +636,106 @@ def run_training(config: dict, device: torch.device):
                         f"Epoch {epoch} | GlobalStep {global_step} | "
                         f"total={losses['total'].item():.4f} | "
                         f"qa={losses['qa'].item():.4f} | "
+                        f"has_ans={losses.get('has_ans', torch.tensor(0)).item():.4f} | "
                         f"fgw={losses['fgw'].item():.4f} | "
                         f"span={losses['span_proj'].item():.4f} | "
                         f"cons={losses['cons'].item():.4f} | "
                         f"λ=({criterion.lambda_fgw:.3f},{criterion.lambda_span:.3f},{criterion.lambda_cons:.3f})"
                     )
 
-                    # --- THÊM KHỐI NÀY ĐỂ VẼ BIỂU ĐỒ ---
-                    # 1. Vẽ biểu đồ các loại Loss
-                    writer.add_scalar("Loss/Total", losses['total'].item(), global_step)
-                    writer.add_scalar("Loss/QA (English)", losses['qa'].item(), global_step)
-                    writer.add_scalar("Loss/FGW (Alignment)", losses['fgw'].item(), global_step)
-                    writer.add_scalar("Loss/Span (Vietnamese)", losses['span_proj'].item(), global_step)
-                    writer.add_scalar("Loss/Consistency", losses['cons'].item(), global_step)
-                    
-                    # 2. Vẽ biểu đồ theo dõi Dual Annealing 
-                    writer.add_scalar("Lambda/FGW", criterion.lambda_fgw, global_step)
+                    # --- TENSORBOARD LOGGING ---
+                    # Loss components
+                    writer.add_scalar("Loss/Total",               losses['total'].item(),    global_step)
+                    writer.add_scalar("Loss/QA",                  losses['qa'].item(),       global_step)
+                    writer.add_scalar("Loss/QA_Start",            losses['qa_start'].item(), global_step)
+                    writer.add_scalar("Loss/QA_End",              losses['qa_end'].item(),   global_step)
+                    writer.add_scalar("Loss/HasAnswer (BCE)",     losses.get('has_ans', torch.tensor(0)).item(), global_step)
+                    writer.add_scalar("Loss/FGW (Alignment)",     losses['fgw'].item(),      global_step)
+                    writer.add_scalar("Loss/Span (Vietnamese)",   losses['span_proj'].item(),global_step)
+                    writer.add_scalar("Loss/Consistency",         losses['cons'].item(),     global_step)
+
+                    # Curriculum lambda tracking
+                    writer.add_scalar("Lambda/FGW",  criterion.lambda_fgw,  global_step)
                     writer.add_scalar("Lambda/Span", criterion.lambda_span, global_step)
                     writer.add_scalar("Lambda/Cons", criterion.lambda_cons, global_step)
-                    
-                    # 3. Theo dõi Learning Rate
+
+                    # Learning rate
                     writer.add_scalar("Learning_Rate/Backbone", optimizer.param_groups[0]['lr'], global_step)
-                    writer.add_scalar("Learning_Rate/Head", optimizer.param_groups[1]['lr'], global_step)
+                    writer.add_scalar("Learning_Rate/Head",     optimizer.param_groups[1]['lr'], global_step)
+
+                    # CLS collapse detector
+                    # Nếu collapse_ratio_start gần 1.0 trong vài epoch đầu
+                    # → CLS đang dominate → cần kiểm tra gradient flow / tăng lambda_has_ans
+                    _cls_s = losses.get('dbg/cls_start', torch.tensor(0)).item()
+                    _max_s = losses.get('dbg/max_start', torch.tensor(1)).item()
+                    _cls_e = losses.get('dbg/cls_end',   torch.tensor(0)).item()
+                    _max_e = losses.get('dbg/max_end',   torch.tensor(1)).item()
+                    writer.add_scalar("Debug/CLS_Start_Logit",      _cls_s, global_step)
+                    writer.add_scalar("Debug/Max_Start_Logit",      _max_s, global_step)
+                    writer.add_scalar("Debug/CLS_End_Logit",        _cls_e, global_step)
+                    writer.add_scalar("Debug/Max_End_Logit",        _max_e, global_step)
+                    # collapse_ratio: 1.0 = collapse, 0.0 = healthy
+                    _denom_s = abs(_max_s) + 1e-8
+                    _denom_e = abs(_max_e) + 1e-8
+                    writer.add_scalar("Debug/Collapse_Ratio_Start", abs(_cls_s) / _denom_s, global_step)
+                    writer.add_scalar("Debug/Collapse_Ratio_End",   abs(_cls_e) / _denom_e, global_step)
+                    _has_acc = losses.get('dbg/has_ans_acc', torch.tensor(float('nan'))).item()
+                    if not torch.isnan(torch.tensor(_has_acc)):
+                        writer.add_scalar("Debug/HasAnswer_Accuracy", _has_acc, global_step)
                     # -----------------------------------
 
-        avg_loss = epoch_loss / max(accum_count, 1)
-        log.info(f"━━ Epoch {epoch}/{config['max_epochs']} done | avg_loss={avg_loss:.4f}")
+        if accum_count > 0:
+            avg_losses = {k: v / accum_count for k, v in epoch_losses.items()}
+            log.info(f"━━ Epoch {epoch}/{config['max_epochs']} done | avg_loss={avg_losses.get('total', 0):.4f}")
+            
+            # --- THÊM IN LOSS BREAKDOWN SAU MỖI EPOCH ---
+            log.info(f"Loss breakdown (Epoch {epoch}):")
+            log.info(f"  total_loss : {avg_losses.get('total', 0):.4f}")
+            log.info(f"  qa_loss    : {avg_losses.get('qa', 0):.4f} (Span Extraction)")
+            log.info(f"  has_ans    : {avg_losses.get('has_ans', 0):.4f} (Answerable BCE)")
+            log.info(f"  ot_loss    : {avg_losses.get('fgw', 0):.4f} (FGW Alignment)")
+            log.info(f"  span_loss  : {avg_losses.get('span_proj', 0):.4f} (Pseudo-label)")
+            log.info(f"  cons_loss  : {avg_losses.get('cons', 0):.4f} (Consistency)")
+            
+            if avg_losses.get('qa', 0) > 0:
+                ratio = avg_losses.get('fgw', 0) / avg_losses.get('qa', 1)
+                log.info(f"  [!] Ratio OT/QA: {ratio:.2f}")
+
+            log.info(f"  Current λ  : FGW={criterion.lambda_fgw:.3f}, Span={criterion.lambda_span:.3f}, Cons={criterion.lambda_cons:.3f}")
+            log.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            avg_loss = avg_losses.get('total', 0)
+        else:
+            avg_loss = 0.0
+
+        # Quick Eval (thực hiện mỗi 2 epoch)
+        if epoch % 2 == 0 and not config.get("overfit", False):
+            import importlib.util
+            eval_file = os.path.join(config["root_dir"], "phase4-evaluation", "quick_eval.py")
+            spec = importlib.util.spec_from_file_location("quick_eval", eval_file)
+            quick_eval_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(quick_eval_mod)
+            quick_em = quick_eval_mod.quick_em
+            dev_file = os.path.join(config["root_dir"], "dataset", "Squad2.0", "dev-v2.0.json")
+            if os.path.exists(dev_file):
+                log.info(f"Đang chạy Quick Eval trên tập dev (200 samples)...")
+                try:
+                    em = quick_em(model, criterion, tokenizer, dev_file, n_samples=200, device=device)
+                    writer.add_scalar("Eval/QuickEM", em, epoch)
+                    log.info(f"Epoch {epoch} Quick EM (200 samples): {em:.2f}%")
+                    if em > best_em:
+                        best_em = em
+                        best_ckpt_path = os.path.join(config["output_dir"], "best.pt")
+                        torch.save({
+                            "epoch": epoch,
+                            "model_state": model.state_dict(),
+                            "criterion_state": criterion.state_dict(),
+                            "em": em,
+                        }, best_ckpt_path)
+                        log.info(f"   Đã lưu checkpoint tốt nhất tại: {best_ckpt_path}")
+                except Exception as e:
+                    log.error(f"Lỗi khi chạy Quick Eval: {e}")
+            else:
+                log.warning(f"Không tìm thấy dev_file tại {dev_file} để chạy Quick Eval.")
 
         # Save checkpoint
         if epoch % config["save_every"] == 0:
@@ -715,13 +756,15 @@ def run_training(config: dict, device: torch.device):
             # TỰ ĐỘNG ĐẨY LÊN HUGGING FACE NẾU CÓ CẤU HÌNH REPO_ID
             # ========================================================
             if config.get("hf_repo_id") and HfApi is not None:
-                # Token sẽ tự động được lấy từ biến môi trường HF_TOKEN hoặc từ "huggingface-cli login"
-                api = HfApi()
+                api = HfApi(token=os.environ.get("HF_TOKEN"))
+                output_basename = os.path.basename(os.path.normpath(config["output_dir"]))
+                if not output_basename:
+                    output_basename = "checkpoints"
                 try:
                     log.info(f"   Đang đẩy file {ckpt_path} lên Hugging Face ({config['hf_repo_id']})...")
                     api.upload_file(
                         path_or_fileobj=ckpt_path,
-                        path_in_repo=f"checkpoints/epoch_{epoch:03d}.pt",
+                        path_in_repo=f"{output_basename}/epoch_{epoch:03d}.pt",
                         repo_id=config["hf_repo_id"],
                         repo_type="model"
                     )
@@ -730,7 +773,7 @@ def run_training(config: dict, device: torch.device):
                     # Lệnh này cực kỳ thông minh: nó chỉ tải lên các file mới hoặc có sự thay đổi
                     api.upload_folder(
                         folder_path=tb_log_dir,
-                        path_in_repo="logs/tensorboard",
+                        path_in_repo=f"logs/{output_basename}_tensorboard",
                         repo_id=config["hf_repo_id"],
                         repo_type="model"
                     )

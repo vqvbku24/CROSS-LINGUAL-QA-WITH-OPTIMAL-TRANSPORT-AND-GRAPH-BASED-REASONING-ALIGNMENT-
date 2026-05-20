@@ -181,6 +181,15 @@ class CrossLingualQADataset(Dataset):
         # (field "answers" trong SQuAD có dạng {"text": [...], "answer_start": [...]})
         en_answer = en_sample.get("answers") or en_sample.get("answer")
 
+        # ── Xác định answerable TRƯỚC KHI tokenize ──────────────────
+        en_is_answerable = (
+            en_answer is not None
+            and isinstance(en_answer.get("answer_start"), list)
+            and len(en_answer["answer_start"]) > 0
+            and len(en_answer.get("text", [])) > 0
+            and len(en_answer["text"][0].strip()) > 0
+        )
+
         # Tokenize EN (có answer span)
         en_ids, en_mask, en_start, en_end, en_qend = _call_process_fn(
             self.process_fn,
@@ -208,10 +217,11 @@ class CrossLingualQADataset(Dataset):
             "en_attention_mask":  _to_long_tensor(en_mask),
             "en_start_position":  _to_long_tensor(en_start),
             "en_end_position":    _to_long_tensor(en_end),
-            "en_question_end":    _to_long_tensor(en_qend),   # ← FIX: thêm mới
+            "en_question_end":    _to_long_tensor(en_qend),
+            "en_is_answerable":   _to_long_tensor(int(en_is_answerable)),  # ← NEW: ground truth flag
             "vi_input_ids":       _to_long_tensor(vi_ids),
             "vi_attention_mask":  _to_long_tensor(vi_mask),
-            "vi_question_end":    _to_long_tensor(vi_qend),   # ← thêm để đối xứng
+            "vi_question_end":    _to_long_tensor(vi_qend),
         }
 
 

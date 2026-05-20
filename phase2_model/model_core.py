@@ -53,6 +53,7 @@ class CrossLingualOTModel(nn.Module):
         batch_D_vi     = []
         batch_M        = []
         batch_keep_en  = []   # ← keep_idx_en: token-space indices được giữ lại
+        batch_keep_vi  = []   # ← NEW: để phục vụ token-space constraint cho VI span projection
         B = en_hidden.size(0)
 
         for i in range(B):
@@ -106,6 +107,7 @@ class CrossLingualOTModel(nn.Module):
             batch_D_vi.append(D_vi.detach())
             batch_M.append(M)
             batch_keep_en.append(en_keep)   # (K,) LongTensor — token indices EN
+            batch_keep_vi.append(vi_keep)   # (K,) LongTensor — token indices VI
 
         # ── FGW solving: BATCHED GPU Sinkhorn ────────────────────────
         # Thay vì gọi POT CPU tuần tự (45s × 32 = 24 phút/batch),
@@ -143,4 +145,7 @@ class CrossLingualOTModel(nn.Module):
             # keep_idx_en[b][j] = token index gốc (trong [0, L-1]) của node j trong EN graph.
             # losses.py dùng để map en_start/en_end từ token-space [0,511] → graph-space [0,K-1].
             "keep_idx_en" : torch.stack(batch_keep_en),      # (B, K) LongTensor
+            "keep_idx_vi" : torch.stack(batch_keep_vi),      # (B, K) LongTensor
+            "en_hidden"   : en_hidden,                       # (B, L_en, H)
+            "vi_hidden"   : vi_hidden,                       # (B, L_vi, H)
         }

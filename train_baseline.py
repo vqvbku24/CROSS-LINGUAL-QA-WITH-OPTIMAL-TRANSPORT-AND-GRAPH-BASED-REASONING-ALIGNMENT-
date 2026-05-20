@@ -344,6 +344,7 @@ def run_training(config: dict, device: torch.device):
             torch.save(save_dict, ckpt_path)
             log.info(f"   Checkpoint saved: {ckpt_path}")
 
+            is_best = False
             # Save best model
             if avg_loss < best_loss:
                 best_loss = avg_loss
@@ -351,19 +352,34 @@ def run_training(config: dict, device: torch.device):
                 model.save_pretrained(best_path)
                 tokenizer.save_pretrained(best_path)
                 log.info(f"   🏆 New best model saved: {best_path} (loss={avg_loss:.4f})")
+                is_best = True
 
             # Upload to HuggingFace nếu có config
             if config.get("hf_repo_id"):
                 try:
                     from huggingface_hub import HfApi
-                    api = HfApi()
+                    api = HfApi(token=os.environ.get("HF_TOKEN"))
+                    output_basename = os.path.basename(os.path.normpath(config["output_dir"]))
+                    if not output_basename:
+                        output_basename = "baseline_checkpoints"
+
                     log.info(f"   Uploading to HuggingFace: {config['hf_repo_id']}...")
                     api.upload_file(
                         path_or_fileobj=ckpt_path,
-                        path_in_repo=f"baseline_checkpoints/epoch_{epoch:03d}.pt",
+                        path_in_repo=f"{output_basename}/epoch_{epoch:03d}.pt",
                         repo_id=config["hf_repo_id"],
                         repo_type="model",
                     )
+                    
+                    if is_best:
+                        log.info(f"   Uploading best model to HuggingFace...")
+                        api.upload_folder(
+                            folder_path=best_path,
+                            path_in_repo=f"{output_basename}/best_model",
+                            repo_id=config["hf_repo_id"],
+                            repo_type="model",
+                        )
+
                     log.info(f"   ✅ Uploaded successfully!")
                 except Exception as e:
                     log.error(f"   Upload error (file local vẫn còn): {e}")
