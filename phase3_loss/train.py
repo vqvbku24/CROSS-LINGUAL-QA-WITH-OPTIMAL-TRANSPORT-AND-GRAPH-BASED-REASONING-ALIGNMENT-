@@ -1,17 +1,20 @@
 # train.py
 """
-Training loop cho Cross-Lingual QA with OT & Graph Alignment.
+Training loop for Cross-Lingual QA with Sinkhorn OT Alignment.
 
-Gồm hai chế độ:
-  1. --mode overfit  : "Overfit on a single batch" — sanity check Phase 2/3.
-                       Verify gradient flow + loss giảm đều → kiến trúc hợp lệ.
-  2. --mode train    : Full training loop với gradient accumulation + scheduler.
+Two modes:
+  1. --mode overfit  : Overfit on a single batch — sanity check.
+  2. --mode train    : Full training loop with gradient accumulation + scheduler.
+
+Architecture (post-refactor):
+  - No graph, no GAT, no subsampling, no FGW.
+  - Sinkhorn OT on full 512-token XLM-R hidden states.
 """
 
 import os
 import sys
 
-# Add project root directory to sys.path to enable importing modules like phase1_dataloader and phase2_model
+# Add project root directory to sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Load variables from .env file
@@ -25,15 +28,17 @@ except ImportError:
 import math
 import argparse
 import logging
-from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-# Import Hugging Face API để upload checkpoint
+# Import Hugging Face API for checkpoint upload
 try:
     from huggingface_hub import HfApi
 except ImportError:
@@ -48,26 +53,65 @@ log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────
-# Config mặc định
+# Distributed Setup / Cleanup
+# ──────────────────────────────────────────────────────────────
+
+def is_distributed() -> bool:
+    """Check if we're running in distributed mode (via torchrun)."""
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    return dist.get_rank() if is_distributed() else 0
+
+
+def get_world_size() -> int:
+    return dist.get_world_size() if is_distributed() else 1
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
+def setup_distributed():
+    """
+    Initialize distributed process group if LOCAL_RANK env var is set.
+    Called from main() before any training.
+    """
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    if local_rank == -1:
+        return  # Not running with torchrun → single-GPU mode
+
+    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(local_rank)
+    log.info(f"[Rank {dist.get_rank()}/{dist.get_world_size()}] "
+             f"Distributed initialized on GPU {local_rank}")
+
+
+def cleanup_distributed():
+    """Clean up distributed process group."""
+    if is_distributed():
+        dist.destroy_process_group()
+
+
+# ──────────────────────────────────────────────────────────────
+# Default Config
 # ──────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
-    "model_name"    : "xlm-roberta-base",
-    "K"             : 96,
-    "gat_hidden"    : 512,
-    "gat_out"       : 256,
-    "gat_layers"    : 2,
-    "fgw_alpha"     : 0.5,
-    "fgw_epsilon"   : 0.25,
-    "use_partial"   : True,
-    "partial_m"     : 0.85,
+    "model_name"        : "xlm-roberta-base",
 
-    "lambda_fgw"    : 0.008,
-    "lambda_span"   : 0.3,
-    "lambda_cons"   : 0.05,
-    "cons_temp"     : 2.0,
-    "max_span_len"  : 40,
+    # OT hyperparameters
+    "sinkhorn_epsilon"  : 0.05,
+    "sinkhorn_iters"    : 50,
 
+    # Loss weights
+    "lambda_ot"         : 0.1,
+    "lambda_span"       : 0.3,
+    "lambda_cons"       : 0.15,
+    "cons_temp"         : 2.0,
+
+    # Training hyperparameters
     "batch_size"        : 4,
     "grad_accum_steps"  : 4,
     "lr"                : 1e-5,
@@ -78,83 +122,75 @@ DEFAULT_CONFIG = {
     "max_grad_norm"     : 1.0,
     "pairing_strategy"  : "topic",
 
+    # Overfit mode
     "overfit_steps"     : 400,
     "overfit_lr"        : 3e-4,
 
-    "root_dir"      : os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "output_dir"    : os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "checkpoints"),
-    "hf_repo_id"    : "",
-    "save_every"    : 1,
-    "log_every"     : 10,
+    # Paths
+    "root_dir"          : os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "output_dir"        : os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "checkpoints"),
+    "hf_repo_id"        : "",
+    "save_every"        : 1,
+    "log_every"         : 10,
 }
-
-
-# ──────────────────────────────────────────────────────────────
-# Patch: model_core cần trả về D_en, D_vi, M
-# (Chỉ fallback nếu model_core chưa tính — hiện tại model_core
-#  đã trả về đủ cả D_en, D_vi, M, keep_idx_en trong dict.)
-# ──────────────────────────────────────────────────────────────
-
-def _patch_model_outputs(model, batch: dict, raw_outputs: dict) -> dict:
-    outputs = dict(raw_outputs)
-
-    if "D_en" not in outputs or "D_vi" not in outputs or "M" not in outputs:
-        en_emb = outputs["en_node_emb"]  # (B, K, H)
-        vi_emb = outputs["vi_node_emb"]  # (B, K, H)
-        B = en_emb.size(0)
-
-        # ── L2-normalize trước khi tính cdist ────────────────────────────
-        # Không chuẩn hóa → cdist có thể = 50~200 → exp(-C/ε) → ±∞
-        #   → gradient FGW vọt lên 55k.
-        # Sau khi normalize: ||v||=1 → cdist ∈ [0, 2] → exp(-C/ε) ∈ [e^{-20}, 1]
-        #   → Sinkhorn ổn định hoàn toàn, gradient thuần hóa.
-        # ─────────────────────────────────────────────────────────────────
-        en_emb_norm = nn.functional.normalize(en_emb, p=2, dim=-1)
-        vi_emb_norm = nn.functional.normalize(vi_emb, p=2, dim=-1)
-
-        D_en_list, D_vi_list, M_list = [], [], []
-        for b in range(B):
-            # D_en / D_vi: DETACH — đây là "cost geometry" của graph (cấu trúc),
-            # không cần backprop qua. Nếu để grad, C1 @ g @ C2.T trong fgw_alignment_loss
-            # tạo luồng gradient O(K³) ngược về backbone → gn_bb vọt lên 14k+.
-            # Chỉ M (cross-language cosine distance) giữ grad → kéo EN↔VI lại gần.
-            D_en_list.append(torch.cdist(en_emb_norm[b], en_emb_norm[b], p=2).detach())
-            D_vi_list.append(torch.cdist(vi_emb_norm[b], vi_emb_norm[b], p=2).detach())
-            # Cosine distance dùng normalized vector: 1 - cos(u,v) ∈ [0, 2]
-            M_list.append(1.0 - en_emb_norm[b] @ vi_emb_norm[b].T)
-
-        outputs["D_en"] = torch.stack(D_en_list)  # (B, K, K), max=2.0
-        outputs["D_vi"] = torch.stack(D_vi_list)
-        outputs["M"]    = torch.stack(M_list)
-
-    return outputs
 
 
 # ──────────────────────────────────────────────────────────────
 # Setup DataLoader
 # ──────────────────────────────────────────────────────────────
 
-def setup_dataloader(config: dict):
+def setup_dataloader(config: dict, for_training: bool = True):
     from phase1_dataloader.data_setup import get_setup_objects
     from phase1_dataloader.cross_lingual_dataset import create_dataloader
 
-    log.info("Loading datasets và tokenizer...")
+    if is_main_process():
+        log.info("Loading datasets and tokenizer...")
     teacher_ds, student_ds, tokenizer = get_setup_objects(
         root_dir=config["root_dir"],
     )
+
+    # Use DistributedSampler when running with torchrun
+    sampler = None
+    shuffle = True
+    if for_training and is_distributed():
+        from phase1_dataloader.cross_lingual_dataset import CrossLingualQADataset
+        # create_dataloader builds the dataset internally, so we create it
+        # and pass DistributedSampler via the loader afterwards.
+        # For now, keep create_dataloader as-is but disable shuffle
+        # (DistributedSampler handles shuffling)
+        shuffle = False
 
     train_loader = create_dataloader(
         teacher_ds=teacher_ds,
         student_ds=student_ds,
         tokenizer=tokenizer,
         batch_size=config["batch_size"],
-        shuffle=True,
+        shuffle=shuffle and not is_distributed(),
         pairing_strategy=config["pairing_strategy"],
-        # num_workers=2,
-        # pin_memory=True,
     )
-    log.info(f"DataLoader sẵn sàng: {len(train_loader)} batches/epoch")
-    return train_loader, tokenizer
+
+    # Wrap with DistributedSampler for DDP
+    if for_training and is_distributed():
+        dataset = train_loader.dataset
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=get_world_size(),
+            rank=get_rank(),
+            shuffle=True,
+        )
+        train_loader = DataLoader(
+            dataset,
+            batch_size=config["batch_size"],
+            sampler=sampler,
+            collate_fn=train_loader.collate_fn,
+            num_workers=getattr(train_loader, 'num_workers', 0),
+            pin_memory=True,
+        )
+
+    if is_main_process():
+        log.info(f"DataLoader ready: {len(train_loader)} batches/epoch"
+                 f"{' (distributed)' if is_distributed() else ''}")
+    return train_loader, tokenizer, sampler
 
 
 # ──────────────────────────────────────────────────────────────
@@ -166,31 +202,22 @@ def setup_model_and_criterion(config: dict, device: torch.device):
     from phase3_loss.losses import OTAlignmentLoss
 
     model = CrossLingualOTModel(
-        model_name  = config["model_name"],
-        K           = config["K"],
-        gat_hidden  = config["gat_hidden"],
-        gat_out     = config["gat_out"],
-        gat_layers  = config["gat_layers"],
-        fgw_alpha   = config["fgw_alpha"],
-        fgw_epsilon = config["fgw_epsilon"],
-        use_partial = config["use_partial"],
-        partial_m   = config["partial_m"],
+        model_name=config["model_name"],
     ).to(device)
 
     criterion = OTAlignmentLoss(
-        qa_hidden_size = config["gat_out"],
-        K              = config["K"],
-        lambda_fgw     = config["lambda_fgw"],
-        lambda_span    = config["lambda_span"],
-        lambda_cons    = config["lambda_cons"],
-        fgw_alpha      = config["fgw_alpha"],
+        hidden_size         = model.backbone.hidden_size,
+        lambda_ot           = config["lambda_ot"],
+        lambda_span         = config["lambda_span"],
+        lambda_cons         = config["lambda_cons"],
         consistency_temperature = config["cons_temp"],
-        max_span_len   = config["max_span_len"],
-        q_hidden_size  = model.backbone.hidden_size,
+        sinkhorn_epsilon    = config["sinkhorn_epsilon"],
+        sinkhorn_iters      = config["sinkhorn_iters"],
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
-    log.info(f"Model: {total_params:.1f}M params | Device: {device}")
+    head_params  = sum(p.numel() for p in criterion.parameters()) / 1e6
+    log.info(f"Model: {total_params:.1f}M params | QA Head: {head_params:.2f}M params | Device: {device}")
 
     return model, criterion
 
@@ -204,47 +231,34 @@ def run_overfit(config: dict, device: torch.device):
     log.info("MODE: OVERFIT ON A SINGLE BATCH (Sanity Check)")
     log.info("=" * 60)
 
-    train_loader, tokenizer = setup_dataloader(config)
+    train_loader, tokenizer, _ = setup_dataloader(config, for_training=False)
     model, criterion = setup_model_and_criterion(config, device)
 
     fixed_batch = next(iter(train_loader))
     fixed_batch = {k: v.to(device, non_blocking=True) for k, v in fixed_batch.items()}
     log.info(f"Fixed batch shapes: { {k: tuple(v.shape) for k, v in fixed_batch.items()} }")
 
-    # ── OVERFIT STRATEGY ─────────────────────────────────────────────────
-    # GAT gradient explosion (21K-1.6M) do O(K²) từ cdist(x,x) FGW gradient.
-    # BatchNorm1d giúp embedding diversity nhưng làm explosion tệ hơn (500K-1.6M).
-    # Joint clipping kill QA head update (effective LR ~1e-7/step).
-    #
-    # → Freeze cả backbone + GAT. Chỉ train QA head (0.5K params).
-    # Mục đích: "given fixed XLM-R+GAT embeddings, QA head có học đúng span?"
-    # Đây là sanity check hợp lệ nhất: verify label mapping + loss + backward.
-    # ─────────────────────────────────────────────────────────────────────
-    log.info("Freezing backbone + GAT. Training QA head only (overfit sanity check).")
+    # ── Strategy: Freeze backbone, train QA head only ──────────
+    log.info("Freezing backbone. Training QA head only (overfit sanity check).")
     for p in model.parameters():
         p.requires_grad_(False)
 
     qa_params = [p for p in criterion.parameters() if p.requires_grad]
-    log.info(f"Trainable: QA head {sum(p.numel() for p in qa_params)} params | LR={config['overfit_lr']*100:.0e}")
+    log.info(f"Trainable: QA head {sum(p.numel() for p in qa_params)} params")
 
-    opt_qa = AdamW(qa_params, lr=config["overfit_lr"] * 100, weight_decay=0.0)
+    # QA head LR = 10× overfit_lr (3e-4 × 10 = 3e-3)
+    # ×100 was too aggressive (0.03) → oscillation; ×10 is fast yet stable
+    opt_qa = AdamW(qa_params, lr=config["overfit_lr"] * 10, weight_decay=0.0)
 
-    model.eval()   # frozen → eval mode
+    model.eval()
     criterion.train()
 
-    # Tắt cons + fgw trong overfit: đây không phải là training thật.
-    # cons bị thổi phồng khi backbone+GAT frozen (EN confident, VI stuck)
-    # và fgw cố định (GAT frozen). Chỉ cần verify qa + span giảm.
+    # Disable OT + cons in overfit: just verify QA + span
+    orig_lambda_ot   = criterion.lambda_ot
     orig_lambda_cons = criterion.lambda_cons
-    orig_lambda_fgw  = getattr(criterion, "lambda_fgw", 0.1)
+    criterion.lambda_ot   = 0.0
     criterion.lambda_cons = 0.0
-    criterion.lambda_fgw  = 0.0
-    log.info("Overfit mode: lambda_cons=0, lambda_fgw=0 (verifying qa + span only)")
-
-    log.info(
-        f"Bắt đầu overfit {config['overfit_steps']} steps | "
-        f"LR_QA={config['overfit_lr']*100:.0e}..."
-    )
+    log.info("Overfit mode: lambda_ot=0, lambda_cons=0 (verifying qa + span only)")
 
     prev_loss      = float("inf")
     stagnant_count = 0
@@ -252,9 +266,8 @@ def run_overfit(config: dict, device: torch.device):
     for step in range(1, config["overfit_steps"] + 1):
         opt_qa.zero_grad()
 
-        raw_outputs = model(fixed_batch)
-        outputs     = _patch_model_outputs(model, fixed_batch, raw_outputs)
-        losses      = criterion(outputs, fixed_batch)
+        outputs = model(fixed_batch)
+        losses  = criterion(outputs, fixed_batch)
 
         losses["total"].backward()
         gn_qa = torch.nn.utils.clip_grad_norm_(qa_params, max_norm=10.0).item()
@@ -267,7 +280,7 @@ def run_overfit(config: dict, device: torch.device):
                 f"Step {step:>4d}/{config['overfit_steps']} | "
                 f"total={total:.4f} | "
                 f"qa={losses['qa'].item():.4f} | "
-                f"fgw={losses['fgw'].item():.4f} | "
+                f"ot={losses['ot'].item():.4f} | "
                 f"span={losses['span_proj'].item():.4f} | "
                 f"cons={losses['cons'].item():.4f} | "
                 f"gn_qa={gn_qa:.3f}"
@@ -276,7 +289,7 @@ def run_overfit(config: dict, device: torch.device):
         if total >= prev_loss - 1e-5:
             stagnant_count += 1
             if stagnant_count >= 30:
-                log.warning("Loss không giảm sau 30 steps liên tiếp — kiểm tra lại kiến trúc")
+                log.warning("Loss not decreasing after 30 consecutive steps")
                 break
         else:
             stagnant_count = 0
@@ -289,106 +302,72 @@ def run_overfit(config: dict, device: torch.device):
     if final_sum < 2.0:
         log.info(f"OVERFIT PASSED! qa={final_qa:.4f} span={final_span:.4f} (sum={final_sum:.4f} < 2.0)")
     else:
-        log.warning(f"OVERFIT CHƯA ĐẠT. qa={final_qa:.4f} span={final_span:.4f} (sum={final_sum:.4f})")
+        log.warning(f"OVERFIT NOT CONVERGED. qa={final_qa:.4f} span={final_span:.4f} (sum={final_sum:.4f})")
     log.info("=" * 60)
 
-    # Restore lambdas và unfreeze
+    # Restore
+    criterion.lambda_ot   = orig_lambda_ot
     criterion.lambda_cons = orig_lambda_cons
-    criterion.lambda_fgw  = orig_lambda_fgw
     for p in model.parameters():
         p.requires_grad_(True)
     model.train()
 
 
 # ──────────────────────────────────────────────────────────────
-# Mode 1b: Overfit FULL — unfreeze backbone + GAT + head
-# Bật lambda_fgw và lambda_cons để kiểm tra joint stability.
+# Mode 1b: Overfit FULL — unfreeze backbone + head
 # ──────────────────────────────────────────────────────────────
 
 def run_overfit_full(config: dict, device: torch.device):
     log.info("=" * 60)
-    log.info("MODE: OVERFIT FULL (Backbone + GAT + QA head — all unfrozen)")
+    log.info("MODE: OVERFIT FULL (Backbone + QA head — all unfrozen)")
     log.info("=" * 60)
 
-    train_loader, tokenizer = setup_dataloader(config)
+    train_loader, tokenizer, _ = setup_dataloader(config, for_training=False)
     model, criterion = setup_model_and_criterion(config, device)
 
     fixed_batch = next(iter(train_loader))
     fixed_batch = {k: v.to(device, non_blocking=True) for k, v in fixed_batch.items()}
     log.info(f"Fixed batch shapes: { {k: tuple(v.shape) for k, v in fixed_batch.items()} }")
 
-    # ── STRATEGY ─────────────────────────────────────────────────────────
-    # Toàn bộ mạng được unfreeze (backbone + GAT + QA head).
-    # lambda_fgw và lambda_cons BẬT theo config (0.1 / 0.3).
-    #
-    # LR (Liều 1 — XLM-R không bao giờ dùng LR > 5e-5):
-    #   backbone : 1e-5  (cực thấp, tránh catastrophic forgetting)
-    #   GAT+head : 1e-4  (layer mới khởi tạo, hội tụ nhanh hơn)
-    #
-    # Gradient clipping (Liều 2 — chặn cú tát 5000+ ở step 1):
-    #   1. Clip riêng backbone (max_norm=0.5) và gat+head (max_norm=1.0)
-    #      → log được gn_bb / gn_other để quan sát explosion.
-    #   2. Clip joint toàn bộ (max_norm=1.0) ngay trước optimizer.step()
-    #      → đảm bảo không gradient nào vượt ngưỡng dù ở group nào.
-    # ─────────────────────────────────────────────────────────────────────
-
-    # Đảm bảo toàn bộ params trainable
     for p in model.parameters():
         p.requires_grad_(True)
 
     backbone_params = list(model.backbone.parameters())
-    other_params    = list(model.gat.parameters()) + list(criterion.parameters())
-    all_params      = backbone_params + other_params
+    head_params     = list(criterion.parameters())
+    all_params      = backbone_params + head_params
 
-    total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_trainable += sum(p.numel() for p in criterion.parameters() if p.requires_grad)
+    total_trainable = sum(p.numel() for p in all_params if p.requires_grad)
     log.info(f"Trainable: ALL params — {total_trainable/1e6:.2f}M")
-    log.info("LR: backbone=1e-5 | gat+head=1e-4 | weight_decay=0.01")
+    log.info(f"LR: backbone=1e-5 | head=1e-4 | weight_decay=0.01")
     log.info(
-        f"lambda_fgw={config['lambda_fgw']} | "
+        f"lambda_ot={config['lambda_ot']} | "
         f"lambda_cons={config['lambda_cons']} | "
         f"lambda_span={config['lambda_span']}"
     )
 
     optimizer = AdamW([
-        {"params": backbone_params, "lr": 1e-5},   # Liều 1: XLM-R luôn ≤ 5e-5
-        {"params": other_params,    "lr": 1e-4},   # Liều 1: GAT + head mới init
+        {"params": backbone_params, "lr": 1e-5},
+        {"params": head_params,     "lr": 1e-4},
     ], weight_decay=0.01)
 
     model.train()
     criterion.train()
-
-    log.info(
-        f"Bắt đầu overfit_full {config['overfit_steps']} steps..."
-    )
 
     prev_loss      = float("inf")
     stagnant_count = 0
 
     for step in range(1, config["overfit_steps"] + 1):
 
-        # ── Curriculum Learning — Dual Annealing (Liều 3 v2) ────────────
-        # FGW  : Phase1 step 1–50 = 0, Phase2 step 51–100 = 0→max (linear)
-        #        Phase3 step 101+       = max
-        # Span : Phase1 step 1–100 = 0 (cần γ tốt trước), Phase2 step 101–200
-        #        = 0→max (linear), Phase3 step 201+ = max
-        #        (Fix Bug #5: trước đây không có annealing → train trên
-        #         pseudo-labels rác từ γ ngẫu nhiên ở early steps.)
-        # Cons : Phase1 step 1–50 = 0, Phase2 step 51–150 = 0→0.1 (linear, chậm hơn)
-        #        Phase3 step 151+       = 0.1 (cap thấp hơn config để tránh KL diverge)
-        # → Tách lịch annealing: FGW hội tụ nhanh, Span cần γ, Cons "bơm" từ từ.
-        # ─────────────────────────────────────────────────────────────────
-
-        # FGW schedule (51 → 100)
+        # ── Curriculum: OT warmup ──────────────────────────────
+        # OT: Phase1 step 1-50 = 0, Phase2 step 51-100 = 0→max
         if step <= 50:
-            criterion.lambda_fgw = 0.0
+            criterion.lambda_ot = 0.0
         elif step <= 100:
-            criterion.lambda_fgw = config["lambda_fgw"] * (step - 50) / 50.0
+            criterion.lambda_ot = config["lambda_ot"] * (step - 50) / 50.0
         else:
-            criterion.lambda_fgw = config["lambda_fgw"]
+            criterion.lambda_ot = config["lambda_ot"]
 
-        # Span schedule (101 → 200) — Fix Bug #5
-        # γ cần ~100 steps FGW training trước khi pseudo-labels có ý nghĩa
+        # Span: Phase1 step 1-100 = 0, Phase2 step 101-200 = 0→max
         if step <= 100:
             criterion.lambda_span = 0.0
         elif step <= 200:
@@ -396,8 +375,8 @@ def run_overfit_full(config: dict, device: torch.device):
         else:
             criterion.lambda_span = config["lambda_span"]
 
-        # Cons schedule (51 → 150, cap tại 0.1 thay vì 0.3)
-        _cons_max = 0.1   # cap thấp hơn config["lambda_cons"]=0.3
+        # Cons: Phase1 step 1-50 = 0, Phase2 step 51-150 = 0→0.1
+        _cons_max = min(0.1, config["lambda_cons"])
         if step <= 50:
             criterion.lambda_cons = 0.0
         elif step <= 150:
@@ -408,26 +387,20 @@ def run_overfit_full(config: dict, device: torch.device):
         if step % 10 == 0 and 51 <= step <= 210:
             log.info(
                 f"   [Annealing step {step}] "
-                f"FGW={criterion.lambda_fgw:.4f}  "
+                f"OT={criterion.lambda_ot:.4f}  "
                 f"SPAN={criterion.lambda_span:.4f}  "
                 f"CONS={criterion.lambda_cons:.4f}"
             )
 
         optimizer.zero_grad()
 
-        raw_outputs = model(fixed_batch)
-        outputs     = _patch_model_outputs(model, fixed_batch, raw_outputs)
-        losses      = criterion(outputs, fixed_batch)
+        outputs = model(fixed_batch)
+        losses  = criterion(outputs, fixed_batch)
 
         losses["total"].backward()
 
-        # Liều 2a: clip riêng từng group để quan sát explosion
-        gn_bb = torch.nn.utils.clip_grad_norm_(
-            backbone_params, max_norm=0.15    # ← giảm từ 0.5: chặn explosion backbone
-        ).item()
-        gn_other = torch.nn.utils.clip_grad_norm_(
-            other_params, max_norm=1.5       # ← tăng từ 1.0: cho head học nhanh hơn
-        ).item()
+        gn_bb = torch.nn.utils.clip_grad_norm_(backbone_params, max_norm=0.15).item()
+        gn_head = torch.nn.utils.clip_grad_norm_(head_params, max_norm=1.5).item()
 
         optimizer.step()
 
@@ -438,41 +411,32 @@ def run_overfit_full(config: dict, device: torch.device):
                 f"Step {step:>4d}/{config['overfit_steps']} | "
                 f"total={total:.4f} | "
                 f"qa={losses['qa'].item():.4f} | "
-                f"fgw={losses['fgw'].item():.4f} | "
+                f"ot={losses['ot'].item():.4f} | "
                 f"span={losses['span_proj'].item():.4f} | "
                 f"cons={losses['cons'].item():.4f} | "
-                f"gn_bb={gn_bb:.3f} gn_other={gn_other:.3f}"
+                f"gn_bb={gn_bb:.3f} gn_head={gn_head:.3f}"
             )
 
         if total >= prev_loss - 1e-5:
             stagnant_count += 1
             if stagnant_count >= 30:
-                log.warning(
-                    "Loss không giảm sau 30 steps liên tiếp — "
-                    "gradient explosion hay learning rate quá lớn"
-                )
+                log.warning("Loss not decreasing after 30 consecutive steps")
                 break
         else:
             stagnant_count = 0
         prev_loss = total
 
     final_total = losses["total"].item()
-    final_qa    = losses["qa"].item()
-    final_span  = losses["span_proj"].item()
-    final_fgw   = losses["fgw"].item()
-    final_cons  = losses["cons"].item()
     log.info("=" * 60)
     log.info(
-        f"Final: total={final_total:.4f} | qa={final_qa:.4f} | "
-        f"span={final_span:.4f} | fgw={final_fgw:.4f} | cons={final_cons:.4f}"
+        f"Final: total={final_total:.4f} | qa={losses['qa'].item():.4f} | "
+        f"span={losses['span_proj'].item():.4f} | ot={losses['ot'].item():.4f} | "
+        f"cons={losses['cons'].item():.4f}"
     )
     if final_total < 3.0:
-        log.info("OVERFIT_FULL: Loss giảm ổn định — kiến trúc joint training OK!")
+        log.info("OVERFIT_FULL: Loss decreasing steadily — joint training OK!")
     else:
-        log.warning(
-            "OVERFIT_FULL chưa đủ giảm. Kiểm tra gradient explosion "
-            "(gn_bb / gn_other) và cân nhắc giảm lambda_fgw hoặc overfit_lr."
-        )
+        log.warning("OVERFIT_FULL: Loss may not have converged sufficiently.")
     log.info("=" * 60)
 
 
@@ -487,17 +451,25 @@ def run_training(config: dict, device: torch.device):
 
     os.makedirs(config["output_dir"], exist_ok=True)
 
-    train_loader, tokenizer = setup_dataloader(config)
+    train_loader, tokenizer, sampler = setup_dataloader(config, for_training=True)
     model, criterion = setup_model_and_criterion(config, device)
 
-    backbone_params = list(model.backbone.parameters())
-    other_params    = list(model.gat.parameters()) + list(criterion.parameters())
-    all_params      = backbone_params + other_params
-    
-    # Sử dụng LR phân tách: 1e-5 cho backbone, 1e-4 cho GAT/QA head (như overfit_full)
+    # Wrap with DDP if distributed
+    if is_distributed():
+        model = DDP(model, device_ids=[device.index], find_unused_parameters=False)
+        criterion = DDP(criterion, device_ids=[device.index], find_unused_parameters=True)
+        log.info(f"[Rank {get_rank()}] Model & Criterion wrapped with DDP")
+
+    # Access underlying module for param groups (DDP wraps .module)
+    _model = model.module if is_distributed() else model
+    _criterion = criterion.module if is_distributed() else criterion
+
+    backbone_params = list(_model.backbone.parameters())
+    head_params     = list(_criterion.parameters())
+
     optimizer = AdamW([
-        {"params": backbone_params, "lr": config.get("lr", 1e-5)}, 
-        {"params": other_params,    "lr": config.get("head_lr", 1e-4)},
+        {"params": backbone_params, "lr": config.get("lr", 1e-5)},
+        {"params": head_params,     "lr": config.get("head_lr", 1e-4)},
     ], weight_decay=config["weight_decay"])
 
     steps_per_epoch = math.ceil(len(train_loader) / config["grad_accum_steps"])
@@ -514,17 +486,19 @@ def run_training(config: dict, device: torch.device):
         log.info(f"Scheduler: linear warmup {warmup_steps} steps / {total_steps} total")
     except ImportError:
         scheduler = None
-        log.warning("transformers không tìm thấy — chạy không có scheduler")
+        log.warning("transformers scheduler not found — running without scheduler")
 
     start_epoch = 1
     global_step = 0
     best_em = 0.0
     optimizer.zero_grad()
 
-    # THÊM DÒNG NÀY VÀO ĐÂY: Khởi tạo TensorBoard Writer
-    tb_log_dir = os.path.join(config["output_dir"], "tensorboard_logs")
-    writer = SummaryWriter(log_dir=tb_log_dir)
-    log.info(f"Đã bật TensorBoard. Dữ liệu lưu tại: {tb_log_dir}")
+    # TensorBoard (only on main process)
+    writer = None
+    if is_main_process():
+        tb_log_dir = os.path.join(config["output_dir"], "tensorboard_logs")
+        writer = SummaryWriter(log_dir=tb_log_dir)
+        log.info(f"TensorBoard enabled. Logs at: {tb_log_dir}")
 
     if config.get("resume_from"):
         if os.path.exists(config["resume_from"]):
@@ -541,68 +515,75 @@ def run_training(config: dict, device: torch.device):
         else:
             log.warning(f"Checkpoint not found at {config['resume_from']}, starting from scratch.")
 
-    # Scale curriculum delay theo dataset size (tránh hardcode)
+    # Access criterion's lambda attrs (through DDP wrapper if needed)
+    _criterion = criterion.module if is_distributed() else criterion
+
+    # Curriculum delays (scaled by dataset size)
     _SPE = steps_per_epoch
-    _FGW_DELAY,  _FGW_WARMUP  = _SPE // 2,  _SPE
+    _OT_DELAY,   _OT_WARMUP   = _SPE // 2,  _SPE
     _SPAN_DELAY, _SPAN_WARMUP = _SPE,        _SPE
-    _CONS_DELAY, _CONS_WARMUP = _SPE * 2,   _SPE // 2
+    _CONS_DELAY, _CONS_WARMUP = _SPE * 2,    _SPE // 2
     _CONS_MAX = config["lambda_cons"]
-    log.info(
-        f"Curriculum delays (steps): "
-        f"FGW={_FGW_DELAY}→{_FGW_DELAY+_FGW_WARMUP} | "
-        f"Span={_SPAN_DELAY}→{_SPAN_DELAY+_SPAN_WARMUP} | "
-        f"Cons={_CONS_DELAY}→{_CONS_DELAY+_CONS_WARMUP}"
-    )
+    if is_main_process():
+        log.info(
+            f"Curriculum delays (steps): "
+            f"OT={_OT_DELAY}→{_OT_DELAY+_OT_WARMUP} | "
+            f"Span={_SPAN_DELAY}→{_SPAN_DELAY+_SPAN_WARMUP} | "
+            f"Cons={_CONS_DELAY}→{_CONS_DELAY+_CONS_WARMUP}"
+        )
 
     for epoch in range(start_epoch, config["max_epochs"] + 1):
+        # Set epoch for DistributedSampler (ensures proper shuffling)
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+
         model.train()
         criterion.train()
 
-        # (Sẽ dùng step-based curriculum bên trong loop thay vì bật/tắt cứng theo Epoch)
-        if epoch == 1:
-            log.info(f"Epoch {epoch}: Bắt đầu Dual Annealing theo step...")
-        else:
-            log.info(f"Epoch {epoch}: Duy trì max lambdas (trừ khi warmup chưa xong).")
+        if is_main_process():
+            if epoch == 1:
+                log.info(f"Epoch {epoch}: Starting curriculum annealing...")
+            else:
+                log.info(f"Epoch {epoch}: Continuing training.")
 
-        epoch_losses = {"total": 0.0, "qa": 0.0, "has_ans": 0.0, "fgw": 0.0, "span_proj": 0.0, "cons": 0.0}
+        epoch_losses = {"total": 0.0, "qa": 0.0, "has_ans": 0.0, "ot": 0.0, "span_proj": 0.0, "cons": 0.0}
         accum_count = 0
 
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-            # ── Curriculum Learning — Dual Annealing ──────────────────────
+            # ── Curriculum Learning ──────────────────────────
             current_step = global_step + 1
 
-            if current_step <= _FGW_DELAY:
-                criterion.lambda_fgw = 0.0
-            elif current_step <= _FGW_DELAY + _FGW_WARMUP:
-                criterion.lambda_fgw = config["lambda_fgw"] * (current_step - _FGW_DELAY) / _FGW_WARMUP
+            if current_step <= _OT_DELAY:
+                _criterion.lambda_ot = 0.0
+            elif current_step <= _OT_DELAY + _OT_WARMUP:
+                _criterion.lambda_ot = config["lambda_ot"] * (current_step - _OT_DELAY) / _OT_WARMUP
             else:
-                criterion.lambda_fgw = config["lambda_fgw"]
+                _criterion.lambda_ot = config["lambda_ot"]
 
             if current_step <= _SPAN_DELAY:
-                criterion.lambda_span = 0.0
+                _criterion.lambda_span = 0.0
             elif current_step <= _SPAN_DELAY + _SPAN_WARMUP:
-                criterion.lambda_span = config["lambda_span"] * (current_step - _SPAN_DELAY) / _SPAN_WARMUP
+                _criterion.lambda_span = config["lambda_span"] * (current_step - _SPAN_DELAY) / _SPAN_WARMUP
             else:
-                criterion.lambda_span = config["lambda_span"]
+                _criterion.lambda_span = config["lambda_span"]
 
             if current_step <= _CONS_DELAY:
-                criterion.lambda_cons = 0.0
+                _criterion.lambda_cons = 0.0
             elif current_step <= _CONS_DELAY + _CONS_WARMUP:
-                criterion.lambda_cons = _CONS_MAX * (current_step - _CONS_DELAY) / _CONS_WARMUP
+                _criterion.lambda_cons = _CONS_MAX * (current_step - _CONS_DELAY) / _CONS_WARMUP
             else:
-                criterion.lambda_cons = _CONS_MAX
+                _criterion.lambda_cons = _CONS_MAX
 
             # Forward
             try:
-                raw_outputs = model(batch)
+                outputs = model(batch)
             except RuntimeError as e:
                 log.error(f"[Epoch {epoch} Step {step}] Forward error: {e}")
                 continue
 
-            outputs = _patch_model_outputs(model, batch, raw_outputs)
-            losses  = criterion(outputs, batch)
+            losses = criterion(outputs, batch)
 
             loss = losses["total"] / config["grad_accum_steps"]
             loss.backward()
@@ -615,100 +596,81 @@ def run_training(config: dict, device: torch.device):
             accum_count += 1
 
             if (step + 1) % config["grad_accum_steps"] == 0:
-                # Clip riêng từng group (đồng bộ với overfit_full)
-                torch.nn.utils.clip_grad_norm_(
-                    backbone_params,
-                    config["max_grad_norm"] * 0.15,   # backbone: 0.3
-                )
-                torch.nn.utils.clip_grad_norm_(
-                    other_params,
-                    config["max_grad_norm"] * 1.5,    # GAT + QA head: 1.5
-                )
-                
+                torch.nn.utils.clip_grad_norm_(backbone_params, config["max_grad_norm"] * 0.15)
+                torch.nn.utils.clip_grad_norm_(head_params,     config["max_grad_norm"] * 1.5)
+
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
 
-                if global_step % config["log_every"] == 0:
+                if global_step % config["log_every"] == 0 and is_main_process():
                     log.info(
                         f"Epoch {epoch} | GlobalStep {global_step} | "
                         f"total={losses['total'].item():.4f} | "
                         f"qa={losses['qa'].item():.4f} | "
                         f"has_ans={losses.get('has_ans', torch.tensor(0)).item():.4f} | "
-                        f"fgw={losses['fgw'].item():.4f} | "
+                        f"ot={losses['ot'].item():.4f} | "
                         f"span={losses['span_proj'].item():.4f} | "
                         f"cons={losses['cons'].item():.4f} | "
-                        f"λ=({criterion.lambda_fgw:.3f},{criterion.lambda_span:.3f},{criterion.lambda_cons:.3f})"
+                        f"λ=({_criterion.lambda_ot:.3f},{_criterion.lambda_span:.3f},{_criterion.lambda_cons:.3f})"
                     )
 
                     # --- TENSORBOARD LOGGING ---
-                    # Loss components
-                    writer.add_scalar("Loss/Total",               losses['total'].item(),    global_step)
-                    writer.add_scalar("Loss/QA",                  losses['qa'].item(),       global_step)
-                    writer.add_scalar("Loss/QA_Start",            losses['qa_start'].item(), global_step)
-                    writer.add_scalar("Loss/QA_End",              losses['qa_end'].item(),   global_step)
-                    writer.add_scalar("Loss/HasAnswer (BCE)",     losses.get('has_ans', torch.tensor(0)).item(), global_step)
-                    writer.add_scalar("Loss/FGW (Alignment)",     losses['fgw'].item(),      global_step)
-                    writer.add_scalar("Loss/Span (Vietnamese)",   losses['span_proj'].item(),global_step)
-                    writer.add_scalar("Loss/Consistency",         losses['cons'].item(),     global_step)
+                    if writer is not None:
+                        writer.add_scalar("Loss/Total",               losses['total'].item(),    global_step)
+                        writer.add_scalar("Loss/QA",                  losses['qa'].item(),       global_step)
+                        writer.add_scalar("Loss/QA_Start",            losses['qa_start'].item(), global_step)
+                        writer.add_scalar("Loss/QA_End",              losses['qa_end'].item(),   global_step)
+                        writer.add_scalar("Loss/HasAnswer (BCE)",     losses.get('has_ans', torch.tensor(0)).item(), global_step)
+                        writer.add_scalar("Loss/OT (Transport)",      losses['ot'].item(),       global_step)
+                        writer.add_scalar("Loss/Span (Vietnamese)",   losses['span_proj'].item(),global_step)
+                        writer.add_scalar("Loss/Consistency",         losses['cons'].item(),     global_step)
 
-                    # Curriculum lambda tracking
-                    writer.add_scalar("Lambda/FGW",  criterion.lambda_fgw,  global_step)
-                    writer.add_scalar("Lambda/Span", criterion.lambda_span, global_step)
-                    writer.add_scalar("Lambda/Cons", criterion.lambda_cons, global_step)
+                        writer.add_scalar("Lambda/OT",   _criterion.lambda_ot,   global_step)
+                        writer.add_scalar("Lambda/Span", _criterion.lambda_span, global_step)
+                        writer.add_scalar("Lambda/Cons", _criterion.lambda_cons, global_step)
 
-                    # Learning rate
-                    writer.add_scalar("Learning_Rate/Backbone", optimizer.param_groups[0]['lr'], global_step)
-                    writer.add_scalar("Learning_Rate/Head",     optimizer.param_groups[1]['lr'], global_step)
+                        writer.add_scalar("Learning_Rate/Backbone", optimizer.param_groups[0]['lr'], global_step)
+                        writer.add_scalar("Learning_Rate/Head",     optimizer.param_groups[1]['lr'], global_step)
 
-                    # CLS collapse detector
-                    # Nếu collapse_ratio_start gần 1.0 trong vài epoch đầu
-                    # → CLS đang dominate → cần kiểm tra gradient flow / tăng lambda_has_ans
-                    _cls_s = losses.get('dbg/cls_start', torch.tensor(0)).item()
-                    _max_s = losses.get('dbg/max_start', torch.tensor(1)).item()
-                    _cls_e = losses.get('dbg/cls_end',   torch.tensor(0)).item()
-                    _max_e = losses.get('dbg/max_end',   torch.tensor(1)).item()
-                    writer.add_scalar("Debug/CLS_Start_Logit",      _cls_s, global_step)
-                    writer.add_scalar("Debug/Max_Start_Logit",      _max_s, global_step)
-                    writer.add_scalar("Debug/CLS_End_Logit",        _cls_e, global_step)
-                    writer.add_scalar("Debug/Max_End_Logit",        _max_e, global_step)
-                    # collapse_ratio: 1.0 = collapse, 0.0 = healthy
-                    _denom_s = abs(_max_s) + 1e-8
-                    _denom_e = abs(_max_e) + 1e-8
-                    writer.add_scalar("Debug/Collapse_Ratio_Start", abs(_cls_s) / _denom_s, global_step)
-                    writer.add_scalar("Debug/Collapse_Ratio_End",   abs(_cls_e) / _denom_e, global_step)
-                    _has_acc = losses.get('dbg/has_ans_acc', torch.tensor(float('nan'))).item()
-                    if not torch.isnan(torch.tensor(_has_acc)):
-                        writer.add_scalar("Debug/HasAnswer_Accuracy", _has_acc, global_step)
-                    # -----------------------------------
+                        # CLS collapse detector
+                        _cls_s = losses.get('dbg/cls_start', torch.tensor(0)).item()
+                        _max_s = losses.get('dbg/max_start', torch.tensor(1)).item()
+                        _cls_e = losses.get('dbg/cls_end',   torch.tensor(0)).item()
+                        _max_e = losses.get('dbg/max_end',   torch.tensor(1)).item()
+                        writer.add_scalar("Debug/CLS_Start_Logit",      _cls_s, global_step)
+                        writer.add_scalar("Debug/Max_Start_Logit",      _max_s, global_step)
+                        writer.add_scalar("Debug/CLS_End_Logit",        _cls_e, global_step)
+                        writer.add_scalar("Debug/Max_End_Logit",        _max_e, global_step)
+                        _denom_s = abs(_max_s) + 1e-8
+                        _denom_e = abs(_max_e) + 1e-8
+                        writer.add_scalar("Debug/Collapse_Ratio_Start", abs(_cls_s) / _denom_s, global_step)
+                        writer.add_scalar("Debug/Collapse_Ratio_End",   abs(_cls_e) / _denom_e, global_step)
+                        _has_acc = losses.get('dbg/has_ans_acc', torch.tensor(float('nan'))).item()
+                        if not torch.isnan(torch.tensor(_has_acc)):
+                            writer.add_scalar("Debug/HasAnswer_Accuracy", _has_acc, global_step)
 
         if accum_count > 0:
             avg_losses = {k: v / accum_count for k, v in epoch_losses.items()}
-            log.info(f"━━ Epoch {epoch}/{config['max_epochs']} done | avg_loss={avg_losses.get('total', 0):.4f}")
-            
-            # --- THÊM IN LOSS BREAKDOWN SAU MỖI EPOCH ---
-            log.info(f"Loss breakdown (Epoch {epoch}):")
-            log.info(f"  total_loss : {avg_losses.get('total', 0):.4f}")
-            log.info(f"  qa_loss    : {avg_losses.get('qa', 0):.4f} (Span Extraction)")
-            log.info(f"  has_ans    : {avg_losses.get('has_ans', 0):.4f} (Answerable BCE)")
-            log.info(f"  ot_loss    : {avg_losses.get('fgw', 0):.4f} (FGW Alignment)")
-            log.info(f"  span_loss  : {avg_losses.get('span_proj', 0):.4f} (Pseudo-label)")
-            log.info(f"  cons_loss  : {avg_losses.get('cons', 0):.4f} (Consistency)")
-            
-            if avg_losses.get('qa', 0) > 0:
-                ratio = avg_losses.get('fgw', 0) / avg_losses.get('qa', 1)
-                log.info(f"  [!] Ratio OT/QA: {ratio:.2f}")
-
-            log.info(f"  Current λ  : FGW={criterion.lambda_fgw:.3f}, Span={criterion.lambda_span:.3f}, Cons={criterion.lambda_cons:.3f}")
-            log.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            if is_main_process():
+                log.info(f"━━ Epoch {epoch}/{config['max_epochs']} done | avg_loss={avg_losses.get('total', 0):.4f}")
+                log.info(f"Loss breakdown (Epoch {epoch}):")
+                log.info(f"  total_loss : {avg_losses.get('total', 0):.4f}")
+                log.info(f"  qa_loss    : {avg_losses.get('qa', 0):.4f} (Span Extraction)")
+                log.info(f"  has_ans    : {avg_losses.get('has_ans', 0):.4f} (Answerable BCE)")
+                log.info(f"  ot_loss    : {avg_losses.get('ot', 0):.4f} (Transport Cost)")
+                log.info(f"  span_loss  : {avg_losses.get('span_proj', 0):.4f} (Pseudo-label)")
+                log.info(f"  cons_loss  : {avg_losses.get('cons', 0):.4f} (Consistency)")
+                log.info(f"  Current λ  : OT={_criterion.lambda_ot:.3f}, Span={_criterion.lambda_span:.3f}, Cons={_criterion.lambda_cons:.3f}")
+                log.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             avg_loss = avg_losses.get('total', 0)
         else:
             avg_loss = 0.0
 
-        # Quick Eval (thực hiện mỗi 2 epoch)
-        if epoch % 2 == 0 and not config.get("overfit", False):
+        # Quick Eval (every 2 epochs, main process only)
+        if epoch % 2 == 0 and is_main_process():
             import importlib.util
             eval_file = os.path.join(config["root_dir"], "phase4-evaluation", "quick_eval.py")
             spec = importlib.util.spec_from_file_location("quick_eval", eval_file)
@@ -716,76 +678,81 @@ def run_training(config: dict, device: torch.device):
             spec.loader.exec_module(quick_eval_mod)
             quick_em = quick_eval_mod.quick_em
             dev_file = os.path.join(config["root_dir"], "dataset", "Squad2.0", "dev-v2.0.json")
+            # Use unwrapped model for eval
+            _eval_model = model.module if is_distributed() else model
+            _eval_criterion = criterion.module if is_distributed() else criterion
             if os.path.exists(dev_file):
-                log.info(f"Đang chạy Quick Eval trên tập dev (200 samples)...")
+                log.info(f"Running Quick Eval on dev set (200 samples)...")
                 try:
-                    em = quick_em(model, criterion, tokenizer, dev_file, n_samples=200, device=device)
-                    writer.add_scalar("Eval/QuickEM", em, epoch)
+                    em = quick_em(_eval_model, _eval_criterion, tokenizer, dev_file, n_samples=200, device=device)
+                    if writer is not None:
+                        writer.add_scalar("Eval/QuickEM", em, epoch)
                     log.info(f"Epoch {epoch} Quick EM (200 samples): {em:.2f}%")
                     if em > best_em:
                         best_em = em
                         best_ckpt_path = os.path.join(config["output_dir"], "best.pt")
                         torch.save({
                             "epoch": epoch,
-                            "model_state": model.state_dict(),
-                            "criterion_state": criterion.state_dict(),
+                            "model_state": _eval_model.state_dict(),
+                            "criterion_state": _eval_criterion.state_dict(),
                             "em": em,
                         }, best_ckpt_path)
-                        log.info(f"   Đã lưu checkpoint tốt nhất tại: {best_ckpt_path}")
+                        log.info(f"   Saved best checkpoint: {best_ckpt_path}")
                 except Exception as e:
-                    log.error(f"Lỗi khi chạy Quick Eval: {e}")
+                    log.error(f"Quick Eval error: {e}")
             else:
-                log.warning(f"Không tìm thấy dev_file tại {dev_file} để chạy Quick Eval.")
+                log.warning(f"Dev file not found at {dev_file}")
 
-        # Save checkpoint
-        if epoch % config["save_every"] == 0:
+        # Save checkpoint (main process only)
+        if epoch % config["save_every"] == 0 and is_main_process():
+            _save_model = model.module if is_distributed() else model
+            _save_criterion = criterion.module if is_distributed() else criterion
             ckpt_path = os.path.join(config["output_dir"], f"epoch_{epoch:03d}.pt")
             torch.save({
                 "epoch"           : epoch,
                 "global_step"     : global_step,
-                "model_state"     : model.state_dict(),
-                "criterion_state" : criterion.state_dict(),
+                "model_state"     : _save_model.state_dict(),
+                "criterion_state" : _save_criterion.state_dict(),
                 "optimizer_state" : optimizer.state_dict(),
                 "scheduler_state" : scheduler.state_dict() if scheduler else None,
                 "config"          : config,
                 "avg_loss"        : avg_loss,
             }, ckpt_path)
-            log.info(f"   Checkpoint saved local: {ckpt_path}")
+            log.info(f"   Checkpoint saved: {ckpt_path}")
 
-            # ========================================================
-            # TỰ ĐỘNG ĐẨY LÊN HUGGING FACE NẾU CÓ CẤU HÌNH REPO_ID
-            # ========================================================
+            # Upload to Hugging Face
             if config.get("hf_repo_id") and HfApi is not None:
                 api = HfApi(token=os.environ.get("HF_TOKEN"))
-                output_basename = os.path.basename(os.path.normpath(config["output_dir"]))
-                if not output_basename:
-                    output_basename = "checkpoints"
+                output_basename = os.path.basename(os.path.normpath(config["output_dir"])) or "checkpoints"
                 try:
-                    log.info(f"   Đang đẩy file {ckpt_path} lên Hugging Face ({config['hf_repo_id']})...")
+                    log.info(f"   Uploading to Hugging Face ({config['hf_repo_id']})...")
                     api.upload_file(
                         path_or_fileobj=ckpt_path,
                         path_in_repo=f"{output_basename}/epoch_{epoch:03d}.pt",
                         repo_id=config["hf_repo_id"],
                         repo_type="model"
                     )
-                    
-                    log.info(f"   Đang đồng bộ TensorBoard logs lên Hugging Face...")
-                    # Lệnh này cực kỳ thông minh: nó chỉ tải lên các file mới hoặc có sự thay đổi
-                    api.upload_folder(
-                        folder_path=tb_log_dir,
-                        path_in_repo=f"logs/{output_basename}_tensorboard",
-                        repo_id=config["hf_repo_id"],
-                        repo_type="model"
-                    )
-                    log.info(f" Đã backup checkpoint & TensorBoard logs an toàn lên mây!")
+                    if writer is not None:
+                        api.upload_folder(
+                            folder_path=tb_log_dir,
+                            path_in_repo=f"logs/{output_basename}_tensorboard",
+                            repo_id=config["hf_repo_id"],
+                            repo_type="model"
+                        )
+                    log.info(f"   Checkpoint & TensorBoard logs uploaded successfully!")
                 except Exception as e:
-                    log.error(f" Lỗi upload lên HF (file local vẫn còn): {e}")
+                    log.error(f"   Upload error (local file still safe): {e}")
             elif config.get("hf_repo_id") and HfApi is None:
-                log.warning(" Bạn chưa cài huggingface_hub! Chạy: pip install huggingface_hub để auto upload.")
-            # ========================================================
+                log.warning("   huggingface_hub not installed! Run: pip install huggingface_hub")
 
-    log.info("Training hoàn thành!")
-    writer.close() # THÊM DÒNG NÀY ĐỂ ĐÓNG KẾT NỐI
+        # Synchronize all processes before next epoch
+        if is_distributed():
+            dist.barrier()
+
+    if is_main_process():
+        log.info("Training complete!")
+    if writer is not None:
+        writer.close()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -795,57 +762,59 @@ def run_training(config: dict, device: torch.device):
 def main():
     parser = argparse.ArgumentParser(description="Train Cross-Lingual OT QA Model")
     parser.add_argument("--mode",      choices=["overfit", "overfit_full", "train"], default="overfit",
-                        help="'overfit': freeze bb+GAT (QA head only) | 'overfit_full': unfreeze all + fgw+cons | 'train': full training")
+                        help="'overfit': freeze backbone | 'overfit_full': unfreeze all | 'train': full training")
     parser.add_argument("--root_dir",  type=str, default=DEFAULT_CONFIG["root_dir"])
     parser.add_argument("--output_dir",type=str, default=DEFAULT_CONFIG["output_dir"])
     parser.add_argument("--hf_repo_id",type=str, default=DEFAULT_CONFIG["hf_repo_id"],
-                        help="Tên repo HuggingFace (VD: username/my-model) để auto backup")
+                        help="HuggingFace repo ID for auto backup")
     parser.add_argument("--epochs",    type=int, default=DEFAULT_CONFIG["max_epochs"])
     parser.add_argument("--batch_size",type=int, default=DEFAULT_CONFIG["batch_size"])
     parser.add_argument("--lr",        type=float, default=DEFAULT_CONFIG["lr"])
     parser.add_argument("--overfit_steps", type=int, default=DEFAULT_CONFIG["overfit_steps"])
-    parser.add_argument("--K",         type=int, default=DEFAULT_CONFIG["K"])
-    parser.add_argument("--use_full",  action="store_true",
-                        help="dùng fgw_bapg thay vì partial_fgw")
     parser.add_argument("--resume_from", type=str, default="",
-                        help="Path to checkpoint (e.g. ./checkpoints/epoch_001.pt) to resume training")
+                        help="Path to checkpoint to resume training")
 
-    # ── Ablation Study: expose lambda coefficients ─────────────────────
-    parser.add_argument("--lambda_fgw",  type=float, default=DEFAULT_CONFIG["lambda_fgw"],
-                        help="Trọng số FGW alignment loss. Set = 0 để test No FGW.")
+    # OT hyperparameters
+    parser.add_argument("--sinkhorn_epsilon", type=float, default=DEFAULT_CONFIG["sinkhorn_epsilon"],
+                        help="Sinkhorn entropic regularization")
+    parser.add_argument("--sinkhorn_iters",   type=int,   default=DEFAULT_CONFIG["sinkhorn_iters"],
+                        help="Number of Sinkhorn iterations")
+
+    # Loss weights (ablation)
+    parser.add_argument("--lambda_ot",   type=float, default=DEFAULT_CONFIG["lambda_ot"],
+                        help="Weight for OT transport cost loss. Set=0 to disable.")
     parser.add_argument("--lambda_span", type=float, default=DEFAULT_CONFIG["lambda_span"],
-                        help="Trọng số Span Projection loss. Set = 0 để test No Span Proj.")
+                        help="Weight for Span Projection loss. Set=0 to disable.")
     parser.add_argument("--lambda_cons", type=float, default=DEFAULT_CONFIG["lambda_cons"],
-                        help="Trọng số Consistency loss. Set = 0 để test No Consistency.")
+                        help="Weight for Consistency loss. Set=0 to disable.")
     parser.add_argument("--cons_temp",   type=float, default=DEFAULT_CONFIG["cons_temp"],
-                        help="Nhiệt độ KL-div consistency loss.")
+                        help="Temperature for consistency KL divergence.")
 
     args = parser.parse_args()
 
     config = dict(DEFAULT_CONFIG)
     config.update({
-        "root_dir"    : args.root_dir,
-        "output_dir"  : args.output_dir,
-        "hf_repo_id"  : args.hf_repo_id,
-        "max_epochs"  : args.epochs,
-        "batch_size"  : args.batch_size,
-        "lr"          : args.lr,
-        "head_lr"     : DEFAULT_CONFIG["head_lr"],
-        "overfit_steps": args.overfit_steps,
-        "K"           : args.K,
-        "use_partial" : not args.use_full,
-        "resume_from" : args.resume_from,
-        # Ablation lambdas
-        "lambda_fgw"  : args.lambda_fgw,
-        "lambda_span" : args.lambda_span,
-        "lambda_cons" : args.lambda_cons,
-        "cons_temp"   : args.cons_temp,
+        "root_dir"          : args.root_dir,
+        "output_dir"        : args.output_dir,
+        "hf_repo_id"        : args.hf_repo_id,
+        "max_epochs"        : args.epochs,
+        "batch_size"        : args.batch_size,
+        "lr"                : args.lr,
+        "head_lr"           : DEFAULT_CONFIG["head_lr"],
+        "overfit_steps"     : args.overfit_steps,
+        "resume_from"       : args.resume_from,
+        "sinkhorn_epsilon"  : args.sinkhorn_epsilon,
+        "sinkhorn_iters"    : args.sinkhorn_iters,
+        "lambda_ot"         : args.lambda_ot,
+        "lambda_span"       : args.lambda_span,
+        "lambda_cons"       : args.lambda_cons,
+        "cons_temp"         : args.cons_temp,
     })
 
-    # Log ablation config nếu có lambda bị tắt
+    # Log ablation config
     _ablation_flags = []
-    if config["lambda_fgw"] == 0.0:
-        _ablation_flags.append("No FGW")
+    if config["lambda_ot"] == 0.0:
+        _ablation_flags.append("No OT")
     if config["lambda_span"] == 0.0:
         _ablation_flags.append("No Span Proj")
     if config["lambda_cons"] == 0.0:
@@ -853,23 +822,32 @@ def main():
     if _ablation_flags:
         log.info(f"⚗️  ABLATION MODE: {' + '.join(_ablation_flags)}")
     else:
-        log.info(f"🔬 FULL MODEL: λ_fgw={config['lambda_fgw']}, λ_span={config['lambda_span']}, λ_cons={config['lambda_cons']}")
+        log.info(f"🔬 FULL MODEL: λ_ot={config['lambda_ot']}, λ_span={config['lambda_span']}, λ_cons={config['lambda_cons']}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    if device.type == "cuda":
+    # Initialize distributed if running with torchrun
+    setup_distributed()
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if torch.cuda.is_available():
+        device = torch.device("cuda", local_rank)
         torch.backends.cudnn.benchmark = True
-        torch.cuda.set_device(0)
-        log.info(f"✅ CUDA benchmark enabled | Device: {device}")
+        if is_main_process():
+            log.info(f"✅ CUDA benchmark enabled | Device: {device}"
+                     f"{f' | World size: {get_world_size()}' if is_distributed() else ''}")
     else:
-        log.info(f"Device: {device}")
+        device = torch.device("cpu")
+        if is_main_process():
+            log.info(f"Device: {device}")
 
-    if args.mode == "overfit":
-        run_overfit(config, device)
-    elif args.mode == "overfit_full":
-        run_overfit_full(config, device)
-    else:
-        run_training(config, device)
+    try:
+        if args.mode == "overfit":
+            run_overfit(config, device)
+        elif args.mode == "overfit_full":
+            run_overfit_full(config, device)
+        else:
+            run_training(config, device)
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

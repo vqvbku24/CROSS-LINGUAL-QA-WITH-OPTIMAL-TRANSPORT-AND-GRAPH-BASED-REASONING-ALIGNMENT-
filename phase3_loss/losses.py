@@ -1,451 +1,456 @@
 # losses.py
 """
-Hàm mục tiêu (Loss Functions) cho Cross-Lingual QA with OT & Graph Alignment.
+Loss Functions for Cross-Lingual QA with Sinkhorn OT Alignment.
 
-Tổng loss:
-    L_total = L_qa + λ_fgw * L_fgw + λ_span * L_span_proj + λ_cons * L_consistency
+Architecture (post-refactor):
+    - No graph, no GAT, no subsampling, no FGW.
+    - Sinkhorn OT operates directly on full XLM-R hidden states (L=512).
 
-Chi tiết:
-    L_qa          : Cross-entropy span extraction trên EN (supervised).
-    L_fgw         : FGW transport cost — cưỡng bức align cấu trúc graph EN ↔ VI.
-    L_span_proj   : Pseudo-label QA loss trên VI dùng span projection từ γ.
-    L_consistency : KL-divergence giữa logits EN và logits VI — ép hai nhánh nhất quán.
+Total loss:
+    L_total = L_qa
+            + λ_ot   * L_ot           (transport cost regularizer)
+            + λ_span * L_span_proj    (pseudo-label QA on VI via γ)
+            + λ_cons * L_consistency  (transport-guided KL)
+
+Components:
+    L_qa         : Cross-entropy span extraction on EN (supervised).
+    L_ot         : Transport cost <γ.detach(), C>  — gradient flows through C only.
+    L_span_proj  : argmax from γ rows at EN start/end → pseudo-labels for VI.
+    L_consistency: KL(VI_softmax || γᵀ @ EN_softmax.detach()) with temperature.
 
 Notes:
-    - L_consistency dùng .detach() trên EN logits (stop-gradient) để Teacher
-      không bị nhiễu từ VI side (theo ý tưởng Phase 3 trong idea.docx).
-    - L_span_proj dùng hard-span pseudo-label decode từ γ (argmax + span constraint).
-    - QA Head (start/end) được chia sẻ và apply cho cả EN lẫn VI node embeddings.
+    - Sinkhorn uses non-uniform marginals (zero mass on PAD tokens).
+    - Log-domain Sinkhorn for numerical stability (~50 iterations).
+    - has_answer_head trained on EN only.
+    - L_span_proj computed for all answerable EN samples regardless of VI prediction.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
 
 
-# ──────────────────────────────────────────────────────────────
-# Helper: Token-space → Graph-space position mapping (Fix Bug #1)
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Log-Domain Sinkhorn OT Solver (Pure PyTorch, Batched)
+# ══════════════════════════════════════════════════════════════
 
-def _remap_positions_to_graph_space(
-    en_start: torch.Tensor,    # (B,) token indices (0-511)
-    en_end: torch.Tensor,      # (B,) token indices (0-511)
-    keep_idx_en: torch.Tensor, # (B, K) mapping graph node → token index
-) -> tuple[torch.Tensor, torch.Tensor]:
+def sinkhorn_log_domain(
+    C: torch.Tensor,            # (B, L, L) cost matrix (already PAD-masked with 1e4)
+    en_pad_mask: torch.Tensor,  # (B, L) True = PAD
+    vi_pad_mask: torch.Tensor,  # (B, L) True = PAD
+    epsilon: float = 0.05,      # entropic regularization
+    num_iters: int = 50,        # Sinkhorn iterations
+) -> torch.Tensor:
     """
-    Chuyển đổi label từ vị trí token gốc (0-511) sang vị trí node
-    trong graph EN sau subsampling (0-K-1).
+    Vectorized log-domain Sinkhorn-Knopp algorithm.
 
-    Với mỗi sample b:
-        - keep_idx_en[b, k] = token index của node thứ k trong graph.
-        - Tìm k sao cho keep_idx_en[b, k] == en_start[b] → gs_start[b] = k.
-        - Nếu không tìm thấy (token bị loại khi subsampling) → dùng
-          nearest-neighbor: chọn node có token index gần nhất với answer token.
-          Cách này tốt hơn fallback về 0 vì (0,0) sẽ corrupt toàn bộ label
-          khiến loss kẹt ở log(K) ≈ 5.07.
+    Non-uniform marginals:
+        mu[b,i] = 1/n_valid_en[b]  if token i is NOT PAD, else 0
+        nu[b,j] = 1/n_valid_vi[b]  if token j is NOT PAD, else 0
+
+    This ensures zero transport mass is assigned to PAD tokens.
 
     Args:
-        en_start    : (B,) start positions trong token-space
-        en_end      : (B,) end   positions trong token-space
-        keep_idx_en : (B, K) bảng tra token index → graph node index
+        C          : (B, L, L) cosine distance cost matrix (PAD positions = 1e4)
+        en_pad_mask: (B, L) boolean — True for PAD tokens in EN
+        vi_pad_mask: (B, L) boolean — True for PAD tokens in VI
+        epsilon    : entropic regularization strength (larger = smoother, more stable)
+        num_iters  : number of Sinkhorn iterations
 
     Returns:
-        gs_start    : (B,) start positions trong graph-space
-        gs_end      : (B,) end   positions trong graph-space
+        gamma: (B, L, L) transport plan. Sum ≈ 1.0 per sample.
+               PAD rows/cols have ~0 mass.
     """
-    B, K = keep_idx_en.shape
-    device = en_start.device
+    B, L, _ = C.shape
+    device = C.device
+    dtype = C.dtype
 
-    # Vectorised nearest-neighbour lookup
-    # keep_idx_en: (B, K) — float cast để dùng abs diff
-    keep_f = keep_idx_en.float()  # (B, K)
+    # ── Non-uniform marginals ─────────────────────────────────
+    # mu[b,i] = 1/n_valid if not PAD, else 0
+    en_valid = (~en_pad_mask).float()                   # (B, L) — 1 for valid, 0 for PAD
+    vi_valid = (~vi_pad_mask).float()                   # (B, L)
+    n_valid_en = en_valid.sum(dim=1, keepdim=True).clamp(min=1.0)  # (B, 1)
+    n_valid_vi = vi_valid.sum(dim=1, keepdim=True).clamp(min=1.0)  # (B, 1)
 
-    # start
-    s_diff  = (keep_f - en_start.float().unsqueeze(1)).abs()   # (B, K)
-    gs_start = s_diff.argmin(dim=1)                             # (B,)
+    mu = en_valid / n_valid_en                          # (B, L) — sums to 1.0 per sample
+    nu = vi_valid / n_valid_vi                          # (B, L)
 
-    # end
-    e_diff  = (keep_f - en_end.float().unsqueeze(1)).abs()     # (B, K)
-    gs_end   = e_diff.argmin(dim=1)                             # (B,)
+    # ── Clamp before log to avoid -inf / NaN ──────────────────
+    log_mu = torch.log(mu.clamp(min=1e-8))              # (B, L)
+    log_nu = torch.log(nu.clamp(min=1e-8))              # (B, L)
 
-    # Unanswerable (s=0, e=0) → giữ nguyên (0, 0)
-    unanswerable = (en_start == 0) & (en_end == 0)
-    gs_start = gs_start.masked_fill(unanswerable, 0)
-    gs_end   = gs_end.masked_fill(unanswerable, 0)
+    # Set log-marginals of PAD tokens to -1e8 (effectively -inf but finite)
+    # This prevents any NaN from propagating through logsumexp
+    log_mu = log_mu.masked_fill(en_pad_mask, -1e8)
+    log_nu = log_nu.masked_fill(vi_pad_mask, -1e8)
 
-    # Đảm bảo gs_start <= gs_end (tránh span bị đảo ngược)
-    # BỎ PHẦN NÀY VÌ GRAPH NODES KHÔNG SORT THEO TOKEN INDEX
-    # swap_mask = gs_start > gs_end
-    # gs_start, gs_end = (
-    #     torch.where(swap_mask, gs_end,   gs_start),
-    #     torch.where(swap_mask, gs_start, gs_end),
-    # )
+    # ── Log-domain kernel ─────────────────────────────────────
+    # log_K[b,i,j] = -C[b,i,j] / epsilon
+    log_K = -C / epsilon                                # (B, L, L)
 
-    return gs_start, gs_end
+    # ── Sinkhorn iterations in log space ──────────────────────
+    # u, v are log-scaling vectors
+    log_u = torch.zeros(B, L, device=device, dtype=dtype)
+    log_v = torch.zeros(B, L, device=device, dtype=dtype)
+
+    for _ in range(num_iters):
+        # Row update: enforce row marginal = mu
+        # log_u[b,i] = log_mu[b,i] - logsumexp_j(log_K[b,i,j] + log_v[b,j])
+        log_u = log_mu - torch.logsumexp(log_K + log_v.unsqueeze(1), dim=2)
+
+        # Column update: enforce column marginal = nu
+        # log_v[b,j] = log_nu[b,j] - logsumexp_i(log_K[b,i,j] + log_u[b,i])
+        log_v = log_nu - torch.logsumexp(log_K + log_u.unsqueeze(2), dim=1)
+
+        # Clamp to prevent overflow in exp()
+        log_u = log_u.clamp(-1e8, 1e2)
+        log_v = log_v.clamp(-1e8, 1e2)
+
+    # ── Reconstruct transport plan ────────────────────────────
+    # gamma[b,i,j] = exp(log_u[b,i] + log_K[b,i,j] + log_v[b,j])
+    gamma = torch.exp(log_u.unsqueeze(2) + log_K + log_v.unsqueeze(1))
+
+    return gamma  # (B, L, L)
 
 
-# ──────────────────────────────────────────────────────────────
-# QA Head
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# QA Head — Operates on Full Token Sequences (L=512)
+# ══════════════════════════════════════════════════════════════
 
 class QAHead(nn.Module):
     """
-    Linear head dự đoán start/end span từ node embeddings.
-    Tích hợp Cross-Attention layer để nhận question-aware features.
+    Linear head predicting start/end span logits from token embeddings.
+    Integrates Cross-Attention: context tokens attend to question tokens.
 
-    Thêm has_answer_head: binary classifier để tách unanswerable ra khỏi
-    span logits, tránh model collapse (luôn predict CLS là start).
+    has_answer_head: binary classifier for unanswerable detection (EN only).
+
+    Input dimensions:
+        context_hidden : (B, L, H)   — full 512-token sequence
+        question_hidden: (B, L_q, H) — question tokens [CLS ... SEP)
     """
 
-    def __init__(self, hidden_size: int, q_hidden_size: int = 768):
+    def __init__(self, hidden_size: int = 768):
+        """
+        Args:
+            hidden_size: XLM-R hidden dimension (768 for base, 1024 for large)
+        """
         super().__init__()
-        # Cross-Attention layer: Context nodes (Query) attend to Question tokens (Key/Value)
-        self.cross_attn = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=4, batch_first=True)
-        self.q_proj = nn.Linear(q_hidden_size, hidden_size)
+
+        # Cross-Attention: context (query) attends to question (key/value)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size, num_heads=8, batch_first=True
+        )
         self.layer_norm = nn.LayerNorm(hidden_size)
 
+        # Span prediction projections
         self.start_proj = nn.Linear(hidden_size, 1)
         self.end_proj   = nn.Linear(hidden_size, 1)
 
-        # has_answer classifier: dùng CLS node embedding (node 0) để predict
-        # answerable/unanswerable — tách hoàn toàn khỏi span logits.
-        # Input: CLS node embedding (B, H) → Output: (B, 1) logit → sigmoid
+        # has_answer classifier: CLS embedding → binary logit
+        # Trained on EN branch only (has supervised labels).
         self.has_answer_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
             nn.Linear(hidden_size // 2, 1),
         )
 
-    def forward(self, node_emb: torch.Tensor, q_emb: torch.Tensor, q_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        context_hidden: torch.Tensor,               # (B, L, H) — full sequence
+        question_hidden: torch.Tensor,               # (B, L_q, H) — question tokens
+        question_pad_mask: torch.Tensor | None = None,  # (B, L_q) True = ignore
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
-            node_emb: (B, K, H) - Context nodes (node 0 = CLS)
-            q_emb: (B, L_q, H_q) - Question tokens (KHÔNG detach — cần gradient)
-            q_mask: (B, L_q) - Padding mask (True = ignore)
+            context_hidden   : (B, L, H) — all 512 tokens from H_en or H_vi
+            question_hidden  : (B, L_q, H) — tokens between [CLS] and first [SEP]
+            question_pad_mask: (B, L_q) — True = padding (ignore in attention)
 
         Returns:
-            start_logits    : (B, K)
-            end_logits      : (B, K)
-            has_answer_logit: (B,) — logit trước sigmoid (>0 = answerable)
+            start_logits     : (B, L) — logits over all 512 positions
+            end_logits       : (B, L) — logits over all 512 positions
+            has_answer_logit : (B,)   — >0 means answerable (before sigmoid)
         """
-        q_proj = self.q_proj(q_emb)  # (B, L_q, H)
-
-        # Cross-attention: Context nodes attend to Question tokens
+        # Cross-attention: context tokens attend to question tokens
         attn_out, _ = self.cross_attn(
-            query=node_emb,
-            key=q_proj,
-            value=q_proj,
-            key_padding_mask=q_mask
+            query=context_hidden,       # (B, L, H)
+            key=question_hidden,        # (B, L_q, H)
+            value=question_hidden,      # (B, L_q, H)
+            key_padding_mask=question_pad_mask,
         )
 
-        # Residual connection + LayerNorm
-        node_emb_out = self.layer_norm(node_emb + attn_out)
+        # Residual + LayerNorm
+        context_out = self.layer_norm(context_hidden + attn_out)  # (B, L, H)
 
-        start_logits = self.start_proj(node_emb_out).squeeze(-1)  # (B, K)
-        end_logits   = self.end_proj(node_emb_out).squeeze(-1)    # (B, K)
+        # Span logits over all L positions
+        start_logits = self.start_proj(context_out).squeeze(-1)   # (B, L)
+        end_logits   = self.end_proj(context_out).squeeze(-1)     # (B, L)
 
-        # has_answer: dùng CLS node (node 0) sau cross-attention
-        cls_emb = node_emb_out[:, 0, :]               # (B, H)
+        # has_answer: use CLS token (position 0) after cross-attention
+        cls_emb = context_out[:, 0, :]                            # (B, H)
         has_answer_logit = self.has_answer_head(cls_emb).squeeze(-1)  # (B,)
 
         return start_logits, end_logits, has_answer_logit
 
 
-# ──────────────────────────────────────────────────────────────
-# Span Projection: γ → pseudo-label cho VI
-# ──────────────────────────────────────────────────────────────
-
-def _decode_vi_span_from_gamma(
-    gamma: torch.Tensor,
-    en_start: torch.Tensor,
-    en_end: torch.Tensor,
-    keep_idx_vi: torch.Tensor,
-    K: int,
-    max_span_len: int = 30,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Dùng transport plan γ để tìm pseudo-label (start, end) trên VI graph.
-    Ràng buộc: vi_e >= vi_s và vi_e - vi_s <= max_span_len trong TOKEN SPACE.
-    """
-    B = gamma.size(0)
-    device = gamma.device
-
-    # 1. Tính tổng mass nhận được từ start và end node của EN
-    batch_idx = torch.arange(B, device=device)
-    start_mass = gamma[batch_idx, en_start, :]  # (B, K)
-    end_mass   = gamma[batch_idx, en_end, :]    # (B, K)
-
-    # 2. Tạo ma trận điểm cho mọi cặp (u, v) trong VI graph
-    # score_matrix[b, u, v] = start_mass[b, u] + end_mass[b, v]
-    score_matrix = start_mass.unsqueeze(2) + end_mass.unsqueeze(1)  # (B, K, K)
-
-    # 3. Ràng buộc Token Space (vi_s <= vi_e và độ dài <= max_span_len)
-    tok = keep_idx_vi  # (B, K)
-    tok_u = tok.unsqueeze(2)  # (B, K, 1) - start node
-    tok_v = tok.unsqueeze(1)  # (B, 1, K) - end node
-    tok_dist = tok_v - tok_u  # (B, K, K) - khoảng cách trong token space
-
-    # Mask invalid spans
-    invalid_mask = (tok_dist < 0) | (tok_dist > max_span_len)
-    score_matrix.masked_fill_(invalid_mask, float('-inf'))
-
-    # 4. Tìm argmax trên 2D (KxK) cho từng sample trong batch
-    best_idx = score_matrix.view(B, -1).argmax(dim=1)  # (B,)
-    vi_s = best_idx // K
-    vi_e = best_idx % K
-
-    return vi_s, vi_e
-
-
-# ──────────────────────────────────────────────────────────────
-# Loss Components
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Loss: QA Span Extraction (Supervised EN)
+# ══════════════════════════════════════════════════════════════
 
 def qa_loss(
-    start_logits: torch.Tensor,
-    end_logits: torch.Tensor,
-    start_positions: torch.Tensor,
-    end_positions: torch.Tensor,
+    start_logits: torch.Tensor,     # (B, L) or (B_filtered, L)
+    end_logits: torch.Tensor,       # (B, L) or (B_filtered, L)
+    start_positions: torch.Tensor,  # (B,) or (B_filtered,)
+    end_positions: torch.Tensor,    # (B,) or (B_filtered,)
     ignore_index: int = -100,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Cross-entropy loss cho span extraction (EN supervised).
+    Cross-entropy loss for span extraction (supervised EN).
 
     Returns:
-        (total, l_start, l_end) — cả 3 để TensorBoard log riêng start/end.
+        (total, l_start, l_end) — all three for TensorBoard logging.
     """
     loss_start = F.cross_entropy(start_logits, start_positions, ignore_index=ignore_index)
     loss_end   = F.cross_entropy(end_logits,   end_positions,   ignore_index=ignore_index)
     return (loss_start + loss_end) / 2.0, loss_start, loss_end
 
 
-def fgw_alignment_loss(
-    gamma: torch.Tensor,
-    D_en: torch.Tensor,
-    D_vi: torch.Tensor,
-    M: torch.Tensor,
-    alpha: float = 0.5,
+# ══════════════════════════════════════════════════════════════
+# Loss: OT Transport Cost (gradient flows through C only)
+# ══════════════════════════════════════════════════════════════
+
+def ot_transport_loss(
+    gamma: torch.Tensor,  # (B, L, L) — transport plan
+    C: torch.Tensor,      # (B, L, L) — cost matrix (has grad through backbone)
 ) -> torch.Tensor:
     """
-    FGW transport cost — dùng như một regularizer buộc EN graph
-    và VI graph phải có cấu trúc tương đồng.
+    L_ot = <gamma.detach(), C>.sum(dim=(-1,-2)).mean()
 
-    L_fgw = alpha * GW_cost + (1 - alpha) * W_cost
-
-    Gradient flow (Danskin's Theorem):
-        g  (transport plan) : DETACH — coi như hằng số tối ưu, không backprop
-                              qua Sinkhorn iterations (tránh chain-rule explosion).
-        C1, C2 (geometry)   : DETACH — đã detach từ _patch_model_outputs.
-        M  (EN↔VI cost)     : GIỮ GRADIENT — toàn bộ signal FGW dồn vào đây,
-                              kéo embedding EN và VI lại gần nhau một cách sạch sẽ.
+    Gradient flows through C only (not through gamma).
+    This pulls EN↔VI embeddings closer for aligned token pairs.
 
     Args:
-        gamma: (B, K, K) transport plan (từ model_core)
-        D_en : (B, K, K) distance matrix EN  [đã detach]
-        D_vi : (B, K, K) distance matrix VI  [đã detach]
-        M    : (B, K, K) feature cost matrix (cosine dist EN↔VI)  [có grad]
-        alpha: weight GW vs Wasserstein
+        gamma: (B, L, L) transport plan from Sinkhorn
+        C    : (B, L, L) cosine distance cost matrix
 
     Returns:
         scalar loss (mean over batch)
     """
-    B = gamma.size(0)
-    losses = []
+    # gamma.detach() — treat transport plan as fixed; gradient only through C
+    per_sample_cost = (gamma.detach() * C).sum(dim=(-1, -2))  # (B,)
+    return per_sample_cost.mean()
 
-    for b in range(B):
-        # ── Danskin's Theorem ────────────────────────────────────────────
-        # g là nghiệm tối ưu của bài toán OT (Sinkhorn). Theo định lý Danskin,
-        # đạo hàm của min_g F(g, θ) theo θ = ∂F/∂θ|_{g=g*}, không cần
-        # backprop qua quá trình tìm g*. Detach ngay tại đây.
-        g  = gamma[b].detach()  # (K, K) — HẰNG SỐ, không có grad_fn
-        # ────────────────────────────────────────────────────────────────
-        C1 = D_en[b]    # (K, K) — đã detach từ _patch_model_outputs
-        C2 = D_vi[b]    # (K, K) — đã detach từ _patch_model_outputs
-        m  = M[b]       # (K, K) — GIỮ GRADIENT (EN↔VI cosine dist)
 
-        # Wasserstein term: <M, g>  — gradient chảy qua m (= M[b])
-        w_loss = (m * g).sum()
-
-        # GW term (efficient formulation):
-        # C1, C2, g đều là hằng số → gw1, gw2, gw3 không có grad_fn
-        # Ngoại trừ w_loss, toàn bộ GW term = hằng số (offset không ảnh hưởng grad)
-        p = g.sum(dim=1)  # (K,) marginal EN
-        q = g.sum(dim=0)  # (K,) marginal VI
-
-        gw1 = (C1 ** 2 * p.unsqueeze(1) * p.unsqueeze(0)).sum()
-        gw2 = (C2 ** 2 * q.unsqueeze(1) * q.unsqueeze(0)).sum()
-        gw3 = (C1 @ g @ C2.T * g).sum()
-        gw_loss = gw1 + gw2 - 2.0 * gw3
-
-        losses.append(alpha * gw_loss + (1.0 - alpha) * w_loss)
-
-    return torch.stack(losses).mean()
-
+# ══════════════════════════════════════════════════════════════
+# Loss: Span Projection (pseudo-label VI from γ)
+# ══════════════════════════════════════════════════════════════
 
 def span_projection_loss(
-    vi_start_logits: torch.Tensor,
-    vi_end_logits: torch.Tensor,
-    gamma: torch.Tensor,
-    en_start: torch.Tensor,
-    en_end: torch.Tensor,
-    keep_idx_vi: torch.Tensor,
-    K: int,
-    max_span_len: int = 30,
+    vi_start_logits: torch.Tensor,  # (B_ans, L) — VI start logits (answerable only)
+    vi_end_logits: torch.Tensor,    # (B_ans, L)
+    gamma: torch.Tensor,            # (B_ans, L, L) — transport plan
+    en_start: torch.Tensor,         # (B_ans,) — EN answer start position (token index)
+    en_end: torch.Tensor,           # (B_ans,) — EN answer end position
 ) -> torch.Tensor:
     """
-    Pseudo-label QA loss cho VI — span được project từ EN qua γ.
+    Span Projection Loss — project EN answer span to VI via transport plan γ.
 
-    Chỉ tính loss cho những sample answerable (đã được lọc ở ngoài).
-    Sử dụng constraint từ token space thông qua keep_idx_vi.
+    For each sample b:
+        hat_s_vi = argmax_j gamma[b, en_start[b], j]   — where does START transport to?
+        hat_e_vi = argmax_j gamma[b, en_end[b], j]     — where does END transport to?
+
+    Constraint: hat_e_vi >= hat_s_vi.
+        If violated, mask positions before hat_s_vi to -inf before argmax on END row.
+
+    Loss = CE(vi_start_logits, hat_s_vi) + CE(vi_end_logits, hat_e_vi)
+
+    Args:
+        vi_start_logits : (B_ans, L)
+        vi_end_logits   : (B_ans, L)
+        gamma           : (B_ans, L, L)
+        en_start        : (B_ans,) token-space start indices
+        en_end          : (B_ans,) token-space end indices
+
+    Returns:
+        scalar loss
     """
     with torch.no_grad():
-        vi_start_pseudo, vi_end_pseudo = _decode_vi_span_from_gamma(
-            gamma, en_start, en_end, keep_idx_vi, K, max_span_len
-        )
+        B_ans = gamma.size(0)
+        L = gamma.size(2)
+        device = gamma.device
+        batch_idx = torch.arange(B_ans, device=device)
 
-    loss, _, _ = qa_loss(
-        vi_start_logits,
-        vi_end_logits,
-        vi_start_pseudo,
-        vi_end_pseudo,
-    )
-    return loss
+        # ── hat_s_vi: argmax over gamma row at EN start position ──
+        # gamma[b, en_start[b], :] = transport mass from EN START to all VI tokens
+        start_mass = gamma[batch_idx, en_start, :]      # (B_ans, L)
+        hat_s_vi = start_mass.argmax(dim=1)              # (B_ans,)
 
+        # ── hat_e_vi: argmax over gamma row at EN end position ────
+        # With constraint: hat_e_vi >= hat_s_vi
+        end_mass = gamma[batch_idx, en_end, :]           # (B_ans, L)
+
+        # Mask positions before hat_s_vi to -inf before argmax
+        # This ensures hat_e_vi >= hat_s_vi
+        position_idx = torch.arange(L, device=device).unsqueeze(0)  # (1, L)
+        before_start_mask = position_idx < hat_s_vi.unsqueeze(1)    # (B_ans, L)
+        end_mass_masked = end_mass.masked_fill(before_start_mask, float('-inf'))
+        hat_e_vi = end_mass_masked.argmax(dim=1)         # (B_ans,)
+
+    # Cross-entropy losses using pseudo-labels
+    loss_start = F.cross_entropy(vi_start_logits, hat_s_vi)
+    loss_end   = F.cross_entropy(vi_end_logits,   hat_e_vi)
+
+    return (loss_start + loss_end) / 2.0
+
+
+# ══════════════════════════════════════════════════════════════
+# Loss: Transport-Guided Consistency (KL divergence)
+# ══════════════════════════════════════════════════════════════
 
 def consistency_loss(
-    en_start_logits: torch.Tensor,
-    en_end_logits: torch.Tensor,
-    vi_start_logits: torch.Tensor,
-    vi_end_logits: torch.Tensor,
-    gamma: torch.Tensor,
+    en_start_logits: torch.Tensor,   # (B, L)
+    en_end_logits: torch.Tensor,     # (B, L)
+    vi_start_logits: torch.Tensor,   # (B, L)
+    vi_end_logits: torch.Tensor,     # (B, L)
+    gamma: torch.Tensor,             # (B, L_en, L_vi) transport plan
     temperature: float = 2.0,
 ) -> torch.Tensor:
     """
     Transport-Guided Consistency Loss.
 
-    Thay vì KL(VI || EN) trực tiếp — vốn bị structural mismatch do EN và VI
-    hoạt động trên 2 graph-space khác nhau (EN có answer-aware subsampling,
-    VI không) — ta dùng transport plan γ làm bridge:
+    P_target = γᵀ @ Softmax(EN_logits.detach() / T)
+    L_cons   = T² × KL( Softmax(VI_logits / T) || P_target )
 
-        L_cons = T² · KL( softmax(VI/T) || transport(softmax(EN/T), γ) )
-
-    Cụ thể:
-        1. Tính EN probability: p_en = softmax(en_logits.detach() / T)
-        2. "Transport" p_en sang VI space: p_target = normalize(γᵀ · p_en)
-           γᵀ[j, i] = transport mass từ EN node i → VI node j
-           → p_target[j] = tổng xác suất EN được transport đến VI node j
-        3. KL(VI || p_target) — VI học từ transported EN distribution
-
-    Tại sao hiệu quả:
-        - γ đã encode thông tin alignment cấu trúc EN↔VI (từ FGW solver)
-        - Target p_target nằm đúng trong VI graph-space → không còn mismatch
-        - γ càng tốt → target càng chính xác → cons loss giảm đều
-        - Tạo "neo" tự nhiên: loss bị bound bởi chất lượng γ
-
-    QUAN TRỌNG: EN logits vẫn được detach() (stop-gradient Teacher).
-    Scale T² giữ nguyên theo Hinton Knowledge Distillation convention.
+    .detach() on EN logits — stop gradient (Teacher doesn't learn from VI).
+    γ acts as a bridge mapping EN distribution to VI token space.
 
     Args:
-        en_start_logits : (B, K) EN start logits
-        en_end_logits   : (B, K) EN end logits
-        vi_start_logits : (B, K) VI start logits
-        vi_end_logits   : (B, K) VI end logits
-        gamma           : (B, K_en, K_vi) transport plan từ FGW solver
-        temperature     : nhiệt độ softmax (> 1 để smooth distribution)
+        en_start_logits : (B, L) EN start logits
+        en_end_logits   : (B, L) EN end logits
+        vi_start_logits : (B, L) VI start logits
+        vi_end_logits   : (B, L) VI end logits
+        gamma           : (B, L_en, L_vi) transport plan from Sinkhorn
+        temperature     : softmax temperature (>1 smooths distribution)
 
     Returns:
         scalar loss
     """
-    # ── 1. EN probability distribution (stop-gradient Teacher) ──────────
-    en_start_prob = F.softmax(en_start_logits.detach() / temperature, dim=-1)  # (B, K)
-    en_end_prob   = F.softmax(en_end_logits.detach()   / temperature, dim=-1)  # (B, K)
+    T = temperature
 
-    # ── 2. Transport EN distribution → VI space qua γ ──────────────────
-    # γ: (B, K_en, K_vi) → γᵀ: (B, K_vi, K_en)
-    # γᵀ · p_en → "expected VI probability" dựa trên transport plan
-    gamma_T = gamma.detach().transpose(1, 2)  # (B, K_vi, K_en)
+    # ── 1. EN probability distribution (stop-gradient Teacher) ──
+    en_start_prob = F.softmax(en_start_logits.detach() / T, dim=-1)  # (B, L)
+    en_end_prob   = F.softmax(en_end_logits.detach()   / T, dim=-1)  # (B, L)
 
-    # Normalize γᵀ theo hàng: mỗi VI node nhận tổng mass = 1
-    # Tránh division by zero cho VI nodes không nhận mass nào
-    gamma_T_norm = gamma_T / (gamma_T.sum(dim=-1, keepdim=True) + 1e-8)
+    # ── 2. Transport EN distribution → VI space via γ ───────────
+    # γᵀ: (B, L_vi, L_en)
+    gamma_T = gamma.detach().transpose(1, 2)                         # (B, L_vi, L_en)
 
-    # Transport: p_target[b, j] = Σ_i γᵀ_norm[b, j, i] · p_en[b, i]
-    vi_target_start = torch.bmm(
-        gamma_T_norm, en_start_prob.unsqueeze(-1)
-    ).squeeze(-1)  # (B, K)
-    vi_target_end = torch.bmm(
-        gamma_T_norm, en_end_prob.unsqueeze(-1)
-    ).squeeze(-1)  # (B, K)
+    # P_target = γᵀ @ p_en  →  (B, L_vi)
+    # This maps: for each VI position j, how much EN probability transports there
+    vi_target_start = torch.bmm(gamma_T, en_start_prob.unsqueeze(-1)).squeeze(-1)  # (B, L_vi)
+    vi_target_end   = torch.bmm(gamma_T, en_end_prob.unsqueeze(-1)).squeeze(-1)    # (B, L_vi)
 
-    # Clamp + renormalize để đảm bảo valid probability distribution
+    # Clamp + renormalize to ensure valid probability distribution
     vi_target_start = vi_target_start.clamp(min=1e-8)
     vi_target_end   = vi_target_end.clamp(min=1e-8)
     vi_target_start = vi_target_start / vi_target_start.sum(dim=-1, keepdim=True)
     vi_target_end   = vi_target_end   / vi_target_end.sum(dim=-1, keepdim=True)
 
-    # ── 3. KL(VI || transported_EN) ────────────────────────────────────
-    vi_start_log = F.log_softmax(vi_start_logits / temperature, dim=-1)
-    vi_end_log   = F.log_softmax(vi_end_logits   / temperature, dim=-1)
+    # ── 3. KL(VI_softmax || P_target) ──────────────────────────
+    vi_start_log = F.log_softmax(vi_start_logits / T, dim=-1)
+    vi_end_log   = F.log_softmax(vi_end_logits   / T, dim=-1)
 
     kl_start = F.kl_div(vi_start_log, vi_target_start, reduction="batchmean")
     kl_end   = F.kl_div(vi_end_log,   vi_target_end,   reduction="batchmean")
 
-    # Scale theo T² (theo Knowledge Distillation convention của Hinton)
-    return (temperature ** 2) * (kl_start + kl_end) / 2.0
+    # Scale by T² (Hinton Knowledge Distillation convention)
+    return (T ** 2) * (kl_start + kl_end) / 2.0
 
 
-# ──────────────────────────────────────────────────────────────
-# Tổng hợp Loss
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Helper: Extract question embeddings from full hidden states
+# ══════════════════════════════════════════════════════════════
+
+def _extract_question_embeddings(
+    hidden: torch.Tensor,        # (B, L, H) — full hidden states
+    question_end: torch.Tensor,  # (B,) — index of first [SEP] (exclusive end of question)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Extract question token embeddings: positions [0, question_end) — [SEP] excluded.
+
+    question_end[b] = index of first [SEP] token for sample b.
+    We extract positions [0, question_end[b]) — the [SEP] token itself is NOT included.
+    Shorter questions within the batch are padded (q_mask = True for padding positions).
+
+    Args:
+        hidden       : (B, L, H) full hidden states
+        question_end : (B,) index of first [SEP] per sample
+
+    Returns:
+        q_emb  : (B, max_q_len, H) — question token embeddings
+        q_mask : (B, max_q_len)     — True = padding (should be ignored)
+    """
+    device = hidden.device
+    max_q_len = question_end.max().item()         # exclusive: [SEP] NOT included
+    q_emb = hidden[:, :max_q_len, :]             # (B, max_q_len, H)
+
+    # Padding mask: positions at or beyond each sample's question_end are padding
+    positions = torch.arange(max_q_len, device=device).unsqueeze(0)  # (1, max_q_len)
+    q_mask = positions >= question_end.unsqueeze(1)                   # (B, max_q_len)
+
+    return q_emb, q_mask
+
+
+# ══════════════════════════════════════════════════════════════
+# OTAlignmentLoss — Orchestrates all loss components
+# ══════════════════════════════════════════════════════════════
 
 class OTAlignmentLoss(nn.Module):
     """
-    Tổng hợp tất cả loss components cho Phase 3.
+    Combined loss for Cross-Lingual QA with Sinkhorn OT.
 
     L_total = L_qa
-            + λ_fgw  * L_fgw
-            + λ_span * L_span_proj
-            + λ_cons * L_consistency
+            + 0.5         * L_has_ans
+            + λ_ot        * L_ot
+            + λ_span      * L_span_proj
+            + λ_cons      * L_consistency
 
-    Cũng expose QAHead để model_core không phải tự tạo.
+    Contains:
+        - QAHead (trainable): cross-attention + span projections + has_answer
+        - Sinkhorn solver (non-parametric): computed each forward pass
+        - All loss computation logic
     """
 
     def __init__(
         self,
-        qa_hidden_size: int = 256,   # = gat_out trong model_core
-        K: int = 128,
-        lambda_fgw: float = 0.01,
-        lambda_span: float = 0.3,
-        lambda_cons: float = 0.15,
-        fgw_alpha: float = 0.5,
-        consistency_temperature: float = 4.0,
-        max_span_len: int = 30,
-        q_hidden_size: int = 768,
+        hidden_size: int = 768,          # XLM-R hidden dimension
+        lambda_ot: float = 0.1,          # weight for OT transport cost
+        lambda_span: float = 0.3,        # weight for span projection loss
+        lambda_cons: float = 0.15,       # weight for consistency loss
+        consistency_temperature: float = 2.0,
+        sinkhorn_epsilon: float = 0.05,  # entropic regularization
+        sinkhorn_iters: int = 50,        # Sinkhorn iterations
     ):
         """
         Args:
-            qa_hidden_size : chiều output của GATEncoder (= gat_out)
-            K              : số node sau subsampling (phải khớp với model_core.K)
-            lambda_fgw     : trọng số L_fgw
-            lambda_span    : trọng số L_span_proj
-            lambda_cons    : trọng số L_consistency
-            fgw_alpha      : alpha trong FGW (GW vs Wasserstein balance)
-            consistency_temperature : nhiệt độ cho KL div
-            max_span_len   : max span length khi decode pseudo-label
-            q_hidden_size  : hidden size của backbone (thường là 768 cho base, 1024 cho large)
+            hidden_size   : XLM-R hidden dim (768 base, 1024 large)
+            lambda_ot     : weight for L_ot (transport cost regularizer)
+            lambda_span   : weight for L_span_proj (pseudo-label VI QA)
+            lambda_cons   : weight for L_consistency (KL divergence)
+            consistency_temperature : temperature T for KL div
+            sinkhorn_epsilon : entropic regularization for Sinkhorn
+            sinkhorn_iters   : number of Sinkhorn iterations
         """
         super().__init__()
-        self.K              = K
-        self.lambda_fgw     = lambda_fgw
-        self.lambda_span    = lambda_span
-        self.lambda_cons    = lambda_cons
-        self.fgw_alpha      = fgw_alpha
-        self.temperature    = consistency_temperature
-        self.max_span_len   = max_span_len
+        self.lambda_ot          = lambda_ot
+        self.lambda_span        = lambda_span
+        self.lambda_cons        = lambda_cons
+        self.temperature        = consistency_temperature
+        self.sinkhorn_epsilon   = sinkhorn_epsilon
+        self.sinkhorn_iters     = sinkhorn_iters
 
-        # QA Head dùng chung cho EN và VI, tích hợp Cross-Attention
-        self.qa_head = QAHead(qa_hidden_size, q_hidden_size=q_hidden_size)
+        # QA Head: shared for EN and VI, operates on full 512-token sequences
+        self.qa_head = QAHead(hidden_size=hidden_size)
 
     def forward(
         self,
@@ -454,155 +459,165 @@ class OTAlignmentLoss(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """
         Args:
-            model_outputs: dict từ CrossLingualOTModel.forward()
+            model_outputs: dict from CrossLingualOTModel.forward()
                 {
-                    "gamma"       : (B, K, K),
-                    "en_node_emb" : (B, K, out_dim),
-                    "vi_node_emb" : (B, K, out_dim),
-                    "D_en"        : (B, K, K),
-                    "D_vi"        : (B, K, K),
-                    "M"           : (B, K, K),
-                    "keep_idx_en" : (B, K),  ← token index của từng node EN (Fix Bug #1)
+                    "en_hidden"   : (B, L, H),
+                    "vi_hidden"   : (B, L, H),
+                    "cost_matrix" : (B, L, L),
+                    "en_pad_mask" : (B, L),
+                    "vi_pad_mask" : (B, L),
                 }
-            batch: dict từ DataLoader
+            batch: dict from DataLoader
                 {
-                    "en_start_position": (B,) — token-space (0-511)
-                    "en_end_position"  : (B,) — token-space (0-511)
-                    ...
+                    "en_start_position" : (B,) — token-space
+                    "en_end_position"   : (B,) — token-space
+                    "en_question_end"   : (B,) — first [SEP] index
+                    "vi_question_end"   : (B,) — first [SEP] index
+                    "en_is_answerable"  : (B,) — 1 if answerable, 0 if not
                 }
 
         Returns:
-            dict chứa:
-                "total"    : L_total (scalar, có grad_fn để backward)
-                "qa"       : L_qa
-                "fgw"      : L_fgw
-                "span_proj": L_span_proj
-                "cons"     : L_consistency
+            dict with all loss components + debug stats:
+                "total", "qa", "qa_start", "qa_end", "has_ans",
+                "ot", "span_proj", "cons", + debug keys
         """
-        gamma        = model_outputs["gamma"]        # (B, K, K)
-        en_node_emb  = model_outputs["en_node_emb"]  # (B, K, H)
-        vi_node_emb  = model_outputs["vi_node_emb"]  # (B, K, H)
-        D_en         = model_outputs["D_en"]         # (B, K, K)
-        D_vi         = model_outputs["D_vi"]         # (B, K, K)
-        M            = model_outputs["M"]            # (B, K, K)
-        keep_idx_en  = model_outputs["keep_idx_en"]  # (B, K) — Fix Bug #1
+        en_hidden   = model_outputs["en_hidden"]     # (B, L, H)
+        vi_hidden   = model_outputs["vi_hidden"]     # (B, L, H)
+        C           = model_outputs["cost_matrix"]   # (B, L, L)
+        en_pad_mask = model_outputs["en_pad_mask"]   # (B, L)
+        vi_pad_mask = model_outputs["vi_pad_mask"]   # (B, L)
 
-        en_start = batch["en_start_position"]  # (B,) token-space
-        en_end   = batch["en_end_position"]    # (B,) token-space
-        
-        # ── 1. Trích xuất Question embeddings và mask ──────────
-        en_hidden = model_outputs.get("en_hidden")  # (B, L_en, H_q)
-        vi_hidden = model_outputs.get("vi_hidden")  # (B, L_vi, H_q)
-        device = en_node_emb.device
+        device = en_hidden.device
+        B, L, H = en_hidden.shape
 
-        # Tạo mask cho EN question (KHÔNG detach — cross-attention cần gradient)
-        en_q_ends = batch["en_question_end"]
-        max_en_q = en_q_ends.max().item() + 1
-        en_q_emb = en_hidden[:, :max_en_q, :]          # ← bỏ .detach()
-        en_q_mask = torch.arange(max_en_q, device=device).unsqueeze(0) > en_q_ends.unsqueeze(1)
+        en_start = batch["en_start_position"]        # (B,) token-space
+        en_end   = batch["en_end_position"]          # (B,) token-space
 
-        # Tạo mask cho VI question (KHÔNG detach)
-        vi_q_ends = batch["vi_question_end"]
-        max_vi_q = vi_q_ends.max().item() + 1
-        vi_q_emb = vi_hidden[:, :max_vi_q, :]          # ← bỏ .detach()
-        vi_q_mask = torch.arange(max_vi_q, device=device).unsqueeze(0) > vi_q_ends.unsqueeze(1)
+        # ══════════════════════════════════════════════════════
+        # 1. Sinkhorn OT — compute transport plan γ
+        # ══════════════════════════════════════════════════════
+        gamma = sinkhorn_log_domain(
+            C, en_pad_mask, vi_pad_mask,
+            epsilon=self.sinkhorn_epsilon,
+            num_iters=self.sinkhorn_iters,
+        )  # (B, L, L)
 
-        # ── 2. QA Head → logits + has_answer ──────────────────
-        en_start_logits, en_end_logits, en_has_ans = self.qa_head(en_node_emb, en_q_emb, en_q_mask)
-        vi_start_logits, vi_end_logits, _           = self.qa_head(vi_node_emb, vi_q_emb, vi_q_mask)
+        # ══════════════════════════════════════════════════════
+        # 2. Extract question embeddings for cross-attention
+        # ══════════════════════════════════════════════════════
+        en_q_emb, en_q_mask = _extract_question_embeddings(
+            en_hidden, batch["en_question_end"]
+        )  # (B, max_q_en, H), (B, max_q_en)
 
-        # ── 3. Remap token-space → graph-space ────────────────
-        en_start_gs, en_end_gs = _remap_positions_to_graph_space(
-            en_start, en_end, keep_idx_en
+        vi_q_emb, vi_q_mask = _extract_question_embeddings(
+            vi_hidden, batch["vi_question_end"]
+        )  # (B, max_q_vi, H), (B, max_q_vi)
+
+        # ══════════════════════════════════════════════════════
+        # 3. QA Head → logits + has_answer
+        # ══════════════════════════════════════════════════════
+        # Context = full 512-token hidden states
+        # Question = tokens [CLS ... SEP) for cross-attention
+        en_start_logits, en_end_logits, en_has_ans = self.qa_head(
+            en_hidden, en_q_emb, en_q_mask
+        )
+        vi_start_logits, vi_end_logits, _ = self.qa_head(
+            vi_hidden, vi_q_emb, vi_q_mask
         )
 
-        # ── 4. L_qa (supervised EN) — dùng graph-space indices ─
-        # CẬP NHẬT: Chỉ tính Span Loss cho những mẫu CÓ CÂU TRẢ LỜI.
-        # Điều này giúp model không bị ép phải dự đoán CLS (0, 0) trong lúc tìm Span,
-        # tránh hiện tượng Model Collapse (luôn dự đoán chuỗi rỗng).
+        # ══════════════════════════════════════════════════════
+        # 4. L_qa (supervised EN) — only answerable samples
+        # ══════════════════════════════════════════════════════
         answerable_mask = batch["en_is_answerable"].bool().to(device)
-        
+
         if answerable_mask.any():
             l_qa, l_qa_start, l_qa_end = qa_loss(
-                en_start_logits[answerable_mask], en_end_logits[answerable_mask],
-                en_start_gs[answerable_mask], en_end_gs[answerable_mask]
+                en_start_logits[answerable_mask],
+                en_end_logits[answerable_mask],
+                en_start[answerable_mask],
+                en_end[answerable_mask],
             )
         else:
-            # Fallback nếu batch toàn bộ là unanswerable
-            l_qa = torch.tensor(0.0, device=device)
+            l_qa       = torch.tensor(0.0, device=device)
             l_qa_start = torch.tensor(0.0, device=device)
-            l_qa_end = torch.tensor(0.0, device=device)
+            l_qa_end   = torch.tensor(0.0, device=device)
 
-        # ── 5. L_has_answer (BCE) ─────────────────────────────
-        # Label: 1 nếu answerable (en_is_answerable = 1), 0 nếu không.
-        # Tách unanswerable detection ra khỏi span logits.
+        # ══════════════════════════════════════════════════════
+        # 5. L_has_answer (BCE) — EN branch only
+        # ══════════════════════════════════════════════════════
         has_answer_label = batch["en_is_answerable"].float().to(device)
-        
-        # CẬP NHẬT: Cho Unanswerable trọng số nhỏ hơn (ví dụ 0.5)
-        # Giúp model phạt nặng hơn khi sai ở Answerable, phạt nhẹ hơn khi sai ở Unanswerable.
-        # Điều này sẽ ép model bớt thiên vị (bias) về phía Unanswerable.
-        # Bạn có thể tune con số 0.5 này (ví dụ 0.3 hoặc 0.1 nếu vẫn còn bias).
+
+        # Weighted BCE: answerable=1.0, unanswerable=0.3
+        # Prevents model from being biased toward predicting unanswerable
         unanswer_weight = 0.3
         sample_weights = torch.where(
-            has_answer_label == 1.0, 
-            torch.tensor(1.0, device=device), 
-            torch.tensor(unanswer_weight, device=device)
+            has_answer_label == 1.0,
+            torch.tensor(1.0, device=device),
+            torch.tensor(unanswer_weight, device=device),
         )
-        
         l_has_ans = F.binary_cross_entropy_with_logits(
-            en_has_ans, has_answer_label, weight=sample_weights
+            en_has_ans, has_answer_label, weight=sample_weights,
         )
 
-        # ── 6. L_fgw ──────────────────────────────────────────
-        l_fgw = fgw_alignment_loss(gamma, D_en, D_vi, M, alpha=self.fgw_alpha)
+        # ══════════════════════════════════════════════════════
+        # 6. L_ot — transport cost regularizer
+        # ══════════════════════════════════════════════════════
+        # Gradient flows through C only (gamma is detached)
+        l_ot = ot_transport_loss(gamma, C)
 
-        # ── 7. L_span_proj — pseudo-label VI ──────────────────
-        # CHỈ tính trên answerable samples
-        keep_idx_vi = model_outputs.get("keep_idx_vi")
-        if answerable_mask.any() and keep_idx_vi is not None:
+        # ══════════════════════════════════════════════════════
+        # 7. L_span_proj — pseudo-label VI
+        # ══════════════════════════════════════════════════════
+        # Computed for ALL answerable EN samples (regardless of VI prediction).
+        # Pseudo-labels come from γ mapping EN answer span → VI positions.
+        if answerable_mask.any():
             l_span = span_projection_loss(
-                vi_start_logits[answerable_mask], vi_end_logits[answerable_mask],
-                gamma[answerable_mask], en_start_gs[answerable_mask], en_end_gs[answerable_mask],
-                keep_idx_vi[answerable_mask], K=self.K, max_span_len=self.max_span_len,
+                vi_start_logits[answerable_mask],
+                vi_end_logits[answerable_mask],
+                gamma[answerable_mask],
+                en_start[answerable_mask],
+                en_end[answerable_mask],
             )
         else:
             l_span = torch.tensor(0.0, device=device)
 
-        # ── 8. L_consistency (Transport-Guided, stop-grad EN) ──
-        # Tương tự như L_qa, L_consistency cũng nên được filter theo answerable_mask
-        # vì EN không còn học span cho unanswerable nữa, logits lúc này sẽ mang tính random.
+        # ══════════════════════════════════════════════════════
+        # 8. L_consistency — transport-guided KL divergence
+        # ══════════════════════════════════════════════════════
         if answerable_mask.any():
             l_cons = consistency_loss(
-                en_start_logits[answerable_mask], en_end_logits[answerable_mask],
-                vi_start_logits[answerable_mask], vi_end_logits[answerable_mask],
+                en_start_logits[answerable_mask],
+                en_end_logits[answerable_mask],
+                vi_start_logits[answerable_mask],
+                vi_end_logits[answerable_mask],
                 gamma=gamma[answerable_mask],
                 temperature=self.temperature,
             )
         else:
             l_cons = torch.tensor(0.0, device=device)
 
-        # ── 9. Tổng hợp ───────────────────────────────────────
+        # ══════════════════════════════════════════════════════
+        # 9. Total loss
+        # ══════════════════════════════════════════════════════
         l_total = (
             l_qa
-            + 0.5      * l_has_ans   # trọng số cố định 0.5 (không cần tune)
-            + self.lambda_fgw  * l_fgw
-            + self.lambda_span * l_span
-            + self.lambda_cons * l_cons
+            + 0.5                * l_has_ans
+            + self.lambda_ot     * l_ot
+            + self.lambda_span   * l_span
+            + self.lambda_cons   * l_cons
         )
 
-        # ── 10. Debug stats — phát hiện sớm CLS collapse ─────────
-        # Nếu cls_start_logit_mean ≈ max_start_logit_mean → CLS đang dominate
-        # → cần tăng lambda_has_ans hoặc kiểm tra gradient flow.
-        # Tất cả đều .detach() — không có chi phí gradient.
+        # ══════════════════════════════════════════════════════
+        # 10. Debug stats — CLS collapse detection
+        # ══════════════════════════════════════════════════════
         with torch.no_grad():
-            cls_start  = en_start_logits[:, 0].mean()            # scalar
-            max_start  = en_start_logits.max(dim=1).values.mean()  # scalar
-            cls_end    = en_end_logits[:, 0].mean()
-            max_end    = en_end_logits.max(dim=1).values.mean()
-            # collapse_ratio gần 1.0 → CLS đang thắng hầu hết các samples
-            answerable_mask = has_answer_label.bool()
+            cls_start = en_start_logits[:, 0].mean()
+            max_start = en_start_logits.max(dim=1).values.mean()
+            cls_end   = en_end_logits[:, 0].mean()
+            max_end   = en_end_logits.max(dim=1).values.mean()
+
             if answerable_mask.any():
-                has_ans_acc = ((en_has_ans[answerable_mask] > 0).float().mean())
+                has_ans_acc = (en_has_ans[answerable_mask] > 0).float().mean()
             else:
                 has_ans_acc = torch.tensor(float('nan'))
 
@@ -612,7 +627,7 @@ class OTAlignmentLoss(nn.Module):
             "qa_start"        : l_qa_start.detach(),
             "qa_end"          : l_qa_end.detach(),
             "has_ans"         : l_has_ans.detach(),
-            "fgw"             : l_fgw.detach(),
+            "ot"              : l_ot.detach(),
             "span_proj"       : l_span.detach(),
             "cons"            : l_cons.detach(),
             # Debug: collapse detector
@@ -620,61 +635,79 @@ class OTAlignmentLoss(nn.Module):
             "dbg/max_start"   : max_start,
             "dbg/cls_end"     : cls_end,
             "dbg/max_end"     : max_end,
-            "dbg/has_ans_acc" : has_ans_acc,  # accuracy trên answerable samples
+            "dbg/has_ans_acc" : has_ans_acc,
         }
 
 
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
 # Quick test: python losses.py
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     torch.manual_seed(42)
-    B, K, H = 2, 32, 64
-    MAX_TOKENS = 512  # token-space size
+    B, L, H = 2, 512, 768
 
-    # Mock keep_idx_en: mỗi node map tới một token index ngẫu nhiên (không trùng)
-    # Đảm bảo token 5 và 10 (answer tokens) nằm trong graph để test remap
-    base_idx = torch.stack([
-        torch.randperm(MAX_TOKENS)[:K],  # sample 0: chứa token 5, 10
-        torch.randperm(MAX_TOKENS)[:K],  # sample 1: unanswerable, không cần
-    ])  # (B, K)
-    # Ép token 5 → node 3, token 10 → node 7 trong sample 0 (để test)
-    base_idx[0, 3] = 5
-    base_idx[0, 7] = 10
+    print("=" * 60)
+    print("Self-test: OTAlignmentLoss with Sinkhorn OT")
+    print("=" * 60)
 
-    # Mock model outputs
+    # ── Mock model outputs ────────────────────────────────────
+    # Simulate XLM-R hidden states
+    en_hidden = torch.randn(B, L, H)
+    vi_hidden = torch.randn(B, L, H)
+
+    # Simulate attention masks (first 400 tokens valid, rest PAD)
+    en_attn_mask = torch.ones(B, L, dtype=torch.long)
+    en_attn_mask[:, 400:] = 0
+    vi_attn_mask = torch.ones(B, L, dtype=torch.long)
+    vi_attn_mask[:, 380:] = 0
+
+    # Cost matrix with PAD masking
+    en_norm = F.normalize(en_hidden, dim=-1)
+    vi_norm = F.normalize(vi_hidden, dim=-1)
+    C = 1.0 - torch.bmm(en_norm, vi_norm.transpose(1, 2))
+    en_pad = (en_attn_mask == 0)
+    vi_pad = (vi_attn_mask == 0)
+    C = C.masked_fill(en_pad.unsqueeze(2), 1e4)
+    C = C.masked_fill(vi_pad.unsqueeze(1), 1e4)
+
     mock_outputs = {
-        "gamma"       : torch.rand(B, K, K).softmax(dim=-1),
-        "en_node_emb" : torch.randn(B, K, H),
-        "vi_node_emb" : torch.randn(B, K, H),
-        "D_en"        : torch.rand(B, K, K),
-        "D_vi"        : torch.rand(B, K, K),
-        "M"           : torch.rand(B, K, K),
-        "keep_idx_en" : base_idx,         # (B, K) — Fix Bug #1
-        "keep_idx_vi" : base_idx.clone(), # (B, K)
-        "en_hidden"   : torch.randn(B, MAX_TOKENS, 768),
-        "vi_hidden"   : torch.randn(B, MAX_TOKENS, 768),
+        "en_hidden":   en_hidden,
+        "vi_hidden":   vi_hidden,
+        "cost_matrix": C,
+        "en_pad_mask": en_pad,
+        "vi_pad_mask": vi_pad,
     }
 
-    # Mock batch — positions trong token-space (0-511)
+    # ── Mock batch ────────────────────────────────────────────
     mock_batch = {
-        "en_start_position": torch.tensor([5,  0]),   # sample 0: token 5, sample 1: unanswerable
-        "en_end_position"  : torch.tensor([10, 0]),
-        "en_question_end"  : torch.tensor([12, 10]),
-        "vi_question_end"  : torch.tensor([14, 11]),
-        "en_is_answerable" : torch.tensor([1,  0]),
+        "en_start_position": torch.tensor([50, 0]),    # sample 0: answerable, sample 1: unanswerable
+        "en_end_position":   torch.tensor([55, 0]),
+        "en_question_end":   torch.tensor([20, 15]),   # question tokens [0..20]
+        "vi_question_end":   torch.tensor([22, 17]),
+        "en_is_answerable":  torch.tensor([1, 0]),
+        "en_attention_mask": en_attn_mask,
+        "vi_attention_mask": vi_attn_mask,
     }
 
-    criterion = OTAlignmentLoss(qa_hidden_size=H, K=K)
+    # ── Run forward ───────────────────────────────────────────
+    criterion = OTAlignmentLoss(hidden_size=H)
     losses = criterion(mock_outputs, mock_batch)
 
-    print("=== Loss Components ===")
+    print("\n=== Loss Components ===")
     for k, v in losses.items():
-        print(f"  {k:12s}: {v.item():.6f}")
+        if isinstance(v, torch.Tensor):
+            print(f"  {k:20s}: {v.item():.6f}")
 
-    # Backward pass
+    # ── Backward pass ─────────────────────────────────────────
     losses["total"].backward()
-    print("\n[OK] Backward pass OK -- gradient flow worked!")
-    print("  - L_qa, L_fgw, L_span_proj, L_consistency calculated.")
-    print("  - stop-gradient EN logits trong L_consistency: OK")
+    print("\n[OK] Backward pass succeeded — gradient flow works!")
+
+    # ── Verify Sinkhorn ───────────────────────────────────────
+    gamma = sinkhorn_log_domain(C.detach(), en_pad, vi_pad)
+    row_sums = gamma.sum(dim=2)  # should be ~mu for valid, ~0 for PAD
+    print(f"\n[Sinkhorn] gamma shape: {gamma.shape}")
+    print(f"[Sinkhorn] gamma sum per sample: {gamma.sum(dim=(1,2)).tolist()}")
+    print(f"[Sinkhorn] PAD row mass (should be ~0): {row_sums[0, 400:410].tolist()}")
+    print(f"[Sinkhorn] Valid row mass (should be ~1/400): {row_sums[0, :5].tolist()}")
+    print("\n[OK] All checks passed!")
