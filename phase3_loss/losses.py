@@ -481,26 +481,34 @@ class OTAlignmentLoss(nn.Module):
                 "total", "qa", "qa_start", "qa_end", "has_ans",
                 "ot", "span_proj", "cons", + debug keys
         """
-        en_hidden   = model_outputs["en_hidden"]     # (B, L, H)
-        vi_hidden   = model_outputs["vi_hidden"]     # (B, L, H)
-        C           = model_outputs["cost_matrix"]   # (B, L, L)
-        en_pad_mask = model_outputs["en_pad_mask"]   # (B, L)
-        vi_pad_mask = model_outputs["vi_pad_mask"]   # (B, L)
+        en_hidden   = model_outputs["en_hidden"]     # (B, T_en, H)  — truncated to max valid tokens
+        vi_hidden   = model_outputs["vi_hidden"]     # (B, T_vi, H)  — truncated to max valid tokens
+        C           = model_outputs["cost_matrix"]   # (B, T_en, T_vi)
+        en_pad_mask = model_outputs["en_pad_mask"]   # (B, T_en)
+        vi_pad_mask = model_outputs["vi_pad_mask"]   # (B, T_vi)
 
         device = en_hidden.device
-        B, L, H = en_hidden.shape
+        B, T_en, H = en_hidden.shape
 
         en_start = batch["en_start_position"]        # (B,) token-space
         en_end   = batch["en_end_position"]          # (B,) token-space
 
+        # ── Clamp to truncated sequence length — prevents IndexError ──
+        # After dynamic truncation, en_start/en_end may exceed T_en.
+        # Clamping ensures valid indices for qa_loss and span_projection_loss.
+        en_seq_len = en_hidden.size(1)               # T_en after dynamic truncation
+        en_start = en_start.clamp(max=en_seq_len - 1)
+        en_end   = en_end.clamp(max=en_seq_len - 1)
+
         # ══════════════════════════════════════════════════════
         # 1. Sinkhorn OT — compute transport plan γ
         # ══════════════════════════════════════════════════════
+        # C is already (B, T_en, T_vi) — no wasted 512-dim compute
         gamma = sinkhorn_log_domain(
             C, en_pad_mask, vi_pad_mask,
             epsilon=self.sinkhorn_epsilon,
             num_iters=self.sinkhorn_iters,
-        )  # (B, L, L)
+        )  # (B, T_en, T_vi)
 
         # ══════════════════════════════════════════════════════
         # 2. Extract question embeddings for cross-attention
@@ -516,7 +524,7 @@ class OTAlignmentLoss(nn.Module):
         # ══════════════════════════════════════════════════════
         # 3. QA Head → logits + has_answer
         # ══════════════════════════════════════════════════════
-        # Context = full 512-token hidden states
+        # Context = truncated hidden states (T_en / T_vi tokens, not 512)
         # Question = tokens [CLS ... SEP) for cross-attention
         en_start_logits, en_end_logits, en_has_ans = self.qa_head(
             en_hidden, en_q_emb, en_q_mask

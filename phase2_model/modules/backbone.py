@@ -18,7 +18,7 @@ class SharedBackbone(nn.Module):
         self.encoder = AutoModel.from_pretrained(
             model_name,
             output_attentions=False,      # ← no attention maps needed
-            output_hidden_states=False,
+            output_hidden_states=True,     # FIXED: must be True for layer mixing
         )
         self.hidden_size = self.encoder.config.hidden_size  # 768 (base) / 1024 (large)
 

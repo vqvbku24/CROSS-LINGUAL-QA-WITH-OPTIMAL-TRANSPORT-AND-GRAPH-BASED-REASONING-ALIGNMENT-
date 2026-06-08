@@ -1,71 +1,126 @@
-# Bug Report — Sinkhorn OT Refactor
+# BUGFIX SPEC — Cross-Lingual OT QA Model
 
-## Bug 1 🔴 `losses.py` — Gradient rò rỉ từ `gamma` vào Span Projection và Consistency Loss
-
-**Vấn đề:**
-`gamma` được tính từ Sinkhorn qua `log_K = -C / epsilon`. Vì `C` có gradient từ backbone,
-`gamma` cũng mang gradient ngầm qua `C`. Khi `gamma` được truyền vào `span_projection_loss`
-và `consistency_loss`, gradient **vô tình chảy ngược về backbone** — ngoài ý muốn.
-Chỉ `L_ot` mới được phép train backbone qua `C`; span và consistency chỉ nên train VI branch.
-
-**Yêu cầu agent:** Phân tích dataflow gradient trong `OTAlignmentLoss.forward()` và đề xuất
-cách isolate gradient hợp lý nhất (ví dụ: `gamma.detach()`, hay tách Sinkhorn ra khỏi
-computation graph, hay cách khác). Áp dụng fix sao cho `L_ot` vẫn train được backbone
-thông qua `C`, còn `L_span_proj` và `L_cons` thì không.
+> **For coding agent.** Fix 3 bugs in priority order. Each section includes: file, location, problem, exact fix.
 
 ---
 
-## Bug 2 🔴 `train.py` — Learning Rate × 100 quá cao trong `run_overfit`
+## BUG 1 — CRITICAL: Index out-of-bounds after dynamic truncation
 
-**Vấn đề:**
+**File:** `losses.py`  
+**Function:** `OTAlignmentLoss.forward()`  
+**Trigger:** Any sample where `en_start_position` or `en_end_position >= T_en` (truncated length)
+
+### Problem
+
+`model_core.py` truncates hidden states to `T_en = max(en_attention_mask.sum())`, which is often 200–350 tokens. But `en_start_position` and `en_end_position` in the batch are token indices in the original 512-token space. If any sample has `en_start >= T_en`, the following lines crash with `IndexError`:
+
 ```python
-opt_qa = AdamW(qa_params, lr=config["overfit_lr"] * 100, weight_decay=0.0)
-# overfit_lr = 3e-4 → lr thực tế = 0.03  ← quá cao, sẽ explode hoặc oscillate
+# losses.py — span_projection_loss()
+start_mass = gamma[batch_idx, en_start, :]   # CRASH if en_start >= T_en
+
+# losses.py — OTAlignmentLoss.forward() — qa_loss()
+en_start_logits[answerable_mask]             # shape (B_ans, T_en)
+en_start[answerable_mask]                    # values may be >= T_en → CE crash
 ```
-Loss sẽ không giảm monotonically trong overfit sanity check.
 
-**Yêu cầu agent:** Xác định lr hợp lý cho QA head trong overfit mode (mục tiêu: loss
-giảm nhanh nhưng ổn định), sửa lại dòng này với lý giải rõ ràng.
+### Fix
 
----
+In `OTAlignmentLoss.forward()`, after reading `en_start` and `en_end` from batch and before any loss computation, add:
 
-## Bug 3 🟡 `losses.py` — Off-by-one: [SEP] token bị include vào question embeddings
-
-**Vấn đề:**
 ```python
-max_q_len = question_end.max().item() + 1
-q_mask = positions > question_end.unsqueeze(1)
-# position == question_end → mask=False → [SEP] token bị include vào cross-attention
+en_start = batch["en_start_position"]
+en_end   = batch["en_end_position"]
+
+# Clamp to truncated sequence length — prevents IndexError
+en_seq_len = en_hidden.size(1)   # T_en after dynamic truncation
+en_start = en_start.clamp(max=en_seq_len - 1)
+en_end   = en_end.clamp(max=en_seq_len - 1)
 ```
-Comment nói "exclusive end" nhưng implementation lại **inclusive** — không nhất quán.
 
-**Yêu cầu agent:** Xem xét kiến trúc QA Head cross-attention và quyết định xem [SEP]
-token có nên tham gia vào question embeddings không. Sửa code và comment cho nhất quán,
-với lý giải rõ ràng về lựa chọn.
+> **Note:** `en_end` must also be clamped, not just `en_start`.
 
 ---
 
-## Bug 4 🟡 `train.py` — Multi-GPU không được handle
+## BUG 2 — CRASH ON INIT: Missing `hidden_size` attribute on model
 
-**Vấn đề:**
-Code chỉ có `torch.cuda.set_device(0)` — training chỉ chạy trên GPU 0 dù cluster có nhiều GPU.
-Sinkhorn trên `[B, 512, 512]` sẽ không tận dụng được các GPU còn lại.
+**File:** `model_core.py`  
+**Class:** `CrossLingualOTModel.__init__()`  
+**Trigger:** `train.py` calls `model.backbone.hidden_size` — attribute does not exist
 
-**Yêu cầu agent:** Đề xuất và implement chiến lược multi-GPU phù hợp nhất với kiến trúc
-hiện tại (lưu ý: `OTAlignmentLoss` chứa Sinkhorn stateful logic — cần cân nhắc khi wrap).
-Có thể chọn `DataParallel`, `DistributedDataParallel` với `torchrun`, hoặc strategy khác
-— miễn là có lý giải rõ ràng về trade-off.
+### Problem
+
+`train.py` reads:
+```python
+criterion = OTAlignmentLoss(
+    hidden_size = model.backbone.hidden_size,  # AttributeError
+    ...
+)
+```
+
+`CrossLingualOTModel` uses `AutoModel` directly (not `SharedBackbone`), and `AutoModel` does not expose a `hidden_size` attribute — only `model.backbone.config.hidden_size` exists.
+
+### Fix
+
+In `CrossLingualOTModel.__init__()`, add one line after `self.backbone = AutoModel.from_pretrained(...)`:
+
+```python
+self.backbone = AutoModel.from_pretrained(model_name, output_hidden_states=True)
+self.hidden_size = self.backbone.config.hidden_size   # ADD THIS LINE — 768 (base) / 1024 (large)
+self.layer_weights = nn.Parameter(torch.ones(4))
+```
 
 ---
 
-## Thứ tự fix
+## BUG 3 — STALE FILE: `backbone.py` contradicts `model_core.py`
 
-| Priority | Bug | File |
-|---|---|---|
-| 1 | Gamma gradient leak | `losses.py` |
-| 2 | LR × 100 | `train.py` |
-| 3 | [SEP] off-by-one | `losses.py` |
-| 4 | Multi-GPU | `train.py` |
+**File:** `backbone.py`  
+**Risk:** Silent wrong behavior if any code imports `SharedBackbone` instead of using `model_core.py` directly
 
-Fix Bug 1 và Bug 2 trước khi chạy bất kỳ experiment nào.
-Bug 3 và Bug 4 có thể fix song song hoặc sau.
+### Problem
+
+`backbone.py` defines `SharedBackbone` with `output_hidden_states=False`:
+```python
+self.encoder = AutoModel.from_pretrained(
+    model_name,
+    output_hidden_states=False,   # ← WRONG for layer mixing
+)
+```
+
+`model_core.py` does NOT use `SharedBackbone` — it creates its own `AutoModel` inline with `output_hidden_states=True`. The two files are out of sync. If any import accidentally uses `SharedBackbone`, `out.hidden_states` will be `None` → crash.
+
+### Fix (choose one)
+
+**Option A — Delete the file (recommended):**
+```bash
+rm backbone.py   # or modules/backbone.py depending on project structure
+```
+
+**Option B — Sync it (if backbone.py is used elsewhere):**
+```python
+# backbone.py — change output_hidden_states to True
+self.encoder = AutoModel.from_pretrained(
+    model_name,
+    output_hidden_states=True,    # CHANGED
+)
+```
+
+---
+
+## Summary Table
+
+| # | Priority | File | Type | Impact |
+|---|----------|------|------|--------|
+| 1 | CRITICAL | `losses.py` — `OTAlignmentLoss.forward()` | Runtime crash | Crashes during training on any batch where answer span is near end of truncated sequence |
+| 2 | HIGH | `model_core.py` — `__init__()` | Crash on init | `AttributeError` on every `run_training()` call |
+| 3 | LOW | `backbone.py` | Stale file | Silent wrong behavior if imported; safe to delete |
+
+---
+
+## No-touch zones
+
+The following are **intentional design choices** — do not change:
+
+- `gamma.detach()` in `ot_transport_loss()` — gradient flows through `C` only, not `gamma`
+- `gamma.detach()` in `consistency_loss()` — EN is teacher, VI is student; EN logits also detached
+- `layer_weights` optimizer group with `lr=1e-4` separate from backbone `lr=1e-5` — required per design spec
+- Curriculum annealing logic in `run_overfit_full()` and `run_training()` — intentional, not a bug

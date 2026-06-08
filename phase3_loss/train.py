@@ -332,13 +332,14 @@ def run_overfit_full(config: dict, device: torch.device):
     for p in model.parameters():
         p.requires_grad_(True)
 
-    backbone_params = list(model.backbone.parameters())
-    head_params     = list(criterion.parameters())
-    all_params      = backbone_params + head_params
+    backbone_params   = list(model.backbone.parameters())
+    layer_w_params    = [model.layer_weights]          # nn.Parameter — learns which layer (6-9) is best
+    head_params       = list(criterion.parameters())
+    all_params        = backbone_params + layer_w_params + head_params
 
     total_trainable = sum(p.numel() for p in all_params if p.requires_grad)
     log.info(f"Trainable: ALL params — {total_trainable/1e6:.2f}M")
-    log.info(f"LR: backbone=1e-5 | head=1e-4 | weight_decay=0.01")
+    log.info(f"LR: backbone=1e-5 | layer_weights=1e-4 | head=1e-4 | weight_decay=0.01")
     log.info(
         f"lambda_ot={config['lambda_ot']} | "
         f"lambda_cons={config['lambda_cons']} | "
@@ -346,8 +347,9 @@ def run_overfit_full(config: dict, device: torch.device):
     )
 
     optimizer = AdamW([
-        {"params": backbone_params, "lr": 1e-5},
-        {"params": head_params,     "lr": 1e-4},
+        {"params": backbone_params,  "lr": 1e-5},
+        {"params": layer_w_params,   "lr": 1e-4},   # layer mixing weights (6,7,8,9)
+        {"params": head_params,      "lr": 1e-4},
     ], weight_decay=0.01)
 
     model.train()
@@ -465,10 +467,12 @@ def run_training(config: dict, device: torch.device):
     _criterion = criterion.module if is_distributed() else criterion
 
     backbone_params = list(_model.backbone.parameters())
+    layer_w_params  = [_model.layer_weights]           # nn.Parameter — learns which layer (6-9) is best
     head_params     = list(_criterion.parameters())
 
     optimizer = AdamW([
         {"params": backbone_params, "lr": config.get("lr", 1e-5)},
+        {"params": layer_w_params,  "lr": config.get("head_lr", 1e-4)},  # layer mixing weights
         {"params": head_params,     "lr": config.get("head_lr", 1e-4)},
     ], weight_decay=config["weight_decay"])
 
