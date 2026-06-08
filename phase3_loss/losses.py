@@ -35,9 +35,9 @@ import torch.nn.functional as F
 # ══════════════════════════════════════════════════════════════
 
 def sinkhorn_log_domain(
-    C: torch.Tensor,            # (B, L, L) cost matrix (already PAD-masked with 1e4)
-    en_pad_mask: torch.Tensor,  # (B, L) True = PAD
-    vi_pad_mask: torch.Tensor,  # (B, L) True = PAD
+    C: torch.Tensor,            # (B, M, N) cost matrix (already PAD-masked with 1e4)
+    en_pad_mask: torch.Tensor,  # (B, M) True = PAD
+    vi_pad_mask: torch.Tensor,  # (B, N) True = PAD
     epsilon: float = 0.05,      # entropic regularization
     num_iters: int = 50,        # Sinkhorn iterations
 ) -> torch.Tensor:
@@ -51,33 +51,34 @@ def sinkhorn_log_domain(
     This ensures zero transport mass is assigned to PAD tokens.
 
     Args:
-        C          : (B, L, L) cosine distance cost matrix (PAD positions = 1e4)
-        en_pad_mask: (B, L) boolean — True for PAD tokens in EN
-        vi_pad_mask: (B, L) boolean — True for PAD tokens in VI
+        C          : (B, M, N) cosine distance cost matrix (PAD positions = 1e4)
+                     M = T_en, N = T_vi (may differ after dynamic truncation)
+        en_pad_mask: (B, M) boolean — True for PAD tokens in EN
+        vi_pad_mask: (B, N) boolean — True for PAD tokens in VI
         epsilon    : entropic regularization strength (larger = smoother, more stable)
         num_iters  : number of Sinkhorn iterations
 
     Returns:
-        gamma: (B, L, L) transport plan. Sum ≈ 1.0 per sample.
+        gamma: (B, M, N) transport plan. Sum ≈ 1.0 per sample.
                PAD rows/cols have ~0 mass.
     """
-    B, L, _ = C.shape
+    B, M, N = C.shape          # M = T_en, N = T_vi (not necessarily equal)
     device = C.device
     dtype = C.dtype
 
     # ── Non-uniform marginals ─────────────────────────────────
     # mu[b,i] = 1/n_valid if not PAD, else 0
-    en_valid = (~en_pad_mask).float()                   # (B, L) — 1 for valid, 0 for PAD
-    vi_valid = (~vi_pad_mask).float()                   # (B, L)
+    en_valid = (~en_pad_mask).float()                   # (B, M) — 1 for valid, 0 for PAD
+    vi_valid = (~vi_pad_mask).float()                   # (B, N)
     n_valid_en = en_valid.sum(dim=1, keepdim=True).clamp(min=1.0)  # (B, 1)
     n_valid_vi = vi_valid.sum(dim=1, keepdim=True).clamp(min=1.0)  # (B, 1)
 
-    mu = en_valid / n_valid_en                          # (B, L) — sums to 1.0 per sample
-    nu = vi_valid / n_valid_vi                          # (B, L)
+    mu = en_valid / n_valid_en                          # (B, M) — sums to 1.0 per sample
+    nu = vi_valid / n_valid_vi                          # (B, N)
 
     # ── Clamp before log to avoid -inf / NaN ──────────────────
-    log_mu = torch.log(mu.clamp(min=1e-8))              # (B, L)
-    log_nu = torch.log(nu.clamp(min=1e-8))              # (B, L)
+    log_mu = torch.log(mu.clamp(min=1e-8))              # (B, M)
+    log_nu = torch.log(nu.clamp(min=1e-8))              # (B, N)
 
     # Set log-marginals of PAD tokens to -1e8 (effectively -inf but finite)
     # This prevents any NaN from propagating through logsumexp
@@ -86,21 +87,21 @@ def sinkhorn_log_domain(
 
     # ── Log-domain kernel ─────────────────────────────────────
     # log_K[b,i,j] = -C[b,i,j] / epsilon
-    log_K = -C / epsilon                                # (B, L, L)
+    log_K = -C / epsilon                                # (B, M, N)
 
     # ── Sinkhorn iterations in log space ──────────────────────
-    # u, v are log-scaling vectors
-    log_u = torch.zeros(B, L, device=device, dtype=dtype)
-    log_v = torch.zeros(B, L, device=device, dtype=dtype)
+    # u, v are log-scaling vectors (row and column respectively)
+    log_u = torch.zeros(B, M, device=device, dtype=dtype)  # row scaling   (B, M)
+    log_v = torch.zeros(B, N, device=device, dtype=dtype)  # column scaling (B, N)
 
     for _ in range(num_iters):
         # Row update: enforce row marginal = mu
         # log_u[b,i] = log_mu[b,i] - logsumexp_j(log_K[b,i,j] + log_v[b,j])
-        log_u = log_mu - torch.logsumexp(log_K + log_v.unsqueeze(1), dim=2)
+        log_u = log_mu - torch.logsumexp(log_K + log_v.unsqueeze(1), dim=2)  # (B, M)
 
         # Column update: enforce column marginal = nu
         # log_v[b,j] = log_nu[b,j] - logsumexp_i(log_K[b,i,j] + log_u[b,i])
-        log_v = log_nu - torch.logsumexp(log_K + log_u.unsqueeze(2), dim=1)
+        log_v = log_nu - torch.logsumexp(log_K + log_u.unsqueeze(2), dim=1)  # (B, N)
 
         # Clamp to prevent overflow in exp()
         log_u = log_u.clamp(-1e8, 1e2)
@@ -108,9 +109,9 @@ def sinkhorn_log_domain(
 
     # ── Reconstruct transport plan ────────────────────────────
     # gamma[b,i,j] = exp(log_u[b,i] + log_K[b,i,j] + log_v[b,j])
-    gamma = torch.exp(log_u.unsqueeze(2) + log_K + log_v.unsqueeze(1))
+    gamma = torch.exp(log_u.unsqueeze(2) + log_K + log_v.unsqueeze(1))  # (B, M, N)
 
-    return gamma  # (B, L, L)
+    return gamma  # (B, M, N)
 
 
 # ══════════════════════════════════════════════════════════════

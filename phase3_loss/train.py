@@ -358,6 +358,8 @@ def run_overfit_full(config: dict, device: torch.device):
     prev_loss      = float("inf")
     stagnant_count = 0
 
+    _cons_max = config["lambda_cons"]
+
     for step in range(1, config["overfit_steps"] + 1):
 
         # ── Curriculum: OT warmup ──────────────────────────────
@@ -377,8 +379,7 @@ def run_overfit_full(config: dict, device: torch.device):
         else:
             criterion.lambda_span = config["lambda_span"]
 
-        # Cons: Phase1 step 1-50 = 0, Phase2 step 51-150 = 0→0.1
-        _cons_max = min(0.1, config["lambda_cons"])
+        # Cons: Phase1 step 1-50 = 0, Phase2 step 51-150 = 0→max
         if step <= 50:
             criterion.lambda_cons = 0.0
         elif step <= 150:
@@ -401,8 +402,9 @@ def run_overfit_full(config: dict, device: torch.device):
 
         losses["total"].backward()
 
-        gn_bb = torch.nn.utils.clip_grad_norm_(backbone_params, max_norm=0.15).item()
-        gn_head = torch.nn.utils.clip_grad_norm_(head_params, max_norm=1.5).item()
+        gn_bb   = torch.nn.utils.clip_grad_norm_(backbone_params, max_norm=0.15).item()
+        gn_lw   = torch.nn.utils.clip_grad_norm_(layer_w_params,  max_norm=1.0).item()
+        gn_head = torch.nn.utils.clip_grad_norm_(head_params,     max_norm=1.5).item()
 
         optimizer.step()
 
@@ -556,30 +558,6 @@ def run_training(config: dict, device: torch.device):
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-            # ── Curriculum Learning ──────────────────────────
-            current_step = global_step + 1
-
-            if current_step <= _OT_DELAY:
-                _criterion.lambda_ot = 0.0
-            elif current_step <= _OT_DELAY + _OT_WARMUP:
-                _criterion.lambda_ot = config["lambda_ot"] * (current_step - _OT_DELAY) / _OT_WARMUP
-            else:
-                _criterion.lambda_ot = config["lambda_ot"]
-
-            if current_step <= _SPAN_DELAY:
-                _criterion.lambda_span = 0.0
-            elif current_step <= _SPAN_DELAY + _SPAN_WARMUP:
-                _criterion.lambda_span = config["lambda_span"] * (current_step - _SPAN_DELAY) / _SPAN_WARMUP
-            else:
-                _criterion.lambda_span = config["lambda_span"]
-
-            if current_step <= _CONS_DELAY:
-                _criterion.lambda_cons = 0.0
-            elif current_step <= _CONS_DELAY + _CONS_WARMUP:
-                _criterion.lambda_cons = _CONS_MAX * (current_step - _CONS_DELAY) / _CONS_WARMUP
-            else:
-                _criterion.lambda_cons = _CONS_MAX
-
             # Forward
             try:
                 outputs = model(batch)
@@ -601,13 +579,36 @@ def run_training(config: dict, device: torch.device):
 
             if (step + 1) % config["grad_accum_steps"] == 0:
                 torch.nn.utils.clip_grad_norm_(backbone_params, config["max_grad_norm"] * 0.15)
+                torch.nn.utils.clip_grad_norm_(layer_w_params,  config["max_grad_norm"] * 1.0)
                 torch.nn.utils.clip_grad_norm_(head_params,     config["max_grad_norm"] * 1.5)
 
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
                 optimizer.zero_grad()
-                global_step += 1
+                global_step += 1  # increment first
+
+                # ── Curriculum Learning (uses updated global_step) ──
+                if global_step <= _OT_DELAY:
+                    _criterion.lambda_ot = 0.0
+                elif global_step <= _OT_DELAY + _OT_WARMUP:
+                    _criterion.lambda_ot = config["lambda_ot"] * (global_step - _OT_DELAY) / _OT_WARMUP
+                else:
+                    _criterion.lambda_ot = config["lambda_ot"]
+
+                if global_step <= _SPAN_DELAY:
+                    _criterion.lambda_span = 0.0
+                elif global_step <= _SPAN_DELAY + _SPAN_WARMUP:
+                    _criterion.lambda_span = config["lambda_span"] * (global_step - _SPAN_DELAY) / _SPAN_WARMUP
+                else:
+                    _criterion.lambda_span = config["lambda_span"]
+
+                if global_step <= _CONS_DELAY:
+                    _criterion.lambda_cons = 0.0
+                elif global_step <= _CONS_DELAY + _CONS_WARMUP:
+                    _criterion.lambda_cons = _CONS_MAX * (global_step - _CONS_DELAY) / _CONS_WARMUP
+                else:
+                    _criterion.lambda_cons = _CONS_MAX
 
                 if global_step % config["log_every"] == 0 and is_main_process():
                     log.info(
