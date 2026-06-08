@@ -1,158 +1,105 @@
-# BUGFIX SPEC — train.py (pre-full-train fixes)
-
-> **For coding agent.** 3 fixes required before running `--mode train`.
-> Fix in priority order. Do not touch anything outside the specified locations.
+# PARAM_TUNING_SPEC.md
+> Agent: review từng item, quyết định có apply hay không dựa trên context thực tế (sequence length, GPU memory, loss scale quan sát được khi train).
 
 ---
 
-## Summary Table
+## Priority Table
 
-| # | Priority | File | Function | Type | Impact |
-|---|----------|------|----------|------|--------|
-| 1 | **BUG** | `train.py` | `run_overfit_full()` | Wrong cap value | `L_cons` capped at 0.1 instead of 0.15 — never reaches design target |
-| 2 | **RISK** | `train.py` | `run_overfit_full()` + `run_training()` | Missing grad clip | `layer_weights` gradient uncontrolled during spikes |
-| 3 | **MINOR** | `train.py` | `run_training()` | Logic offset | `global_step` off-by-one causes curriculum to shift by 1 step |
-
----
-
-## FIX 1 — BUG: `_cons_max` capped too low in `run_overfit_full`
-
-**File:** `train.py`  
-**Function:** `run_overfit_full()`  
-**Root cause:** `min(0.1, config["lambda_cons"])` evaluates to `0.1` when `lambda_cons=0.15`, silently capping consistency loss below its designed maximum. This is why `cons` plateaued at ~0.45 instead of continuing to decrease.
-
-### Find this line (inside the step loop):
-```python
-_cons_max = min(0.1, config["lambda_cons"])
-```
-
-### Replace with:
-```python
-_cons_max = config["lambda_cons"]
-```
-
-> **Note:** This line is recalculated every step inside the loop — move it outside the loop after the fix (just before `for step in range(...):`) for efficiency, but correctness-only fix is the one-line change above.
+| Priority | File | Tham số | Hiện tại | Đề xuất | Rủi ro nếu không đổi |
+|---|---|---|---|---|---|
+| 🔴 HIGH | `losses.py` | `sinkhorn_epsilon` | `0.05` | `0.1` | Span extraction collapse (Arabic −14 F1 theo ablation bài báo ACL) |
+| 🟡 MEDIUM | `losses.py` + `train.py` | `sinkhorn_iters` | `50` | `100` | Under-converged transport gradient, alignment signal yếu |
+| 🟡 MEDIUM | `train.py` | `lambda_ot` | `0.1` | Scale-check | OT contribution quá nhỏ so với L_qa, không có tác dụng align |
 
 ---
 
-## FIX 2 — RISK: `layer_weights` gradient never clipped
+## Item 1 — `sinkhorn_epsilon`: 0.05 → 0.1
 
-**File:** `train.py`  
-**Functions:** `run_overfit_full()` AND `run_training()`  
-**Root cause:** Gradient clipping covers `backbone_params` and `head_params` but skips `layer_w_params`. During spikes (e.g. step 380: `gn_bb=15.2`), `layer_weights` can receive large uncontrolled gradients.
+**File:** `losses.py`
+**Function:** `OTAlignmentLoss.__init__()` và `DEFAULT_CONFIG` trong `train.py`
 
-### In `run_overfit_full()` — find:
+**Problem snippet:**
 ```python
-gn_bb = torch.nn.utils.clip_grad_norm_(backbone_params, max_norm=0.15).item()
-gn_head = torch.nn.utils.clip_grad_norm_(head_params, max_norm=1.5).item()
+# losses.py - OTAlignmentLoss.__init__
+sinkhorn_epsilon: float = 0.05,  # entropic regularization
+
+# train.py - DEFAULT_CONFIG
+"sinkhorn_epsilon"  : 0.05,
 ```
 
-### Replace with:
+**Lý do:**
+Bài báo ACL ablate ε ∈ {0.05, 0.1, 0.2} trên cùng task extractive QA (XSQuAD):
+- ε=0.05 → plan quá **sharp**, cưỡng bức one-to-one token alignment → XSQuAD F1 sập từ 67.6 xuống 63.1, Arabic riêng giảm ~14 F1
+- ε=0.1 → balance tốt nhất giữa alignment signal và generative capacity
+- Span extraction cần plan **mềm**: một EN span (nhiều token) phải phân phối mass sang nhiều VI token, không bị ép về một điểm
+
+**Fix snippet:**
 ```python
-gn_bb   = torch.nn.utils.clip_grad_norm_(backbone_params, max_norm=0.15).item()
-gn_lw   = torch.nn.utils.clip_grad_norm_(layer_w_params,  max_norm=1.0).item()
-gn_head = torch.nn.utils.clip_grad_norm_(head_params,     max_norm=1.5).item()
+# losses.py - OTAlignmentLoss.__init__
+sinkhorn_epsilon: float = 0.1,   # ← đổi từ 0.05
+
+# train.py - DEFAULT_CONFIG
+"sinkhorn_epsilon"  : 0.1,       # ← đổi từ 0.05
 ```
 
-### In `run_training()` — find:
-```python
-torch.nn.utils.clip_grad_norm_(backbone_params, config["max_grad_norm"] * 0.15)
-torch.nn.utils.clip_grad_norm_(head_params,     config["max_grad_norm"] * 1.5)
-```
-
-### Replace with:
-```python
-torch.nn.utils.clip_grad_norm_(backbone_params, config["max_grad_norm"] * 0.15)
-torch.nn.utils.clip_grad_norm_(layer_w_params,  config["max_grad_norm"] * 1.0)
-torch.nn.utils.clip_grad_norm_(head_params,     config["max_grad_norm"] * 1.5)
-```
+**No-touch zones:** Logic Sinkhorn solver, PAD masking, marginal computation — không đổi gì ngoài giá trị default.
 
 ---
 
-## FIX 3 — MINOR: `global_step` off-by-one in `run_training`
+## Item 2 — `sinkhorn_iters`: 50 → 100
 
-**File:** `train.py`  
-**Function:** `run_training()`  
-**Root cause:** `global_step` is incremented *after* `optimizer.step()`, so curriculum uses `current_step = global_step + 1` as a workaround. This makes the code harder to reason about and is easy to break if curriculum logic is touched later.
+**File:** `losses.py` + `train.py`
+**Function:** `OTAlignmentLoss.__init__()` và `DEFAULT_CONFIG`
 
-### Find this block (inside `if (step + 1) % config["grad_accum_steps"] == 0:`):
+**Problem snippet:**
 ```python
-optimizer.step()
-if scheduler is not None:
-    scheduler.step()
-optimizer.zero_grad()
-global_step += 1
+# losses.py
+sinkhorn_iters: int = 50,
+
+# train.py
+"sinkhorn_iters"    : 50,
 ```
 
-### Replace with:
+**Lý do:**
+Bài báo cho thấy K=50 là "under-converged" → gradient từ transport plan nhiễu, làm yếu alignment pressure. K=100 là điểm tối ưu efficiency–quality.
+
+**Lưu ý cho agent:** Với dynamic truncation (T_en × T_vi << 512²), wall-clock tăng khi đổi K=50→100 sẽ **nhỏ hơn nhiều** so với bài báo (họ tăng từ 23.98h → 34.01h trên full 512 tokens). Agent nên đo thực tế time/batch trước khi quyết định.
+
+**Fix snippet:**
 ```python
-optimizer.step()
-if scheduler is not None:
-    scheduler.step()
-optimizer.zero_grad()
-global_step += 1  # increment first
+# losses.py
+sinkhorn_iters: int = 100,       # ← đổi từ 50
+
+# train.py
+"sinkhorn_iters"    : 100,       # ← đổi từ 50
 ```
 
-### Then find ALL occurrences of `current_step = global_step + 1` in `run_training` and the curriculum block that uses it:
-```python
-current_step = global_step + 1
-
-if current_step <= _OT_DELAY:
-    _criterion.lambda_ot = 0.0
-elif current_step <= _OT_DELAY + _OT_WARMUP:
-    _criterion.lambda_ot = config["lambda_ot"] * (current_step - _OT_DELAY) / _OT_WARMUP
-else:
-    _criterion.lambda_ot = config["lambda_ot"]
-
-if current_step <= _SPAN_DELAY:
-    _criterion.lambda_span = 0.0
-elif current_step <= _SPAN_DELAY + _SPAN_WARMUP:
-    _criterion.lambda_span = config["lambda_span"] * (current_step - _SPAN_DELAY) / _SPAN_WARMUP
-else:
-    _criterion.lambda_span = config["lambda_span"]
-
-if current_step <= _CONS_DELAY:
-    _criterion.lambda_cons = 0.0
-elif current_step <= _CONS_DELAY + _CONS_WARMUP:
-    _criterion.lambda_cons = _CONS_MAX * (current_step - _CONS_DELAY) / _CONS_WARMUP
-else:
-    _criterion.lambda_cons = _CONS_MAX
-```
-
-### Replace with (remove `current_step`, use `global_step` directly):
-```python
-if global_step <= _OT_DELAY:
-    _criterion.lambda_ot = 0.0
-elif global_step <= _OT_DELAY + _OT_WARMUP:
-    _criterion.lambda_ot = config["lambda_ot"] * (global_step - _OT_DELAY) / _OT_WARMUP
-else:
-    _criterion.lambda_ot = config["lambda_ot"]
-
-if global_step <= _SPAN_DELAY:
-    _criterion.lambda_span = 0.0
-elif global_step <= _SPAN_DELAY + _SPAN_WARMUP:
-    _criterion.lambda_span = config["lambda_span"] * (global_step - _SPAN_DELAY) / _SPAN_WARMUP
-else:
-    _criterion.lambda_span = config["lambda_span"]
-
-if global_step <= _CONS_DELAY:
-    _criterion.lambda_cons = 0.0
-elif global_step <= _CONS_DELAY + _CONS_WARMUP:
-    _criterion.lambda_cons = _CONS_MAX * (global_step - _CONS_DELAY) / _CONS_WARMUP
-else:
-    _criterion.lambda_cons = _CONS_MAX
-```
-
-> **Note:** The curriculum block must be moved to run **after** `global_step += 1` (i.e. inside the `if (step + 1) % grad_accum_steps == 0:` block, after the increment). Currently it runs before — that's the source of the offset.
+**No-touch zones:** Vòng lặp Sinkhorn, log-domain stabilization — không đổi.
 
 ---
 
-## No-touch zones
+## Item 3 — Scale-check `lambda_ot`
 
-- All optimizer param groups and their `lr` values — intentional design
-- Curriculum delay values (`_OT_DELAY`, `_SPAN_DELAY`, `_CONS_DELAY`) — do not change
-- `lambda_ot`, `lambda_span`, `lambda_cons` default values in `DEFAULT_CONFIG` — do not change
-- All DDP / distributed logic — do not touch
-- `run_overfit()` (frozen backbone mode) — unaffected by these fixes, do not modify
+**File:** `train.py`
+**Function:** `DEFAULT_CONFIG`, `run_training()`
 
----
+**Problem snippet:**
+```python
+"lambda_ot"         : 0.1,
+```
+
+**Lý do:**
+Bài báo dùng nguyên tắc: `λ_OT * L_OT` nên đóng góp ~20–40% của `L_qa` để có tác dụng thực sự. Với `lambda_ot=0.1`, nếu L_ot ~0.3 thì contribution chỉ ~0.03, trong khi L_qa ~2–3 ở epoch đầu → OT gần như không có gradient ảnh hưởng.
+
+**Không phải fix cứng** — agent cần quan sát TensorBoard:
+- Check `Loss/OT (Transport)` vs `Loss/QA` ở bước đầu training
+- Nếu `lambda_ot * L_ot < 5% của L_qa` → tăng `lambda_ot` lên 0.3–0.5
+- Nếu đã ~20–40% → giữ nguyên
+
+**Fix snippet (conditional):**
+```python
+# Chỉ apply nếu quan sát thấy OT contribution < 5% L_qa
+"lambda_ot"         : 0.3,   # ← tăng từ 0.1, nếu cần
+```
+
+**No-touch zones:** Curriculum warmup schedule cho lambda_ot trong `run_training()` — logic annealing không đổi, chỉ đổi target value.

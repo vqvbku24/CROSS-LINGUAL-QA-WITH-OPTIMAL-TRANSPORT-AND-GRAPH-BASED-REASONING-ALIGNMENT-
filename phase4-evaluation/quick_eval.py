@@ -46,7 +46,7 @@ def quick_em(model, criterion, tokenizer, dev_file, n_samples=200, device="cuda"
             q_end_val = q_end.item()
 
             # Get hidden states from backbone (no GAT, no subsampling)
-            hidden = model.backbone(input_ids, attn_mask)  # (1, L, H)
+            hidden = model.backbone(input_ids, attn_mask).last_hidden_state  # (1, L, H)
 
             # Extract question embeddings for cross-attention
             q_emb = hidden[:, :q_end_val + 1, :]     # (1, L_q, H)

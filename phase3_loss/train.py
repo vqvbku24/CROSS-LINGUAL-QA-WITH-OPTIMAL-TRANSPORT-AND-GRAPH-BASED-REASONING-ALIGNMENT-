@@ -102,8 +102,8 @@ DEFAULT_CONFIG = {
     "model_name"        : "xlm-roberta-base",
 
     # OT hyperparameters
-    "sinkhorn_epsilon"  : 0.05,
-    "sinkhorn_iters"    : 50,
+    "sinkhorn_epsilon"  : 0.1,   # ← changed from 0.05 (ACL ablation: ε=0.1 best for soft span alignment)
+    "sinkhorn_iters"    : 100,  # ← changed from 50  (K=50 under-converged, noisy gradients)
 
     # Loss weights
     "lambda_ot"         : 0.1,
