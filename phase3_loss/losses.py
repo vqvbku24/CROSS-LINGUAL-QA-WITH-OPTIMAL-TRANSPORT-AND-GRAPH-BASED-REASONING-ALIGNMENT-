@@ -452,7 +452,7 @@ class OTAlignmentLoss(nn.Module):
         sinkhorn_epsilon: float = 0.1,   # entropic regularization  ← changed from 0.05 (ACL ablation: ε=0.1 best for soft span alignment)
         sinkhorn_iters: int = 100,       # Sinkhorn iterations       ← changed from 50  (K=50 under-converged, noisy gradients)
         span_confidence_threshold: float = 0.0,
-        span_soft: bool = False,
+        span_soft: bool = True,
     ):
         """
         Args:

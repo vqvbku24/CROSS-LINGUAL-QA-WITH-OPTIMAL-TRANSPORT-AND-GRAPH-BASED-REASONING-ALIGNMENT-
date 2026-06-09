@@ -110,6 +110,7 @@ DEFAULT_CONFIG = {
     "lambda_span"       : 0.3,
     "lambda_cons"       : 0.15,
     "cons_temp"         : 2.0,
+    "span_soft"         : True,
 
     # Training hyperparameters
     "batch_size"        : 4,
@@ -213,6 +214,7 @@ def setup_model_and_criterion(config: dict, device: torch.device):
         consistency_temperature = config["cons_temp"],
         sinkhorn_epsilon    = config["sinkhorn_epsilon"],
         sinkhorn_iters      = config["sinkhorn_iters"],
+        span_soft           = config.get("span_soft", True),
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -527,8 +529,8 @@ def run_training(config: dict, device: torch.device):
     # Curriculum delays (scaled by dataset size)
     _SPE = steps_per_epoch
     _OT_DELAY,   _OT_WARMUP   = _SPE // 2,  _SPE
-    _SPAN_DELAY, _SPAN_WARMUP = _SPE,        _SPE
-    _CONS_DELAY, _CONS_WARMUP = _SPE * 2,    _SPE // 2
+    _SPAN_DELAY, _SPAN_WARMUP = _SPE * 4,   _SPE * 2
+    _CONS_DELAY, _CONS_WARMUP = _SPE * 4,   _SPE * 2
     _CONS_MAX = config["lambda_cons"]
     if is_main_process():
         log.info(
@@ -804,6 +806,8 @@ def main():
                         help="Weight for Consistency loss. Set=0 to disable.")
     parser.add_argument("--cons_temp",   type=float, default=DEFAULT_CONFIG["cons_temp"],
                         help="Temperature for consistency KL divergence.")
+    parser.add_argument("--span_soft",   type=str, default="True", choices=["True", "False"],
+                        help="Use soft span targets instead of hard argmax.")
 
     args = parser.parse_args()
 
@@ -824,6 +828,7 @@ def main():
         "lambda_span"       : args.lambda_span,
         "lambda_cons"       : args.lambda_cons,
         "cons_temp"         : args.cons_temp,
+        "span_soft"         : args.span_soft == "True",
     })
 
     # Log ablation config
