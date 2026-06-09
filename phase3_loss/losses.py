@@ -252,7 +252,7 @@ def span_projection_loss(
     gamma: torch.Tensor,            # (B_ans, L, L) — transport plan
     en_start: torch.Tensor,         # (B_ans,) — EN answer start position (token index)
     en_end: torch.Tensor,           # (B_ans,) — EN answer end position
-    confidence_threshold: float = 0.05,
+    confidence_threshold: float = 0.0,
     soft: bool = False,
 ) -> torch.Tensor:
     """
@@ -451,7 +451,7 @@ class OTAlignmentLoss(nn.Module):
         consistency_temperature: float = 2.0,
         sinkhorn_epsilon: float = 0.1,   # entropic regularization  ← changed from 0.05 (ACL ablation: ε=0.1 best for soft span alignment)
         sinkhorn_iters: int = 100,       # Sinkhorn iterations       ← changed from 50  (K=50 under-converged, noisy gradients)
-        span_confidence_threshold: float = 0.05,
+        span_confidence_threshold: float = 0.0,
         span_soft: bool = False,
     ):
         """
