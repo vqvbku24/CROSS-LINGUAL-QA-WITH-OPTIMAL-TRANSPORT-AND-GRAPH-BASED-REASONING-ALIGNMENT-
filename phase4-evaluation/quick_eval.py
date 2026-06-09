@@ -46,14 +46,27 @@ def quick_em(model, criterion, tokenizer, dev_file, n_samples=200, device="cuda"
             q_end_val = q_end.item()
 
             # Get hidden states from backbone (no GAT, no subsampling)
-            hidden = model.backbone(input_ids, attn_mask).last_hidden_state  # (1, L, H)
+            out = model.backbone(input_ids, attn_mask)
+            target_layers = [6, 7, 8, 9]
+            stacked = torch.stack([out.hidden_states[i] for i in target_layers], dim=0)  # (4, 1, L, H)
+            weights = torch.softmax(model.layer_weights, dim=0).view(4, 1, 1, 1)
+            hidden = (stacked * weights).sum(dim=0)   # (1, L, H)
 
             # Extract question embeddings for cross-attention
             q_emb = hidden[:, :q_end_val + 1, :]     # (1, L_q, H)
             q_mask = torch.zeros(1, q_end_val + 1, dtype=torch.bool, device=device)
 
             # QA head: context=full sequence, question=q tokens
-            _, _, has_ans_logit = criterion.qa_head(hidden, q_emb, q_mask)
+            start_logits, end_logits, has_ans_logit = criterion.qa_head(hidden, q_emb, q_mask)
+            
+            # Mask end positions: only allow [start_idx, start_idx + MAX_ANSWER_LEN]
+            MAX_ANSWER_LEN = 30
+            start_idx = start_logits[0].argmax().item()
+            end_logits_masked = end_logits[0].clone()
+            end_logits_masked[:start_idx] = float('-inf')
+            end_logits_masked[start_idx + MAX_ANSWER_LEN:] = float('-inf')
+            end_idx = end_logits_masked.argmax().item()
+
             pred_answerable = has_ans_logit.item() > 0
 
             if pred_answerable == is_answerable:

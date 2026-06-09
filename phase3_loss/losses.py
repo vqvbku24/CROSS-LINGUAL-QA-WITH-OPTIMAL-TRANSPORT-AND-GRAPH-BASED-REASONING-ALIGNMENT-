@@ -252,29 +252,26 @@ def span_projection_loss(
     gamma: torch.Tensor,            # (B_ans, L, L) — transport plan
     en_start: torch.Tensor,         # (B_ans,) — EN answer start position (token index)
     en_end: torch.Tensor,           # (B_ans,) — EN answer end position
+    confidence_threshold: float = 0.05,
+    soft: bool = False,
 ) -> torch.Tensor:
     """
     Span Projection Loss — project EN answer span to VI via transport plan γ.
-
-    For each sample b:
-        hat_s_vi = argmax_j gamma[b, en_start[b], j]   — where does START transport to?
-        hat_e_vi = argmax_j gamma[b, en_end[b], j]     — where does END transport to?
-
-    Constraint: hat_e_vi >= hat_s_vi.
-        If violated, mask positions before hat_s_vi to -inf before argmax on END row.
-
-    Loss = CE(vi_start_logits, hat_s_vi) + CE(vi_end_logits, hat_e_vi)
-
-    Args:
-        vi_start_logits : (B_ans, L)
-        vi_end_logits   : (B_ans, L)
-        gamma           : (B_ans, L, L)
-        en_start        : (B_ans,) token-space start indices
-        en_end          : (B_ans,) token-space end indices
-
-    Returns:
-        scalar loss
+    Supports confidence thresholding (Fix 1) and soft targets (Fix 5).
     """
+    if soft:
+        with torch.no_grad():
+            B_ans = gamma.size(0)
+            batch_idx = torch.arange(B_ans, device=gamma.device)
+            start_target = gamma[batch_idx, en_start, :]   # (B_ans, T_vi)
+            end_target   = gamma[batch_idx, en_end, :]     # (B_ans, T_vi)
+            start_target = start_target / start_target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            end_target   = end_target   / end_target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        loss_start = -(start_target * F.log_softmax(vi_start_logits, dim=-1)).sum(dim=-1).mean()
+        loss_end   = -(end_target   * F.log_softmax(vi_end_logits,   dim=-1)).sum(dim=-1).mean()
+        return (loss_start + loss_end) / 2.0
+
     with torch.no_grad():
         B_ans = gamma.size(0)
         L = gamma.size(2)
@@ -297,9 +294,17 @@ def span_projection_loss(
         end_mass_masked = end_mass.masked_fill(before_start_mask, float('-inf'))
         hat_e_vi = end_mass_masked.argmax(dim=1)         # (B_ans,)
 
-    # Cross-entropy losses using pseudo-labels
-    loss_start = F.cross_entropy(vi_start_logits, hat_s_vi)
-    loss_end   = F.cross_entropy(vi_end_logits,   hat_e_vi)
+        # confidence gate (Fix 1)
+        start_confidence = start_mass[batch_idx, hat_s_vi]   # (B_ans,)
+        end_confidence   = end_mass[batch_idx, hat_e_vi]     # (B_ans,)
+        confident_mask   = (start_confidence > confidence_threshold) & \
+                           (end_confidence > confidence_threshold)
+
+    if not confident_mask.any():
+        return torch.tensor(0.0, device=vi_start_logits.device, requires_grad=False)
+
+    loss_start = F.cross_entropy(vi_start_logits[confident_mask], hat_s_vi[confident_mask])
+    loss_end   = F.cross_entropy(vi_end_logits[confident_mask],   hat_e_vi[confident_mask])
 
     return (loss_start + loss_end) / 2.0
 
@@ -315,6 +320,7 @@ def consistency_loss(
     vi_end_logits: torch.Tensor,     # (B, L)
     gamma: torch.Tensor,             # (B, L_en, L_vi) transport plan
     temperature: float = 2.0,
+    vi_pad_mask: torch.Tensor | None = None,   # (B, T_vi) True = PAD
 ) -> torch.Tensor:
     """
     Transport-Guided Consistency Loss.
@@ -332,6 +338,7 @@ def consistency_loss(
         vi_end_logits   : (B, L) VI end logits
         gamma           : (B, L_en, L_vi) transport plan from Sinkhorn
         temperature     : softmax temperature (>1 smooths distribution)
+        vi_pad_mask     : (B, L_vi) boolean — True for PAD tokens in VI
 
     Returns:
         scalar loss
@@ -351,11 +358,24 @@ def consistency_loss(
     vi_target_start = torch.bmm(gamma_T, en_start_prob.unsqueeze(-1)).squeeze(-1)  # (B, L_vi)
     vi_target_end   = torch.bmm(gamma_T, en_end_prob.unsqueeze(-1)).squeeze(-1)    # (B, L_vi)
 
-    # Clamp + renormalize to ensure valid probability distribution
-    vi_target_start = vi_target_start.clamp(min=1e-8)
-    vi_target_end   = vi_target_end.clamp(min=1e-8)
-    vi_target_start = vi_target_start / vi_target_start.sum(dim=-1, keepdim=True)
-    vi_target_end   = vi_target_end   / vi_target_end.sum(dim=-1, keepdim=True)
+    if vi_pad_mask is not None:
+        # Zero out PAD positions in soft targets
+        vi_target_start = vi_target_start.masked_fill(vi_pad_mask, 0.0)
+        vi_target_end   = vi_target_end.masked_fill(vi_pad_mask, 0.0)
+
+        # Re-normalize so targets sum to 1 over valid positions
+        vi_target_start = vi_target_start / vi_target_start.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        vi_target_end   = vi_target_end   / vi_target_end.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        # Mask logits so softmax assigns ~0 to PAD positions
+        vi_start_logits = vi_start_logits.masked_fill(vi_pad_mask, -1e9)
+        vi_end_logits   = vi_end_logits.masked_fill(vi_pad_mask, -1e9)
+    else:
+        # Clamp + renormalize to ensure valid probability distribution
+        vi_target_start = vi_target_start.clamp(min=1e-8)
+        vi_target_end   = vi_target_end.clamp(min=1e-8)
+        vi_target_start = vi_target_start / vi_target_start.sum(dim=-1, keepdim=True)
+        vi_target_end   = vi_target_end   / vi_target_end.sum(dim=-1, keepdim=True)
 
     # ── 3. KL(VI_softmax || P_target) ──────────────────────────
     vi_start_log = F.log_softmax(vi_start_logits / T, dim=-1)
@@ -431,6 +451,8 @@ class OTAlignmentLoss(nn.Module):
         consistency_temperature: float = 2.0,
         sinkhorn_epsilon: float = 0.1,   # entropic regularization  ← changed from 0.05 (ACL ablation: ε=0.1 best for soft span alignment)
         sinkhorn_iters: int = 100,       # Sinkhorn iterations       ← changed from 50  (K=50 under-converged, noisy gradients)
+        span_confidence_threshold: float = 0.05,
+        span_soft: bool = False,
     ):
         """
         Args:
@@ -441,6 +463,8 @@ class OTAlignmentLoss(nn.Module):
             consistency_temperature : temperature T for KL div
             sinkhorn_epsilon : entropic regularization for Sinkhorn
             sinkhorn_iters   : number of Sinkhorn iterations
+            span_confidence_threshold : threshold for gating pseudo-labels
+            span_soft        : whether to use soft span projection
         """
         super().__init__()
         self.lambda_ot          = lambda_ot
@@ -449,6 +473,8 @@ class OTAlignmentLoss(nn.Module):
         self.temperature        = consistency_temperature
         self.sinkhorn_epsilon   = sinkhorn_epsilon
         self.sinkhorn_iters     = sinkhorn_iters
+        self.span_confidence_threshold = span_confidence_threshold
+        self.span_soft          = span_soft
 
         # QA Head: shared for EN and VI, operates on full 512-token sequences
         self.qa_head = QAHead(hidden_size=hidden_size)
@@ -589,6 +615,8 @@ class OTAlignmentLoss(nn.Module):
                 gamma[answerable_mask],
                 en_start[answerable_mask],
                 en_end[answerable_mask],
+                confidence_threshold=self.span_confidence_threshold,
+                soft=self.span_soft,
             )
         else:
             l_span = torch.tensor(0.0, device=device)
@@ -604,6 +632,7 @@ class OTAlignmentLoss(nn.Module):
                 vi_end_logits[answerable_mask],
                 gamma=gamma[answerable_mask],
                 temperature=self.temperature,
+                vi_pad_mask=vi_pad_mask[answerable_mask],
             )
         else:
             l_cons = torch.tensor(0.0, device=device)

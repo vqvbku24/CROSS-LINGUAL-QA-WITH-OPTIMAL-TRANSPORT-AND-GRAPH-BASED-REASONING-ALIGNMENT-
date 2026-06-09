@@ -669,6 +669,16 @@ def run_training(config: dict, device: torch.device):
                 log.info(f"  span_loss  : {avg_losses.get('span_proj', 0):.4f} (Pseudo-label)")
                 log.info(f"  cons_loss  : {avg_losses.get('cons', 0):.4f} (Consistency)")
                 log.info(f"  Current λ  : OT={_criterion.lambda_ot:.3f}, Span={_criterion.lambda_span:.3f}, Cons={_criterion.lambda_cons:.3f}")
+                with torch.no_grad():
+                    lw = torch.softmax(_model.layer_weights, dim=0)
+                    log.info(
+                        f"  Layer weights: "
+                        f"L6={lw[0].item():.4f} L7={lw[1].item():.4f} "
+                        f"L8={lw[2].item():.4f} L9={lw[3].item():.4f}"
+                    )
+                    if writer is not None:
+                        for i, name in enumerate(["L6", "L7", "L8", "L9"]):
+                            writer.add_scalar(f"LayerWeights/{name}", lw[i].item(), epoch)
                 log.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             avg_loss = avg_losses.get('total', 0)
         else:
