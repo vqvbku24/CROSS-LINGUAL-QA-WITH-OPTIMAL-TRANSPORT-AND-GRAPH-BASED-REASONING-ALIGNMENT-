@@ -252,61 +252,76 @@ def span_projection_loss(
     gamma: torch.Tensor,            # (B_ans, L, L) — transport plan
     en_start: torch.Tensor,         # (B_ans,) — EN answer start position (token index)
     en_end: torch.Tensor,           # (B_ans,) — EN answer end position
-    confidence_threshold: float = 0.0,
-    soft: bool = False,
-) -> torch.Tensor:
+    global_step: int,
+    spe: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Span Projection Loss — project EN answer span to VI via transport plan γ.
-    Supports confidence thresholding (Fix 1) and soft targets (Fix 5).
+    Curriculum Span Loss:
+      Phase 1 (step <= 4*spe): Soft supervision — dùng hàng gamma làm soft target.
+      Phase 2 (step >  4*spe): Hard pseudo-label với confidence threshold = 0.25.
+    Returns: (loss, mean_start_mass, mean_end_mass, valid_ratio)
     """
-    if soft:
+    B_ans = gamma.size(0)
+    L_vi  = gamma.size(2)
+    device = gamma.device
+    batch_idx = torch.arange(B_ans, device=device)
+
+    is_hard_phase = global_step > (4 * spe)
+
+    # Initialize metrics
+    mean_start_mass = torch.tensor(0.0, device=device)
+    mean_end_mass   = torch.tensor(0.0, device=device)
+    valid_ratio     = torch.tensor(0.0, device=device)
+
+    if not is_hard_phase:
+        # ---- PHASE 1: SOFT SUPERVISION (Warm-up) ----
         with torch.no_grad():
-            B_ans = gamma.size(0)
-            batch_idx = torch.arange(B_ans, device=gamma.device)
-            start_target = gamma[batch_idx, en_start, :]   # (B_ans, T_vi)
-            end_target   = gamma[batch_idx, en_end, :]     # (B_ans, T_vi)
+            start_target = gamma[batch_idx, en_start, :]   # (B_ans, L_vi)
+            end_target   = gamma[batch_idx, en_end,   :]   # (B_ans, L_vi)
+            
+            # Re-normalize for numerical stability
             start_target = start_target / start_target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
             end_target   = end_target   / end_target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
         loss_start = -(start_target * F.log_softmax(vi_start_logits, dim=-1)).sum(dim=-1).mean()
         loss_end   = -(end_target   * F.log_softmax(vi_end_logits,   dim=-1)).sum(dim=-1).mean()
-        return (loss_start + loss_end) / 2.0
+        return (loss_start + loss_end) / 2.0, mean_start_mass, mean_end_mass, valid_ratio
 
-    with torch.no_grad():
-        B_ans = gamma.size(0)
-        L = gamma.size(2)
-        device = gamma.device
-        batch_idx = torch.arange(B_ans, device=device)
+    else:
+        # ---- PHASE 2: HARD PSEUDO-LABELING + THRESHOLD ----
+        with torch.no_grad():
+            start_mass_dist = gamma[batch_idx, en_start, :]
+            max_start_mass, hat_s_vi = start_mass_dist.max(dim=1)
 
-        # ── hat_s_vi: argmax over gamma row at EN start position ──
-        # gamma[b, en_start[b], :] = transport mass from EN START to all VI tokens
-        start_mass = gamma[batch_idx, en_start, :]      # (B_ans, L)
-        hat_s_vi = start_mass.argmax(dim=1)              # (B_ans,)
+            end_mass_dist = gamma[batch_idx, en_end, :]
+            position_idx  = torch.arange(L_vi, device=device).unsqueeze(0)
+            before_start_mask = position_idx < hat_s_vi.unsqueeze(1)
+            end_mass_dist_masked = end_mass_dist.masked_fill(before_start_mask, float('-inf'))
 
-        # ── hat_e_vi: argmax over gamma row at EN end position ────
-        # With constraint: hat_e_vi >= hat_s_vi
-        end_mass = gamma[batch_idx, en_end, :]           # (B_ans, L)
+            # GUARD (FIX-03): xử lý trường hợp toàn bộ là -inf
+            all_inf_mask = (end_mass_dist_masked == float('-inf')).all(dim=1)
+            if all_inf_mask.any():
+                end_mass_dist_masked[all_inf_mask, hat_s_vi[all_inf_mask]] = 0.0
 
-        # Mask positions before hat_s_vi to -inf before argmax
-        # This ensures hat_e_vi >= hat_s_vi
-        position_idx = torch.arange(L, device=device).unsqueeze(0)  # (1, L)
-        before_start_mask = position_idx < hat_s_vi.unsqueeze(1)    # (B_ans, L)
-        end_mass_masked = end_mass.masked_fill(before_start_mask, float('-inf'))
-        hat_e_vi = end_mass_masked.argmax(dim=1)         # (B_ans,)
+            max_end_mass, hat_e_vi = end_mass_dist_masked.max(dim=1)
 
-        # confidence gate (Fix 1)
-        start_confidence = start_mass[batch_idx, hat_s_vi]   # (B_ans,)
-        end_confidence   = end_mass[batch_idx, hat_e_vi]     # (B_ans,)
-        confident_mask   = (start_confidence > confidence_threshold) & \
-                           (end_confidence > confidence_threshold)
+            confidence_threshold = 0.25
+            valid_pseudo_mask = (
+                (max_start_mass > confidence_threshold) &
+                (max_end_mass   > confidence_threshold)
+            )
 
-    if not confident_mask.any():
-        return torch.tensor(0.0, device=vi_start_logits.device, requires_grad=False)
-
-    loss_start = F.cross_entropy(vi_start_logits[confident_mask], hat_s_vi[confident_mask])
-    loss_end   = F.cross_entropy(vi_end_logits[confident_mask],   hat_e_vi[confident_mask])
-
-    return (loss_start + loss_end) / 2.0
+        if valid_pseudo_mask.any():
+            mean_start_mass = max_start_mass[valid_pseudo_mask].mean()
+            mean_end_mass   = max_end_mass[valid_pseudo_mask].mean()
+            valid_ratio     = valid_pseudo_mask.float().mean()
+            
+            loss_start = F.cross_entropy(vi_start_logits[valid_pseudo_mask], hat_s_vi[valid_pseudo_mask])
+            loss_end   = F.cross_entropy(vi_end_logits[valid_pseudo_mask],   hat_e_vi[valid_pseudo_mask])
+            loss = (loss_start + loss_end) / 2.0
+            return loss, mean_start_mass, mean_end_mass, valid_ratio
+        else:
+            return torch.tensor(0.0, device=device, requires_grad=True), mean_start_mass, mean_end_mass, valid_ratio
 
 
 # ══════════════════════════════════════════════════════════════
@@ -483,6 +498,8 @@ class OTAlignmentLoss(nn.Module):
         self,
         model_outputs: dict,
         batch: dict,
+        global_step: int = 0,
+        spe: int = 1,
     ) -> dict[str, torch.Tensor]:
         """
         Args:
@@ -556,7 +573,7 @@ class OTAlignmentLoss(nn.Module):
         en_start_logits, en_end_logits, en_has_ans = self.qa_head(
             en_hidden, en_q_emb, en_q_mask
         )
-        vi_start_logits, vi_end_logits, _ = self.qa_head(
+        vi_start_logits, vi_end_logits, vi_has_ans = self.qa_head(
             vi_hidden, vi_q_emb, vi_q_mask
         )
 
@@ -578,24 +595,24 @@ class OTAlignmentLoss(nn.Module):
             l_qa_end   = torch.tensor(0.0, device=device)
 
         # ══════════════════════════════════════════════════════
-        # 5. L_has_answer (BCE) — EN branch only
+        # 5. L_has_answer (BCE) — Asymmetric weighting (FIX-04)
         # ══════════════════════════════════════════════════════
         has_answer_label = batch["en_is_answerable"].float().to(device)
 
-        # pos_weight=2.0 → unanswerable (label=0, i.e. negative class) is
-        # upweighted 2× relative to answerable samples.
-        # NOTE: in BCEWithLogitsLoss, pos_weight scales the POSITIVE class
-        # (label=1, i.e. answerable). Setting pos_weight < 1 would down-weight
-        # answerable; we want the opposite, so use pos_weight=2.0 to upweight
-        # the answerable class which forces the model to be penalised more when
-        # it misses an answerable sample — effectively keeping the gradient
-        # balanced on both classes at ~50/50 SQuAD 2.0 ratio.
-        # Tune this value based on observed batch class ratio (Hypothesis A).
-        l_has_ans = F.binary_cross_entropy_with_logits(
+        loss_has_en = F.binary_cross_entropy_with_logits(
             en_has_ans,
             has_answer_label,
             pos_weight=torch.tensor(2.0, device=device),
         )
+
+        loss_has_vi = F.binary_cross_entropy_with_logits(
+            vi_has_ans,
+            has_answer_label,
+            pos_weight=torch.tensor(2.0, device=device),
+        )
+
+        # Asymmetric aggregation — bảo vệ EN anchor
+        l_has_ans = (0.7 * loss_has_en) + (0.3 * loss_has_vi)
 
         # ══════════════════════════════════════════════════════
         # 6. L_ot — transport cost regularizer
@@ -609,17 +626,20 @@ class OTAlignmentLoss(nn.Module):
         # Computed for ALL answerable EN samples (regardless of VI prediction).
         # Pseudo-labels come from γ mapping EN answer span → VI positions.
         if answerable_mask.any():
-            l_span = span_projection_loss(
+            l_span, mean_s_mass, mean_e_mass, valid_ratio = span_projection_loss(
                 vi_start_logits[answerable_mask],
                 vi_end_logits[answerable_mask],
                 gamma[answerable_mask],
                 en_start[answerable_mask],
                 en_end[answerable_mask],
-                confidence_threshold=self.span_confidence_threshold,
-                soft=self.span_soft,
+                global_step=global_step,
+                spe=spe,
             )
         else:
             l_span = torch.tensor(0.0, device=device)
+            mean_s_mass = torch.tensor(0.0, device=device)
+            mean_e_mass = torch.tensor(0.0, device=device)
+            valid_ratio = torch.tensor(0.0, device=device)
 
         # ══════════════════════════════════════════════════════
         # 8. L_consistency — transport-guided KL divergence
@@ -652,13 +672,20 @@ class OTAlignmentLoss(nn.Module):
         )
 
         # ══════════════════════════════════════════════════════
-        # 10. Debug stats — CLS collapse detection
+        # 10. Debug stats — CLS collapse detection & Entropy (FIX-05, 06)
         # ══════════════════════════════════════════════════════
         with torch.no_grad():
             cls_start = en_start_logits[:, 0].mean()
             max_start = en_start_logits.max(dim=1).values.mean()
             cls_end   = en_end_logits[:, 0].mean()
             max_end   = en_end_logits.max(dim=1).values.mean()
+
+            # Calculate Entropy with numerical stability clamp
+            P_vi_start = F.softmax(vi_start_logits, dim=-1)
+            entropy_start = -(P_vi_start * (P_vi_start + 1e-8).log()).sum(dim=-1).mean()
+
+            P_vi_end = F.softmax(vi_end_logits, dim=-1)
+            entropy_end = -(P_vi_end * (P_vi_end + 1e-8).log()).sum(dim=-1).mean()
 
             if answerable_mask.any():
                 has_ans_acc = (en_has_ans[answerable_mask] > 0).float().mean()
@@ -674,12 +701,17 @@ class OTAlignmentLoss(nn.Module):
             "ot"              : l_ot.detach(),
             "span_proj"       : l_span.detach(),
             "cons"            : l_cons.detach(),
-            # Debug: collapse detector
+            # Debug & tracking
             "dbg/cls_start"   : cls_start,
             "dbg/max_start"   : max_start,
             "dbg/cls_end"     : cls_end,
             "dbg/max_end"     : max_end,
             "dbg/has_ans_acc" : has_ans_acc,
+            "dbg/entropy_start": entropy_start,
+            "dbg/entropy_end"  : entropy_end,
+            "dbg/mean_start_mass": mean_s_mass,
+            "dbg/mean_end_mass"  : mean_e_mass,
+            "dbg/valid_ratio"    : valid_ratio,
         }
 
 

@@ -102,7 +102,7 @@ DEFAULT_CONFIG = {
     "model_name"        : "xlm-roberta-base",
 
     # OT hyperparameters
-    "sinkhorn_epsilon"  : 0.1,   # ← changed from 0.05 (ACL ablation: ε=0.1 best for soft span alignment)
+    "sinkhorn_epsilon"  : 0.05,  # ← reset to 0.05 (for sharper transport plan)
     "sinkhorn_iters"    : 100,  # ← changed from 50  (K=50 under-converged, noisy gradients)
 
     # Loss weights
@@ -269,7 +269,7 @@ def run_overfit(config: dict, device: torch.device):
         opt_qa.zero_grad()
 
         outputs = model(fixed_batch)
-        losses  = criterion(outputs, fixed_batch)
+        losses  = criterion(outputs, fixed_batch, global_step=step, spe=config["overfit_steps"])
 
         losses["total"].backward()
         gn_qa = torch.nn.utils.clip_grad_norm_(qa_params, max_norm=10.0).item()
@@ -400,7 +400,7 @@ def run_overfit_full(config: dict, device: torch.device):
         optimizer.zero_grad()
 
         outputs = model(fixed_batch)
-        losses  = criterion(outputs, fixed_batch)
+        losses  = criterion(outputs, fixed_batch, global_step=step, spe=config["overfit_steps"])
 
         losses["total"].backward()
 
@@ -567,7 +567,7 @@ def run_training(config: dict, device: torch.device):
                 log.error(f"[Epoch {epoch} Step {step}] Forward error: {e}")
                 continue
 
-            losses = criterion(outputs, batch)
+            losses = criterion(outputs, batch, global_step=global_step, spe=_SPE)
 
             loss = losses["total"] / config["grad_accum_steps"]
             loss.backward()
@@ -634,6 +634,15 @@ def run_training(config: dict, device: torch.device):
                         writer.add_scalar("Loss/OT (Transport)",      losses['ot'].item(),       global_step)
                         writer.add_scalar("Loss/Span (Vietnamese)",   losses['span_proj'].item(),global_step)
                         writer.add_scalar("Loss/Consistency",         losses['cons'].item(),     global_step)
+
+                        # New entropy and transport mass metrics
+                        if 'dbg/entropy_start' in losses:
+                            writer.add_scalar("Metrics/VI_StartLogit_Entropy", losses['dbg/entropy_start'], global_step)
+                            writer.add_scalar("Metrics/VI_EndLogit_Entropy",   losses['dbg/entropy_end'],   global_step)
+                        if 'dbg/mean_start_mass' in losses:
+                            writer.add_scalar("Metrics/OT_MeanStartMass",      losses['dbg/mean_start_mass'], global_step)
+                            writer.add_scalar("Metrics/OT_MeanEndMass",        losses['dbg/mean_end_mass'],   global_step)
+                            writer.add_scalar("Metrics/OT_ValidPseudoRatio",   losses['dbg/valid_ratio'],     global_step)
 
                         writer.add_scalar("Lambda/OT",   _criterion.lambda_ot,   global_step)
                         writer.add_scalar("Lambda/Span", _criterion.lambda_span, global_step)
