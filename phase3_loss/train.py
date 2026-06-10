@@ -123,6 +123,12 @@ DEFAULT_CONFIG = {
     "max_grad_norm"     : 1.0,
     "pairing_strategy"  : "topic",
 
+    # Curriculum epoch milestones (3-Stage Rocket)
+    "cons_start_epoch"  : 3,
+    "cons_warmup_epochs": 2,
+    "span_start_epoch"  : 5,
+    "span_warmup_epochs": 2,
+
     # Overfit mode
     "overfit_steps"     : 400,
     "overfit_lr"        : 3e-4,
@@ -529,15 +535,29 @@ def run_training(config: dict, device: torch.device):
     # Curriculum delays (scaled by dataset size)
     _SPE = steps_per_epoch
     _OT_DELAY,   _OT_WARMUP   = _SPE // 2,  _SPE
-    _SPAN_DELAY, _SPAN_WARMUP = _SPE * 4,   _SPE * 2
-    _CONS_DELAY, _CONS_WARMUP = _SPE * 4,   _SPE * 2
+    # Tầng 2: Bật Cons sau Epoch 3
+    _CONS_DELAY  = int(_SPE * config.get("cons_start_epoch", 3))
+    _CONS_WARMUP = int(_SPE * config.get("cons_warmup_epochs", 2))
+
+    # Tầng 3: Bật Span sau Epoch 5
+    _SPAN_DELAY  = int(_SPE * config.get("span_start_epoch", 5))
+    _SPAN_WARMUP = int(_SPE * config.get("span_warmup_epochs", 2))
+
+    if _SPAN_DELAY <= _CONS_DELAY:
+        log.warning(f"span_start_epoch ({config.get('span_start_epoch', 5)}) should be > cons_start_epoch ({config.get('cons_start_epoch', 3)})")
+
     _CONS_MAX = config["lambda_cons"]
     if is_main_process():
         log.info(
-            f"Curriculum delays (steps): "
-            f"OT={_OT_DELAY}→{_OT_DELAY+_OT_WARMUP} | "
-            f"Span={_SPAN_DELAY}→{_SPAN_DELAY+_SPAN_WARMUP} | "
-            f"Cons={_CONS_DELAY}→{_CONS_DELAY+_CONS_WARMUP}"
+            f"3-Stage Curriculum (steps): "
+            f"[Stage1] OT: {_OT_DELAY}→{_OT_DELAY+_OT_WARMUP} | "
+            f"[Stage2] Cons: {_CONS_DELAY}→{_CONS_DELAY+_CONS_WARMUP} | "
+            f"[Stage3] Span: {_SPAN_DELAY}→{_SPAN_DELAY+_SPAN_WARMUP}"
+        )
+        log.info(
+            f"Epoch milestones: "
+            f"Cons starts ep.{config.get('cons_start_epoch', 3)} | "
+            f"Span starts ep.{config.get('span_start_epoch', 5)}"
         )
 
     for epoch in range(start_epoch, config["max_epochs"] + 1):
@@ -818,6 +838,16 @@ def main():
     parser.add_argument("--span_soft",   type=str, default="True", choices=["True", "False"],
                         help="Use soft span targets instead of hard argmax.")
 
+    # Curriculum epoch milestones
+    parser.add_argument("--cons_start_epoch", type=int, default=DEFAULT_CONFIG.get("cons_start_epoch", 3),
+                        help="Epoch at which L_cons starts warming up. Default: 3.")
+    parser.add_argument("--cons_warmup_epochs", type=int, default=DEFAULT_CONFIG.get("cons_warmup_epochs", 2),
+                        help="Number of epochs for L_cons linear warmup. Default: 2.")
+    parser.add_argument("--span_start_epoch", type=int, default=DEFAULT_CONFIG.get("span_start_epoch", 5),
+                        help="Epoch at which L_span starts warming up. Must be > cons_start_epoch. Default: 5.")
+    parser.add_argument("--span_warmup_epochs", type=int, default=DEFAULT_CONFIG.get("span_warmup_epochs", 2),
+                        help="Number of epochs for L_span linear warmup. Default: 2.")
+
     args = parser.parse_args()
 
     config = dict(DEFAULT_CONFIG)
@@ -838,6 +868,10 @@ def main():
         "lambda_cons"       : args.lambda_cons,
         "cons_temp"         : args.cons_temp,
         "span_soft"         : args.span_soft == "True",
+        "cons_start_epoch"  : args.cons_start_epoch,
+        "cons_warmup_epochs": args.cons_warmup_epochs,
+        "span_start_epoch"  : args.span_start_epoch,
+        "span_warmup_epochs": args.span_warmup_epochs,
     })
 
     # Log ablation config

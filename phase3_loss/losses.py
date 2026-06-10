@@ -305,7 +305,7 @@ def span_projection_loss(
 
             max_end_mass, hat_e_vi = end_mass_dist_masked.max(dim=1)
 
-            confidence_threshold = 0.25
+            confidence_threshold = 0.15
             valid_pseudo_mask = (
                 (max_start_mass > confidence_threshold) &
                 (max_end_mass   > confidence_threshold)

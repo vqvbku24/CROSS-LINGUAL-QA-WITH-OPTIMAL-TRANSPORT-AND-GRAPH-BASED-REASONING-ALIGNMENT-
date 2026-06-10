@@ -1,8 +1,10 @@
-# BUGFIX_SPEC.md — Cross-Lingual QA: idea_updated_V2 Implementation
+# CURRICULUM_REORDER_SPEC.md — 3-Stage Rocket Curriculum
 
-> **Dành cho coding agent.** Spec này liệt kê các thay đổi cần thực hiện theo thứ tự ưu tiên.
-> Agent tự quyết định thứ tự implement, chiến lược test, và cách integrate vào codebase hiện tại.
-> Không được chỉnh sửa bất kỳ file nào ngoài danh sách "Allowed Files" bên dưới.
+> **Dành cho coding agent.** Thay đổi thứ tự curriculum từ QA→Span→Cons thành QA→Cons→Span,
+> đồng thời đưa các mốc epoch ra thành CLI arguments để dễ ablation.
+> Agent tự quyết định cách integrate, đặt tên biến, và refactor nếu cần.
+> Không được chỉnh sửa bất kỳ file nào ngoài danh sách Allowed Files.
+> **Scope:** Chỉ `run_training`. Các hàm `run_overfit` và `run_overfit_full` KHÔNG nằm trong scope lần này.
 
 ---
 
@@ -10,245 +12,201 @@
 
 | File | Phạm vi được phép chỉnh sửa |
 |---|---|
-| `losses.py` | Toàn bộ — refactor `span_projection_loss`, cập nhật `forward` loss aggregation, thêm entropy metric |
-| `train.py` | Chỉ phần argument defaults và curriculum phase-gate logic |
+| `train.py` | `DEFAULT_CONFIG`, `ArgumentParser`, `run_training` only |
 
 ## No-Touch Zone
 
 | File | Lý do |
 |---|---|
-| `backbone.py` | Đã ổn định sau các bug fix trước |
-| `model_core.py` | Không liên quan đến thay đổi lần này |
-| `dataset.py` | Không liên quan |
-| `evaluate.py` | Không liên quan |
+| `losses.py` | Không liên quan đến thay đổi lần này |
+| `backbone.py` | Stable |
+| `model_core.py` | Stable |
 
 ---
 
 ## Priority Table
 
-| Priority | ID | File | Mức độ rủi ro | Mô tả ngắn |
-|---|---|---|---|---|
-| 🔴 P1 | `FIX-01` | `train.py` | Thấp | Reset `sinkhorn_epsilon` default về `0.05` |
-| 🔴 P1 | `FIX-02` | `losses.py` | Cao | Implement toàn bộ `span_projection_loss` Soft-to-Hard Curriculum |
-| 🔴 P1 | `FIX-03` | `losses.py` | Trung bình | Guard edge case all-`-inf` trong Phase 2 của `span_projection_loss` |
-| 🟠 P2 | `FIX-04` | `losses.py` | Thấp | Asymmetric weighting `loss_has_ans = 0.7*EN + 0.3*VI` |
-| 🟡 P3 | `FIX-05` | `losses.py` | Thấp | Thêm entropy monitoring với numerical stability clamp |
-| 🟡 P3 | `FIX-06` | `losses.py` | Thấp | Log `mean_max_start_mass` và `mean_max_end_mass` lên TensorBoard |
+| Priority | ID | Mức độ rủi ro | Mô tả ngắn |
+|---|---|---|---|
+| 🔴 P1 | `CUR-01` | Trung bình | Đổi thứ tự delay: Cons trước Span trong `run_training` |
+| 🔴 P1 | `CUR-02` | Thấp | Đưa `cons_start_epoch` và `span_start_epoch` ra CLI args |
+| 🟠 P2 | `CUR-03` | Thấp | Đưa `cons_start_epoch` và `span_start_epoch` vào `DEFAULT_CONFIG` |
+| 🟡 P3 | `CUR-04` | Thấp | Cập nhật log message curriculum để phản ánh thứ tự mới |
 
 ---
 
-## Chi tiết từng Fix
+## Chi tiết từng Change
 
 ---
 
-### FIX-01 — Reset `sinkhorn_epsilon` default
+### CUR-01 — Đổi thứ tự delay Cons → trước Span
 
 **File:** `train.py`
-**Function/Argument:** `ArgumentParser` hoặc config dict chứa `sinkhorn_epsilon`
+**Function:** `run_training`
 
-**Problem code:**
+**Problem (thứ tự hiện tại — Span và Cons bật cùng lúc sau epoch 4):**
 ```python
-# Hiện tại (sau lần tune trước)
-parser.add_argument("--sinkhorn_epsilon", type=float, default=0.1)
+_SPAN_DELAY, _SPAN_WARMUP = _SPE * 4,   _SPE * 2
+_CONS_DELAY, _CONS_WARMUP = _SPE * 4,   _SPE * 2
 ```
 
-**Fix:**
+**Fix — Cons trước Span, lệch nhau 2 epoch:**
 ```python
-parser.add_argument("--sinkhorn_epsilon", type=float, default=0.05)
-# sinkhorn_iters GIỮ NGUYÊN 100 — không đổi
+# Tầng 2: Bật Cons sau Epoch 3 (step = 3 * _SPE)
+_CONS_DELAY  = int(_SPE * config.get("cons_start_epoch",  3))
+_CONS_WARMUP = int(_SPE * config.get("cons_warmup_epochs", 2))
+
+# Tầng 3: Bật Span sau Epoch 5 (step = 5 * _SPE)
+_SPAN_DELAY  = int(_SPE * config.get("span_start_epoch",  5))
+_SPAN_WARMUP = int(_SPE * config.get("span_warmup_epochs", 2))
 ```
 
-**Lý do:** epsilon=0.05 cho transport plan sắc nét hơn; kết hợp với iters=100 đủ để hội tụ.
+**Lý do thứ tự:** `L_cons` không có confidence threshold → học được ngay khi γ còn noisy.
+`L_span` Phase 2 có `confidence_threshold = 0.25` → cần γ đủ sắc nét mới có valid samples.
+Cho Cons chạy trước 2 epoch = cho OT + Cons đủ thời gian làm sắc nét γ trước khi Span enforce hard threshold.
+
+**Điều kiện bất biến phải giữ:** `_SPAN_DELAY > _CONS_DELAY` luôn luôn đúng.
+Agent nên thêm assertion hoặc log warning nếu user truyền tham số vi phạm điều kiện này.
 
 ---
 
-### FIX-02 — Implement `span_projection_loss` Soft-to-Hard Curriculum
+### CUR-02 — CLI Arguments mới
 
-**File:** `losses.py`
-**Function:** `span_projection_loss` (replace toàn bộ)
+**File:** `train.py`
+**Function:** `main` → `ArgumentParser`
 
-**Problem code (logic cũ — hard pseudo-label không có warm-up):**
+**Fix — thêm 4 args sau nhóm `--lambda_*` args:**
 ```python
-def span_projection_loss(self, vi_start_logits, vi_end_logits, gamma, en_start, en_end):
-    # ... hard pseudo-label trực tiếp, không có curriculum
-```
-
-**Fix — Full replacement:**
-```python
-def span_projection_loss(self, vi_start_logits, vi_end_logits, gamma, en_start, en_end, global_step, spe):
-    """
-    Curriculum Span Loss:
-      Phase 1 (step <= 4*spe): Soft supervision — dùng hàng gamma làm soft target.
-      Phase 2 (step >  4*spe): Hard pseudo-label với confidence threshold = 0.25.
-    """
-    B_ans = gamma.size(0)
-    L_vi  = gamma.size(2)
-    device = gamma.device
-    batch_idx = torch.arange(B_ans, device=device)
-
-    is_hard_phase = global_step > (4 * spe)
-
-    if not is_hard_phase:
-        # ---- PHASE 1: SOFT SUPERVISION (Warm-up) ----
-        with torch.no_grad():
-            start_target = gamma[batch_idx, en_start, :]   # (B_ans, L_vi)
-            end_target   = gamma[batch_idx, en_end,   :]   # (B_ans, L_vi)
-
-        loss_start = -(start_target * F.log_softmax(vi_start_logits, dim=-1)).sum(dim=-1).mean()
-        loss_end   = -(end_target   * F.log_softmax(vi_end_logits,   dim=-1)).sum(dim=-1).mean()
-        return (loss_start + loss_end) / 2.0
-
-    else:
-        # ---- PHASE 2: HARD PSEUDO-LABELING + THRESHOLD ----
-        # (xem FIX-03 cho guard all-inf bên dưới)
-        with torch.no_grad():
-            start_mass_dist = gamma[batch_idx, en_start, :]
-            max_start_mass, hat_s_vi = start_mass_dist.max(dim=1)
-
-            end_mass_dist = gamma[batch_idx, en_end, :]
-            position_idx  = torch.arange(L_vi, device=device).unsqueeze(0)
-            before_start_mask = position_idx < hat_s_vi.unsqueeze(1)
-            end_mass_dist_masked = end_mass_dist.masked_fill(before_start_mask, float('-inf'))
-
-            # GUARD (FIX-03): xử lý trường hợp toàn bộ là -inf
-            # (xem FIX-03 để implement guard này)
-
-            max_end_mass, hat_e_vi = end_mass_dist_masked.max(dim=1)
-
-            confidence_threshold = 0.25
-            valid_pseudo_mask = (
-                (max_start_mass > confidence_threshold) &
-                (max_end_mass   > confidence_threshold)   # -inf samples tự bị lọc ở đây
-            )
-
-        if valid_pseudo_mask.any():
-            loss_start = F.cross_entropy(vi_start_logits[valid_pseudo_mask], hat_s_vi[valid_pseudo_mask])
-            loss_end   = F.cross_entropy(vi_end_logits[valid_pseudo_mask],   hat_e_vi[valid_pseudo_mask])
-            return (loss_start + loss_end) / 2.0
-        else:
-            return torch.tensor(0.0, device=device, requires_grad=True)
-```
-
-**Lưu ý cho agent:** Cần cập nhật **tất cả call-sites** của `span_projection_loss` để truyền thêm `global_step` và `spe`.
-
----
-
-### FIX-03 — Guard all-`-inf` trong Phase 2
-
-**File:** `losses.py`
-**Function:** `span_projection_loss`, Phase 2, ngay sau khi tính `end_mass_dist_masked`
-
-**Problem:** Nếu `hat_s_vi[i]` trùng với token cuối của VI sequence, `end_mass_dist_masked[i]` sẽ toàn `-inf`. PyTorch `max()` trên all-`-inf` tensor không raise error nhưng trả về index undefined — behavior này phụ thuộc backend/device.
-
-**Fix — chèn sau dòng `end_mass_dist_masked = ...`:**
-```python
-# Guard: nếu toàn hàng là -inf (hat_s_vi tại vị trí cuối), cho phép end = start
-all_inf_mask = (end_mass_dist_masked == float('-inf')).all(dim=1)
-if all_inf_mask.any():
-    # Fallback: cho end bằng start (span length = 1) cho các sample bị affected
-    # Các sample này sẽ bị lọc bởi confidence_threshold vì max_end_mass = -inf < 0.25
-    # Guard này chỉ ngăn undefined behavior của max() — không ảnh hưởng loss
-    end_mass_dist_masked[all_inf_mask, hat_s_vi[all_inf_mask]] = 0.0
-```
-
-**Agent quyết định:** Nếu codebase có convention khác cho degenerate span (e.g., skip toàn bộ sample thay vì fallback), agent có thể implement theo convention đó — miễn là tránh được all-`-inf` input cho `max()`.
-
----
-
-### FIX-04 — Asymmetric Weighting cho `loss_has_ans`
-
-**File:** `losses.py`
-**Function:** `forward` (hoặc hàm tổng hợp loss — tùy codebase đặt tên)
-
-**Problem code (weighting đối xứng hiện tại):**
-```python
-# Cách cũ — EN và VI có cùng trọng số
-loss_has_ans = F.binary_cross_entropy_with_logits(vi_has_logits, batch["en_is_answerable"].float())
-# hoặc: loss_has_ans = (loss_has_en + loss_has_vi) / 2.0
-```
-
-**Fix:**
-```python
-# 1. EN branch — supervised anchor
-en_cls       = H_en[:, 0, :]
-en_has_logits = self.has_answer_head(en_cls).squeeze(-1)
-loss_has_en   = F.binary_cross_entropy_with_logits(
-    en_has_logits, batch["en_is_answerable"].float()
+# Curriculum epoch milestones
+parser.add_argument(
+    "--cons_start_epoch", type=int, default=3,
+    help="Epoch at which L_cons starts warming up. Default: 3."
 )
-
-# 2. VI branch — distant supervision (chỉ có noisy label từ EN)
-vi_cls        = H_vi[:, 0, :]
-vi_has_logits = self.has_answer_head(vi_cls).squeeze(-1)
-loss_has_vi   = F.binary_cross_entropy_with_logits(
-    vi_has_logits, batch["en_is_answerable"].float()
+parser.add_argument(
+    "--cons_warmup_epochs", type=int, default=2,
+    help="Number of epochs for L_cons linear warmup. Default: 2."
 )
-
-# 3. Asymmetric aggregation — bảo vệ EN anchor
-loss_has_ans = (0.7 * loss_has_en) + (0.3 * loss_has_vi)
+parser.add_argument(
+    "--span_start_epoch", type=int, default=5,
+    help="Epoch at which L_span starts warming up. Must be > cons_start_epoch. Default: 5."
+)
+parser.add_argument(
+    "--span_warmup_epochs", type=int, default=2,
+    help="Number of epochs for L_span linear warmup. Default: 2."
+)
 ```
 
-**Lý do:** VI branch chỉ có distant supervision → không nên receive weight bằng EN. Fix này giải quyết nguyên nhân chính của `Loss/HasAnswer` oscillating.
+**Cập nhật `config` dict trong `main`:**
+```python
+config.update({
+    # ... existing keys ...
+    "cons_start_epoch"   : args.cons_start_epoch,
+    "cons_warmup_epochs" : args.cons_warmup_epochs,
+    "span_start_epoch"   : args.span_start_epoch,
+    "span_warmup_epochs" : args.span_warmup_epochs,
+})
+```
 
 ---
 
-### FIX-05 — Entropy Monitoring với Numerical Stability
+### CUR-03 — Cập nhật DEFAULT_CONFIG
 
-**File:** `losses.py`
-**Vị trí:** Trong `forward`, sau khi tính `vi_start_logits` / `vi_end_logits` — log lên TensorBoard cùng lúc với các loss khác.
+**File:** `train.py`
+**Section:** `DEFAULT_CONFIG` dict
 
-**Problem (công thức gốc trong tài liệu — thiếu clamp):**
+**Fix — thêm 4 keys:**
 ```python
-entropy = -(P_vi * log(P_vi)).sum(dim=-1).mean()  # log(0) → -inf nếu P_vi có zero
+DEFAULT_CONFIG = {
+    # ... existing keys ...
+
+    # Curriculum epoch milestones (3-Stage Rocket)
+    # Stage 1: QA + OT only (Epochs 1 → cons_start_epoch)
+    # Stage 2: + Cons warmup (cons_start_epoch → span_start_epoch)
+    # Stage 3: + Span warmup (span_start_epoch → span_start_epoch + span_warmup_epochs)
+    "cons_start_epoch"   : 3,
+    "cons_warmup_epochs" : 2,
+    "span_start_epoch"   : 5,
+    "span_warmup_epochs" : 2,
+}
+```
+
+---
+
+### CUR-04 — Cập nhật log message
+
+**File:** `train.py`
+**Function:** `run_training`, đoạn log curriculum delays
+
+**Problem (log hiện tại không phản ánh thứ tự mới):**
+```python
+log.info(
+    f"Curriculum delays (steps): "
+    f"OT={_OT_DELAY}→{_OT_DELAY+_OT_WARMUP} | "
+    f"Span={_SPAN_DELAY}→{_SPAN_DELAY+_SPAN_WARMUP} | "
+    f"Cons={_CONS_DELAY}→{_CONS_DELAY+_CONS_WARMUP}"
+)
 ```
 
 **Fix:**
 ```python
-with torch.no_grad():
-    P_vi_start = F.softmax(vi_start_logits, dim=-1)
-    entropy_start = -(P_vi_start * (P_vi_start + 1e-8).log()).sum(dim=-1).mean()
-
-    P_vi_end = F.softmax(vi_end_logits, dim=-1)
-    entropy_end = -(P_vi_end * (P_vi_end + 1e-8).log()).sum(dim=-1).mean()
-
-# Log lên TensorBoard
-writer.add_scalar("Metrics/VI_StartLogit_Entropy", entropy_start, global_step)
-writer.add_scalar("Metrics/VI_EndLogit_Entropy",   entropy_end,   global_step)
-```
-
-**Interpretation guide cho agent:** Entropy cao = phân phối flat (model chưa confident); entropy thấp = phân phối peaked (model confident). Quan sát entropy giảm dần qua epoch là tín hiệu tốt của Phase 2 Curriculum.
-
----
-
-### FIX-06 — Log Mean Transport Mass
-
-**File:** `losses.py`
-**Vị trí:** Trong Phase 2 của `span_projection_loss`, sau khi tính `max_start_mass` và `max_end_mass`.
-
-**Fix — thêm log (không ảnh hưởng backward):**
-```python
-with torch.no_grad():
-    # Chỉ log trên valid samples để tránh nhiễu từ -inf samples
-    if valid_pseudo_mask.any():
-        mean_start_mass = max_start_mass[valid_pseudo_mask].mean()
-        mean_end_mass   = max_end_mass[valid_pseudo_mask].mean()
-        # Trả về cùng với loss để caller có thể log, HOẶC dùng global writer
-        # Agent quyết định convention log phù hợp với codebase
-```
-
-**TensorBoard keys gợi ý:**
-```
-Metrics/OT_MeanStartMass   (target: tăng dần về phía > 0.5 ở Phase 2)
-Metrics/OT_MeanEndMass     (target: tương tự)
-Metrics/OT_ValidPseudoRatio  (= valid_pseudo_mask.float().mean() — tỷ lệ sample vượt threshold)
+log.info(
+    f"3-Stage Curriculum (steps): "
+    f"[Stage1] OT: {_OT_DELAY}→{_OT_DELAY+_OT_WARMUP} | "
+    f"[Stage2] Cons: {_CONS_DELAY}→{_CONS_DELAY+_CONS_WARMUP} | "
+    f"[Stage3] Span: {_SPAN_DELAY}→{_SPAN_DELAY+_SPAN_WARMUP}"
+)
+log.info(
+    f"Epoch milestones: "
+    f"Cons starts ep.{config['cons_start_epoch']} | "
+    f"Span starts ep.{config['span_start_epoch']}"
+)
 ```
 
 ---
 
-## Verification Checklist (Agent tự kiểm tra)
+## Validation — Agent tự kiểm tra
 
-- [ ] `FIX-01`: `--sinkhorn_epsilon` default = `0.05`; `--sinkhorn_iters` không đổi = `100`
-- [ ] `FIX-02`: `span_projection_loss` có signature mới `(..., global_step, spe)`; tất cả call-sites đã được cập nhật
-- [ ] `FIX-03`: Không có `max()` call nào nhận all-`-inf` tensor
-- [ ] `FIX-04`: `loss_has_ans` = `0.7 * loss_has_en + 0.3 * loss_has_vi`; không còn symmetric averaging
-- [ ] `FIX-05`: Entropy log dùng `(P + 1e-8).log()` — không dùng `P.log()` trực tiếp
-- [ ] `FIX-06`: Transport mass metrics được log ở Phase 2 (`global_step > 4 * spe`)
+- [ ] `_SPAN_DELAY > _CONS_DELAY` — assertion hoặc log warning nếu user truyền tham số vi phạm
+- [ ] `python train.py --mode train --cons_start_epoch 3 --span_start_epoch 5` — chạy không error
+- [ ] `python train.py --mode train --cons_start_epoch 2 --span_start_epoch 4` — ablation variant chạy được
+- [ ] Log output hiển thị đúng: `[Stage2] Cons: X→Y` trước `[Stage3] Span: A→B`
+- [ ] `python train.py --help` — 4 args mới xuất hiện trong help text
+- [ ] Các args cũ (`--lambda_ot`, `--lambda_span`, etc.) không bị ảnh hưởng
+- [ ] `run_overfit` và `run_overfit_full` **không bị chỉnh sửa**
+
+---
+
+## Ablation Variants Gợi ý (cho paper)
+
+| Run | `--cons_start_epoch` | `--span_start_epoch` | Mục đích |
+|---|---|---|---|
+| **Proposed** | 3 | 5 | Chiến lược đề xuất |
+| Aggressive | 2 | 4 | Bật sớm hơn 1 epoch |
+| Conservative | 4 | 7 | Cho OT nhiều thời gian hơn |
+| Simultaneous | 4 | 4 | Baseline — bật cùng lúc (config cũ) |
+| No-Cons | 99 | 5 | Ablation: bỏ Cons, chỉ Span |
+
+Chạy 5 variants này = đủ dữ liệu cho ablation table trong paper.
+
+---
+
+## Ghi chú Kiến trúc
+
+```
+3-Stage Rocket Timeline (default):
+  Epoch 1-3:  QA + OT only
+              → XLM-R học EN span extraction
+              → OT kéo EN↔VI embeddings gần nhau
+              → γ bắt đầu có cấu trúc
+
+  Epoch 3-5:  + Cons warmup (linear 0 → lambda_cons)
+              → VI logits học hình dáng phân phối EN qua γ
+              → γ tiếp tục sắc nét nhờ OT
+              → "Gò đất" VI distribution nhô lên gần threshold
+
+  Epoch 5-7:  + Span warmup (linear 0 → lambda_span)
+              → confidence_threshold = 0.25 được vượt bởi các samples tốt
+              → span_loss != 0.0 → logits VI vót nhọn thành Start/End boundaries
+
+  Epoch 7+:   Full model — tất cả loss components ở max weight
+```
