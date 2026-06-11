@@ -2,27 +2,38 @@
 """
 Loss Functions for Cross-Lingual QA with Sinkhorn OT Alignment.
 
-Architecture (post-refactor):
+Architecture (post-refactor — Zero-Shot + Global OT):
     - No graph, no GAT, no subsampling, no FGW.
-    - Sinkhorn OT operates directly on full XLM-R hidden states (L=512).
+    - Sinkhorn OT operates directly on full XLM-R hidden states.
+    - NO pseudo-labeling from γ (Topological Attractor problem).
 
 Total loss:
     L_total = L_qa
-            + λ_ot   * L_ot           (transport cost regularizer)
-            + λ_span * L_span_proj    (pseudo-label QA on VI via γ)
-            + λ_cons * L_consistency  (transport-guided KL)
+            + L_has_ans          (EN-only answerable detection)
+            + λ_ot   * L_ot     (transport cost — global space alignment)
 
 Components:
     L_qa         : Cross-entropy span extraction on EN (supervised).
-    L_ot         : Transport cost <γ.detach(), C>  — gradient flows through C only.
-    L_span_proj  : argmax from γ rows at EN start/end → pseudo-labels for VI.
-    L_consistency: KL(VI_softmax || γᵀ @ EN_softmax.detach()) with temperature.
+    L_has_ans    : BCE on EN only (no pos_weight, no VI distant supervision).
+    L_ot         : Transport cost <γ.detach(), C> — gradient flows through C only.
+
+Why L_span and L_cons were removed:
+    Sinkhorn γ collapses onto "Topological Attractors" — tokens that share
+    identical sub-word IDs across languages (numbers, punctuation, Named
+    Entities like "Paris"). These have cosine distance ≈ 0, causing γ to
+    dump all transport mass onto them instead of semantically aligned tokens.
+    Using γ for pseudo-labels (L_span) or distribution matching (L_cons)
+    teaches the model to extract single meaningless tokens (Start == End).
+
+    Instead, we rely on Zero-Shot Transfer:
+    - L_qa teaches the QA Head accurate span boundaries on EN.
+    - L_ot pulls VI hidden space close to EN (global alignment).
+    - At inference, QA Head naturally generalizes to VI without pseudo-labels.
 
 Notes:
     - Sinkhorn uses non-uniform marginals (zero mass on PAD tokens).
     - Log-domain Sinkhorn for numerical stability (~50 iterations).
-    - has_answer_head trained on EN only.
-    - L_span_proj computed for all answerable EN samples regardless of VI prediction.
+    - has_answer_head trained on EN only (zero-shot transfer to VI).
 """
 
 import torch
@@ -243,177 +254,6 @@ def ot_transport_loss(
 
 
 # ══════════════════════════════════════════════════════════════
-# Loss: Span Projection (pseudo-label VI from γ)
-# ══════════════════════════════════════════════════════════════
-
-def span_projection_loss(
-    vi_start_logits: torch.Tensor,  # (B_ans, L) — VI start logits (answerable only)
-    vi_end_logits: torch.Tensor,    # (B_ans, L)
-    gamma: torch.Tensor,            # (B_ans, L, L) — transport plan
-    en_start: torch.Tensor,         # (B_ans,) — EN answer start position (token index)
-    en_end: torch.Tensor,           # (B_ans,) — EN answer end position
-    global_step: int,
-    spe: int,
-    span_start_epoch: int = 5,
-    confidence_threshold: float = 0.10,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Curriculum Span Loss:
-      Phase 1 (step <= span_start_epoch*spe): Soft supervision — dùng hàng gamma làm soft target.
-      Phase 2 (step >  span_start_epoch*spe): Hard pseudo-label với normalized confidence threshold.
-        γ rows are normalized to sum=1 before thresholding (fixes scale mismatch
-        where raw mass ≈ 1/n_valid is too small for any absolute threshold).
-    Returns: (loss, mean_start_mass, mean_end_mass, valid_ratio)
-    """
-    B_ans = gamma.size(0)
-    L_vi  = gamma.size(2)
-    device = gamma.device
-    batch_idx = torch.arange(B_ans, device=device)
-
-    is_hard_phase = global_step > (span_start_epoch * spe)
-
-    # Initialize metrics
-    mean_start_mass = torch.tensor(0.0, device=device)
-    mean_end_mass   = torch.tensor(0.0, device=device)
-    valid_ratio     = torch.tensor(0.0, device=device)
-
-    if not is_hard_phase:
-        # ---- PHASE 1: SOFT SUPERVISION (Warm-up) ----
-        with torch.no_grad():
-            start_target = gamma[batch_idx, en_start, :]   # (B_ans, L_vi)
-            end_target   = gamma[batch_idx, en_end,   :]   # (B_ans, L_vi)
-            
-            # Re-normalize for numerical stability
-            start_target = start_target / start_target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-            end_target   = end_target   / end_target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-
-        loss_start = -(start_target * F.log_softmax(vi_start_logits, dim=-1)).sum(dim=-1).mean()
-        loss_end   = -(end_target   * F.log_softmax(vi_end_logits,   dim=-1)).sum(dim=-1).mean()
-        return (loss_start + loss_end) / 2.0, mean_start_mass, mean_end_mass, valid_ratio
-
-    else:
-        # ---- PHASE 2: HARD PSEUDO-LABELING + THRESHOLD ----
-        # γ rows sum to 1/n_valid (≈0.0025 for 400 tokens) due to doubly-stochastic
-        # marginals. Normalize each row to sum=1 so threshold compares fractions,
-        # not raw transport mass. (Phase 1 already does this for soft targets.)
-        with torch.no_grad():
-            start_mass_raw = gamma[batch_idx, en_start, :]  # (B_ans, L_vi)
-            start_mass_norm = start_mass_raw / start_mass_raw.sum(dim=1, keepdim=True).clamp(min=1e-8)
-            max_start_mass, hat_s_vi = start_mass_norm.max(dim=1)
-
-            end_mass_raw = gamma[batch_idx, en_end, :]  # (B_ans, L_vi)
-            end_mass_norm = end_mass_raw / end_mass_raw.sum(dim=1, keepdim=True).clamp(min=1e-8)
-
-            # Mask positions before predicted start (enforce end >= start)
-            position_idx = torch.arange(L_vi, device=device).unsqueeze(0)
-            before_start_mask = position_idx < hat_s_vi.unsqueeze(1)
-            end_mass_masked = end_mass_norm.masked_fill(before_start_mask, 0.0)
-
-            # GUARD: if all positions masked (start at last position), fallback to start
-            all_zero_mask = (end_mass_masked.sum(dim=1) < 1e-8)
-            if all_zero_mask.any():
-                end_mass_masked[all_zero_mask, hat_s_vi[all_zero_mask]] = 1.0
-
-            max_end_mass, hat_e_vi = end_mass_masked.max(dim=1)
-
-            valid_pseudo_mask = (
-                (max_start_mass > confidence_threshold) &
-                (max_end_mass   > confidence_threshold)
-            )
-
-        if valid_pseudo_mask.any():
-            mean_start_mass = max_start_mass[valid_pseudo_mask].mean()
-            mean_end_mass   = max_end_mass[valid_pseudo_mask].mean()
-            valid_ratio     = valid_pseudo_mask.float().mean()
-            
-            loss_start = F.cross_entropy(vi_start_logits[valid_pseudo_mask], hat_s_vi[valid_pseudo_mask])
-            loss_end   = F.cross_entropy(vi_end_logits[valid_pseudo_mask],   hat_e_vi[valid_pseudo_mask])
-            loss = (loss_start + loss_end) / 2.0
-            return loss, mean_start_mass, mean_end_mass, valid_ratio
-        else:
-            return torch.tensor(0.0, device=device, requires_grad=True), mean_start_mass, mean_end_mass, valid_ratio
-
-
-# ══════════════════════════════════════════════════════════════
-# Loss: Transport-Guided Consistency (KL divergence)
-# ══════════════════════════════════════════════════════════════
-
-def consistency_loss(
-    en_start_logits: torch.Tensor,   # (B, L)
-    en_end_logits: torch.Tensor,     # (B, L)
-    vi_start_logits: torch.Tensor,   # (B, L)
-    vi_end_logits: torch.Tensor,     # (B, L)
-    gamma: torch.Tensor,             # (B, L_en, L_vi) transport plan
-    temperature: float = 2.0,
-    vi_pad_mask: torch.Tensor | None = None,   # (B, T_vi) True = PAD
-) -> torch.Tensor:
-    """
-    Transport-Guided Consistency Loss.
-
-    P_target = γᵀ @ Softmax(EN_logits.detach() / T)
-    L_cons   = T² × KL( Softmax(VI_logits / T) || P_target )
-
-    .detach() on EN logits — stop gradient (Teacher doesn't learn from VI).
-    γ acts as a bridge mapping EN distribution to VI token space.
-
-    Args:
-        en_start_logits : (B, L) EN start logits
-        en_end_logits   : (B, L) EN end logits
-        vi_start_logits : (B, L) VI start logits
-        vi_end_logits   : (B, L) VI end logits
-        gamma           : (B, L_en, L_vi) transport plan from Sinkhorn
-        temperature     : softmax temperature (>1 smooths distribution)
-        vi_pad_mask     : (B, L_vi) boolean — True for PAD tokens in VI
-
-    Returns:
-        scalar loss
-    """
-    T = temperature
-
-    # ── 1. EN probability distribution (stop-gradient Teacher) ──
-    en_start_prob = F.softmax(en_start_logits.detach() / T, dim=-1)  # (B, L)
-    en_end_prob   = F.softmax(en_end_logits.detach()   / T, dim=-1)  # (B, L)
-
-    # ── 2. Transport EN distribution → VI space via γ ───────────
-    # γᵀ: (B, L_vi, L_en)
-    gamma_T = gamma.detach().transpose(1, 2)                         # (B, L_vi, L_en)
-
-    # P_target = γᵀ @ p_en  →  (B, L_vi)
-    # This maps: for each VI position j, how much EN probability transports there
-    vi_target_start = torch.bmm(gamma_T, en_start_prob.unsqueeze(-1)).squeeze(-1)  # (B, L_vi)
-    vi_target_end   = torch.bmm(gamma_T, en_end_prob.unsqueeze(-1)).squeeze(-1)    # (B, L_vi)
-
-    if vi_pad_mask is not None:
-        # Zero out PAD positions in soft targets
-        vi_target_start = vi_target_start.masked_fill(vi_pad_mask, 0.0)
-        vi_target_end   = vi_target_end.masked_fill(vi_pad_mask, 0.0)
-
-        # Re-normalize so targets sum to 1 over valid positions
-        vi_target_start = vi_target_start / vi_target_start.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        vi_target_end   = vi_target_end   / vi_target_end.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-
-        # Mask logits so softmax assigns ~0 to PAD positions
-        vi_start_logits = vi_start_logits.masked_fill(vi_pad_mask, -1e9)
-        vi_end_logits   = vi_end_logits.masked_fill(vi_pad_mask, -1e9)
-    else:
-        # Clamp + renormalize to ensure valid probability distribution
-        vi_target_start = vi_target_start.clamp(min=1e-8)
-        vi_target_end   = vi_target_end.clamp(min=1e-8)
-        vi_target_start = vi_target_start / vi_target_start.sum(dim=-1, keepdim=True)
-        vi_target_end   = vi_target_end   / vi_target_end.sum(dim=-1, keepdim=True)
-
-    # ── 3. KL(VI_softmax || P_target) ──────────────────────────
-    vi_start_log = F.log_softmax(vi_start_logits / T, dim=-1)
-    vi_end_log   = F.log_softmax(vi_end_logits   / T, dim=-1)
-
-    kl_start = F.kl_div(vi_start_log, vi_target_start, reduction="batchmean")
-    kl_end   = F.kl_div(vi_end_log,   vi_target_end,   reduction="batchmean")
-
-    # Scale by T² (Hinton Knowledge Distillation convention)
-    return (T ** 2) * (kl_start + kl_end) / 2.0
-
-
-# ══════════════════════════════════════════════════════════════
 # Helper: Extract question embeddings from full hidden states
 # ══════════════════════════════════════════════════════════════
 
@@ -455,54 +295,37 @@ class OTAlignmentLoss(nn.Module):
     """
     Combined loss for Cross-Lingual QA with Sinkhorn OT.
 
-    L_total = L_qa
-            + 1.0         * L_has_ans
-            + λ_ot        * L_ot
-            + λ_span      * L_span_proj
-            + λ_cons      * L_consistency
+    Zero-Shot + Global OT strategy:
+        L_total = L_qa + L_has_ans + λ_ot * L_ot
 
     Contains:
         - QAHead (trainable): cross-attention + span projections + has_answer
         - Sinkhorn solver (non-parametric): computed each forward pass
         - All loss computation logic
+
+    L_span and L_cons have been removed because Sinkhorn γ collapses onto
+    Topological Attractors (shared sub-word tokens across languages), producing
+    corrupted pseudo-labels that destroy span extraction capability.
     """
 
     def __init__(
         self,
         hidden_size: int = 768,          # XLM-R hidden dimension
         lambda_ot: float = 0.1,          # weight for OT transport cost
-        lambda_span: float = 0.3,        # weight for span projection loss
-        lambda_cons: float = 0.15,       # weight for consistency loss
-        consistency_temperature: float = 1.0,
-        sinkhorn_epsilon: float = 0.05,   # entropic regularization  ← changed from 0.05 (ACL ablation: ε=0.1 best for soft span alignment)
-        sinkhorn_iters: int = 300,       # Sinkhorn iterations       ← changed from 50  (K=50 under-converged, noisy gradients)
-        span_confidence_threshold: float = 0.10,
-        span_soft: bool = False,
-        span_start_epoch: int = 5,
+        sinkhorn_epsilon: float = 0.05,  # entropic regularization
+        sinkhorn_iters: int = 300,       # Sinkhorn iterations
     ):
         """
         Args:
-            hidden_size   : XLM-R hidden dim (768 base, 1024 large)
-            lambda_ot     : weight for L_ot (transport cost regularizer)
-            lambda_span   : weight for L_span_proj (pseudo-label VI QA)
-            lambda_cons   : weight for L_consistency (KL divergence)
-            consistency_temperature : temperature T for KL div
+            hidden_size      : XLM-R hidden dim (768 base, 1024 large)
+            lambda_ot        : weight for L_ot (transport cost regularizer)
             sinkhorn_epsilon : entropic regularization for Sinkhorn
             sinkhorn_iters   : number of Sinkhorn iterations
-            span_confidence_threshold : threshold for gating pseudo-labels
-            span_soft        : whether to use soft span projection
-            span_start_epoch : epoch when phase 2 (hard span projection) starts
         """
         super().__init__()
         self.lambda_ot          = lambda_ot
-        self.lambda_span        = lambda_span
-        self.lambda_cons        = lambda_cons
-        self.temperature        = consistency_temperature
         self.sinkhorn_epsilon   = sinkhorn_epsilon
         self.sinkhorn_iters     = sinkhorn_iters
-        self.span_confidence_threshold = span_confidence_threshold
-        self.span_soft          = span_soft
-        self.span_start_epoch   = span_start_epoch
 
         # QA Head: shared for EN and VI, operates on full 512-token sequences
         self.qa_head = QAHead(hidden_size=hidden_size)
@@ -536,7 +359,7 @@ class OTAlignmentLoss(nn.Module):
         Returns:
             dict with all loss components + debug stats:
                 "total", "qa", "qa_start", "qa_end", "has_ans",
-                "ot", "span_proj", "cons", + debug keys
+                "ot", + debug keys
         """
         en_hidden   = model_outputs["en_hidden"]     # (B, T_en, H)  — truncated to max valid tokens
         vi_hidden   = model_outputs["vi_hidden"]     # (B, T_vi, H)  — truncated to max valid tokens
@@ -552,7 +375,7 @@ class OTAlignmentLoss(nn.Module):
 
         # ── Clamp to truncated sequence length — prevents IndexError ──
         # After dynamic truncation, en_start/en_end may exceed T_en.
-        # Clamping ensures valid indices for qa_loss and span_projection_loss.
+        # Clamping ensures valid indices for qa_loss.
         en_seq_len = en_hidden.size(1)               # T_en after dynamic truncation
         en_start = en_start.clamp(max=en_seq_len - 1)
         en_end   = en_end.clamp(max=en_seq_len - 1)
@@ -608,86 +431,35 @@ class OTAlignmentLoss(nn.Module):
             l_qa_end   = torch.tensor(0.0, device=device)
 
         # ══════════════════════════════════════════════════════
-        # 5. L_has_answer (BCE) — Asymmetric weighting (FIX-04)
+        # 5. L_has_answer (BCE) — EN only, no pos_weight
         # ══════════════════════════════════════════════════════
+        # Previous version used pos_weight=2.0 and trained on VI too,
+        # causing 98-99% overconfidence. Now: EN only, balanced BCE.
         has_answer_label = batch["en_is_answerable"].float().to(device)
 
-        loss_has_en = F.binary_cross_entropy_with_logits(
+        l_has_ans = F.binary_cross_entropy_with_logits(
             en_has_ans,
             has_answer_label,
-            pos_weight=torch.tensor(2.0, device=device),
         )
-
-        loss_has_vi = F.binary_cross_entropy_with_logits(
-            vi_has_ans,
-            has_answer_label,
-            pos_weight=torch.tensor(2.0, device=device),
-        )
-
-        # Asymmetric aggregation — bảo vệ EN anchor
-        l_has_ans = (0.7 * loss_has_en) + (0.3 * loss_has_vi)
 
         # ══════════════════════════════════════════════════════
         # 6. L_ot — transport cost regularizer
         # ══════════════════════════════════════════════════════
-        # Gradient flows through C only (gamma is detached)
+        # Gradient flows through C only (gamma is detached).
+        # This is the ONLY role of OT: pull VI space → EN space globally.
         l_ot = ot_transport_loss(gamma, C)
 
         # ══════════════════════════════════════════════════════
-        # 7. L_span_proj — pseudo-label VI
+        # 7. Total loss — Zero-Shot + Global OT
         # ══════════════════════════════════════════════════════
-        # Computed for ALL answerable EN samples (regardless of VI prediction).
-        # Pseudo-labels come from γ mapping EN answer span → VI positions.
-        if answerable_mask.any():
-            l_span, mean_s_mass, mean_e_mass, valid_ratio = span_projection_loss(
-                vi_start_logits[answerable_mask],
-                vi_end_logits[answerable_mask],
-                gamma[answerable_mask],
-                en_start[answerable_mask],
-                en_end[answerable_mask],
-                global_step=global_step,
-                spe=spe,
-                span_start_epoch=self.span_start_epoch,
-                confidence_threshold=self.span_confidence_threshold,
-            )
-        else:
-            l_span = torch.tensor(0.0, device=device)
-            mean_s_mass = torch.tensor(0.0, device=device)
-            mean_e_mass = torch.tensor(0.0, device=device)
-            valid_ratio = torch.tensor(0.0, device=device)
-
-        # ══════════════════════════════════════════════════════
-        # 8. L_consistency — transport-guided KL divergence
-        # ══════════════════════════════════════════════════════
-        if answerable_mask.any():
-            l_cons = consistency_loss(
-                en_start_logits[answerable_mask],
-                en_end_logits[answerable_mask],
-                vi_start_logits[answerable_mask],
-                vi_end_logits[answerable_mask],
-                gamma=gamma[answerable_mask],
-                temperature=self.temperature,
-                vi_pad_mask=vi_pad_mask[answerable_mask],
-            )
-        else:
-            l_cons = torch.tensor(0.0, device=device)
-
-        # ══════════════════════════════════════════════════════
-        # 9. Total loss
-        # ══════════════════════════════════════════════════════
-        # has_answer coefficient raised 0.5 → 1.0 (safe: has_answer_head is
-        # an independent MLP on CLS; it does NOT share weights with start_proj
-        # or end_proj, so increasing this does not hurt span loss gradients).
         l_total = (
             l_qa
-            + 1.0                * l_has_ans
-            + self.lambda_ot     * l_ot
-            + self.lambda_span   * l_span
-            + self.lambda_cons   * l_cons
+            + l_has_ans
+            + self.lambda_ot * l_ot
         )
 
         # ══════════════════════════════════════════════════════
-        # 10. Debug stats — CLS collapse detection & Entropy (FIX-05, 06)
+        # 8. Debug stats — CLS collapse detection & Entropy
         # ══════════════════════════════════════════════════════
         with torch.no_grad():
             cls_start = en_start_logits[:, 0].mean()
@@ -707,6 +479,9 @@ class OTAlignmentLoss(nn.Module):
             else:
                 has_ans_acc = torch.tensor(float('nan'))
 
+            # VI has_ans probability (for monitoring zero-shot transfer)
+            vi_has_ans_prob = torch.sigmoid(vi_has_ans).mean()
+
         return {
             "total"           : l_total,
             "qa"              : l_qa.detach(),
@@ -714,8 +489,6 @@ class OTAlignmentLoss(nn.Module):
             "qa_end"          : l_qa_end.detach(),
             "has_ans"         : l_has_ans.detach(),
             "ot"              : l_ot.detach(),
-            "span_proj"       : l_span.detach(),
-            "cons"            : l_cons.detach(),
             # Debug & tracking
             "dbg/cls_start"   : cls_start,
             "dbg/max_start"   : max_start,
@@ -724,9 +497,7 @@ class OTAlignmentLoss(nn.Module):
             "dbg/has_ans_acc" : has_ans_acc,
             "dbg/entropy_start": entropy_start,
             "dbg/entropy_end"  : entropy_end,
-            "dbg/mean_start_mass": mean_s_mass,
-            "dbg/mean_end_mass"  : mean_e_mass,
-            "dbg/valid_ratio"    : valid_ratio,
+            "dbg/vi_has_ans_prob": vi_has_ans_prob,
         }
 
 
@@ -739,7 +510,7 @@ if __name__ == "__main__":
     B, L, H = 2, 512, 768
 
     print("=" * 60)
-    print("Self-test: OTAlignmentLoss with Sinkhorn OT")
+    print("Self-test: OTAlignmentLoss (Zero-Shot + Global OT)")
     print("=" * 60)
 
     # ── Mock model outputs ────────────────────────────────────

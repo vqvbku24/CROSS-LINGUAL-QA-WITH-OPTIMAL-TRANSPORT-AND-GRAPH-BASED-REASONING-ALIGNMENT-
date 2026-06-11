@@ -6,9 +6,11 @@ Two modes:
   1. --mode overfit  : Overfit on a single batch — sanity check.
   2. --mode train    : Full training loop with gradient accumulation + scheduler.
 
-Architecture (post-refactor):
+Architecture (Zero-Shot + Global OT):
   - No graph, no GAT, no subsampling, no FGW.
-  - Sinkhorn OT on full 512-token XLM-R hidden states.
+  - Sinkhorn OT on full XLM-R hidden states.
+  - L_total = L_qa + L_has_ans + λ_ot * L_ot
+  - No L_span or L_cons (Topological Attractor problem).
 """
 
 import os
@@ -102,15 +104,11 @@ DEFAULT_CONFIG = {
     "model_name"        : "xlm-roberta-base",
 
     # OT hyperparameters
-    "sinkhorn_epsilon"  : 0.05,  # ← reset to 0.05 (for sharper transport plan)
-    "sinkhorn_iters"    : 300,  # ← changed from 50  (K=50 under-converged, noisy gradients)
+    "sinkhorn_epsilon"  : 0.05,
+    "sinkhorn_iters"    : 300,
 
-    # Loss weights
+    # Loss weights (Zero-Shot + Global OT: only λ_ot)
     "lambda_ot"         : 0.1,
-    "lambda_span"       : 0.3,
-    "lambda_cons"       : 0.15,
-    "cons_temp"         : 1.0,
-    "span_soft"         : False,
 
     # Training hyperparameters
     "batch_size"        : 32,
@@ -122,12 +120,6 @@ DEFAULT_CONFIG = {
     "max_epochs"        : 15,
     "max_grad_norm"     : 1.0,
     "pairing_strategy"  : "topic",
-
-    # Curriculum epoch milestones (3-Stage Rocket)
-    "cons_start_epoch"  : 3,
-    "cons_warmup_epochs": 2,
-    "span_start_epoch"  : 5,
-    "span_warmup_epochs": 2,
 
     # Overfit mode
     "overfit_steps"     : 400,
@@ -215,13 +207,8 @@ def setup_model_and_criterion(config: dict, device: torch.device):
     criterion = OTAlignmentLoss(
         hidden_size         = model.backbone.hidden_size,
         lambda_ot           = config["lambda_ot"],
-        lambda_span         = config["lambda_span"],
-        lambda_cons         = config["lambda_cons"],
-        consistency_temperature = config["cons_temp"],
         sinkhorn_epsilon    = config["sinkhorn_epsilon"],
         sinkhorn_iters      = config["sinkhorn_iters"],
-        span_soft           = config.get("span_soft", True),
-        span_start_epoch    = config.get("span_start_epoch", 5),
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -262,12 +249,10 @@ def run_overfit(config: dict, device: torch.device):
     model.eval()
     criterion.train()
 
-    # Disable OT + cons in overfit: just verify QA + span
-    orig_lambda_ot   = criterion.lambda_ot
-    orig_lambda_cons = criterion.lambda_cons
-    criterion.lambda_ot   = 0.0
-    criterion.lambda_cons = 0.0
-    log.info("Overfit mode: lambda_ot=0, lambda_cons=0 (verifying qa + span only)")
+    # Disable OT in overfit: just verify QA head works
+    orig_lambda_ot = criterion.lambda_ot
+    criterion.lambda_ot = 0.0
+    log.info("Overfit mode: lambda_ot=0 (verifying qa head only)")
 
     prev_loss      = float("inf")
     stagnant_count = 0
@@ -290,8 +275,6 @@ def run_overfit(config: dict, device: torch.device):
                 f"total={total:.4f} | "
                 f"qa={losses['qa'].item():.4f} | "
                 f"ot={losses['ot'].item():.4f} | "
-                f"span={losses['span_proj'].item():.4f} | "
-                f"cons={losses['cons'].item():.4f} | "
                 f"gn_qa={gn_qa:.3f}"
             )
 
@@ -304,19 +287,16 @@ def run_overfit(config: dict, device: torch.device):
             stagnant_count = 0
         prev_loss = total
 
-    final_qa   = losses["qa"].item()
-    final_span = losses["span_proj"].item()
-    final_sum  = final_qa + final_span
+    final_qa = losses["qa"].item()
     log.info("=" * 60)
-    if final_sum < 2.0:
-        log.info(f"OVERFIT PASSED! qa={final_qa:.4f} span={final_span:.4f} (sum={final_sum:.4f} < 2.0)")
+    if final_qa < 1.0:
+        log.info(f"OVERFIT PASSED! qa={final_qa:.4f} < 1.0")
     else:
-        log.warning(f"OVERFIT NOT CONVERGED. qa={final_qa:.4f} span={final_span:.4f} (sum={final_sum:.4f})")
+        log.warning(f"OVERFIT NOT CONVERGED. qa={final_qa:.4f}")
     log.info("=" * 60)
 
     # Restore
-    criterion.lambda_ot   = orig_lambda_ot
-    criterion.lambda_cons = orig_lambda_cons
+    criterion.lambda_ot = orig_lambda_ot
     for p in model.parameters():
         p.requires_grad_(True)
     model.train()
@@ -349,11 +329,7 @@ def run_overfit_full(config: dict, device: torch.device):
     total_trainable = sum(p.numel() for p in all_params if p.requires_grad)
     log.info(f"Trainable: ALL params — {total_trainable/1e6:.2f}M")
     log.info(f"LR: backbone=1e-5 | layer_weights=1e-4 | head=1e-4 | weight_decay=0.01")
-    log.info(
-        f"lambda_ot={config['lambda_ot']} | "
-        f"lambda_cons={config['lambda_cons']} | "
-        f"lambda_span={config['lambda_span']}"
-    )
+    log.info(f"lambda_ot={config['lambda_ot']}")
 
     optimizer = AdamW([
         {"params": backbone_params,  "lr": 1e-5},
@@ -367,8 +343,6 @@ def run_overfit_full(config: dict, device: torch.device):
     prev_loss      = float("inf")
     stagnant_count = 0
 
-    _cons_max = config["lambda_cons"]
-
     for step in range(1, config["overfit_steps"] + 1):
 
         # ── Curriculum: OT warmup ──────────────────────────────
@@ -380,28 +354,10 @@ def run_overfit_full(config: dict, device: torch.device):
         else:
             criterion.lambda_ot = config["lambda_ot"]
 
-        # Span: Phase1 step 1-100 = 0, Phase2 step 101-200 = 0→max
-        if step <= 100:
-            criterion.lambda_span = 0.0
-        elif step <= 200:
-            criterion.lambda_span = config["lambda_span"] * (step - 100) / 100.0
-        else:
-            criterion.lambda_span = config["lambda_span"]
-
-        # Cons: Phase1 step 1-50 = 0, Phase2 step 51-150 = 0→max
-        if step <= 50:
-            criterion.lambda_cons = 0.0
-        elif step <= 150:
-            criterion.lambda_cons = _cons_max * (step - 50) / 100.0
-        else:
-            criterion.lambda_cons = _cons_max
-
-        if step % 10 == 0 and 51 <= step <= 210:
+        if step % 10 == 0 and 51 <= step <= 110:
             log.info(
                 f"   [Annealing step {step}] "
-                f"OT={criterion.lambda_ot:.4f}  "
-                f"SPAN={criterion.lambda_span:.4f}  "
-                f"CONS={criterion.lambda_cons:.4f}"
+                f"OT={criterion.lambda_ot:.4f}"
             )
 
         optimizer.zero_grad()
@@ -425,8 +381,6 @@ def run_overfit_full(config: dict, device: torch.device):
                 f"total={total:.4f} | "
                 f"qa={losses['qa'].item():.4f} | "
                 f"ot={losses['ot'].item():.4f} | "
-                f"span={losses['span_proj'].item():.4f} | "
-                f"cons={losses['cons'].item():.4f} | "
                 f"gn_bb={gn_bb:.3f} gn_head={gn_head:.3f}"
             )
 
@@ -443,8 +397,7 @@ def run_overfit_full(config: dict, device: torch.device):
     log.info("=" * 60)
     log.info(
         f"Final: total={final_total:.4f} | qa={losses['qa'].item():.4f} | "
-        f"span={losses['span_proj'].item():.4f} | ot={losses['ot'].item():.4f} | "
-        f"cons={losses['cons'].item():.4f}"
+        f"ot={losses['ot'].item():.4f}"
     )
     if final_total < 3.0:
         log.info("OVERFIT_FULL: Loss decreasing steadily — joint training OK!")
@@ -459,7 +412,7 @@ def run_overfit_full(config: dict, device: torch.device):
 
 def run_training(config: dict, device: torch.device):
     log.info("=" * 60)
-    log.info("MODE: FULL TRAINING")
+    log.info("MODE: FULL TRAINING (Zero-Shot + Global OT)")
     log.info("=" * 60)
 
     os.makedirs(config["output_dir"], exist_ok=True)
@@ -533,32 +486,13 @@ def run_training(config: dict, device: torch.device):
     # Access criterion's lambda attrs (through DDP wrapper if needed)
     _criterion = criterion.module if is_distributed() else criterion
 
-    # Curriculum delays (scaled by dataset size)
+    # OT warmup schedule: first half of epoch 1 = 0, then linear ramp over 1 epoch
     _SPE = steps_per_epoch
     _OT_DELAY,   _OT_WARMUP   = _SPE // 2,  _SPE
-    # Tầng 2: Bật Cons sau Epoch 3
-    _CONS_DELAY  = int(_SPE * config.get("cons_start_epoch", 3))
-    _CONS_WARMUP = int(_SPE * config.get("cons_warmup_epochs", 2))
 
-    # Tầng 3: Bật Span sau Epoch 5
-    _SPAN_DELAY  = int(_SPE * config.get("span_start_epoch", 5))
-    _SPAN_WARMUP = int(_SPE * config.get("span_warmup_epochs", 2))
-
-    if _SPAN_DELAY <= _CONS_DELAY:
-        log.warning(f"span_start_epoch ({config.get('span_start_epoch', 5)}) should be > cons_start_epoch ({config.get('cons_start_epoch', 3)})")
-
-    _CONS_MAX = config["lambda_cons"]
     if is_main_process():
         log.info(
-            f"3-Stage Curriculum (steps): "
-            f"[Stage1] OT: {_OT_DELAY}→{_OT_DELAY+_OT_WARMUP} | "
-            f"[Stage2] Cons: {_CONS_DELAY}→{_CONS_DELAY+_CONS_WARMUP} | "
-            f"[Stage3] Span: {_SPAN_DELAY}→{_SPAN_DELAY+_SPAN_WARMUP}"
-        )
-        log.info(
-            f"Epoch milestones: "
-            f"Cons starts ep.{config.get('cons_start_epoch', 3)} | "
-            f"Span starts ep.{config.get('span_start_epoch', 5)}"
+            f"OT Warmup (steps): delay={_OT_DELAY}, ramp={_OT_DELAY}→{_OT_DELAY+_OT_WARMUP}"
         )
 
     for epoch in range(start_epoch, config["max_epochs"] + 1):
@@ -570,12 +504,9 @@ def run_training(config: dict, device: torch.device):
         criterion.train()
 
         if is_main_process():
-            if epoch == 1:
-                log.info(f"Epoch {epoch}: Starting curriculum annealing...")
-            else:
-                log.info(f"Epoch {epoch}: Continuing training.")
+            log.info(f"Epoch {epoch}/{config['max_epochs']}: Training...")
 
-        epoch_losses = {"total": 0.0, "qa": 0.0, "has_ans": 0.0, "ot": 0.0, "span_proj": 0.0, "cons": 0.0}
+        epoch_losses = {"total": 0.0, "qa": 0.0, "has_ans": 0.0, "ot": 0.0}
         accum_count = 0
 
         for step, batch in enumerate(train_loader):
@@ -611,27 +542,13 @@ def run_training(config: dict, device: torch.device):
                 optimizer.zero_grad()
                 global_step += 1  # increment first
 
-                # ── Curriculum Learning (uses updated global_step) ──
+                # ── OT Warmup (only curriculum remaining) ──
                 if global_step <= _OT_DELAY:
                     _criterion.lambda_ot = 0.0
                 elif global_step <= _OT_DELAY + _OT_WARMUP:
                     _criterion.lambda_ot = config["lambda_ot"] * (global_step - _OT_DELAY) / _OT_WARMUP
                 else:
                     _criterion.lambda_ot = config["lambda_ot"]
-
-                if global_step <= _SPAN_DELAY:
-                    _criterion.lambda_span = 0.0
-                elif global_step <= _SPAN_DELAY + _SPAN_WARMUP:
-                    _criterion.lambda_span = config["lambda_span"] * (global_step - _SPAN_DELAY) / _SPAN_WARMUP
-                else:
-                    _criterion.lambda_span = config["lambda_span"]
-
-                if global_step <= _CONS_DELAY:
-                    _criterion.lambda_cons = 0.0
-                elif global_step <= _CONS_DELAY + _CONS_WARMUP:
-                    _criterion.lambda_cons = _CONS_MAX * (global_step - _CONS_DELAY) / _CONS_WARMUP
-                else:
-                    _criterion.lambda_cons = _CONS_MAX
 
                 if global_step % config["log_every"] == 0 and is_main_process():
                     log.info(
@@ -640,9 +557,7 @@ def run_training(config: dict, device: torch.device):
                         f"qa={losses['qa'].item():.4f} | "
                         f"has_ans={losses.get('has_ans', torch.tensor(0)).item():.4f} | "
                         f"ot={losses['ot'].item():.4f} | "
-                        f"span={losses['span_proj'].item():.4f} | "
-                        f"cons={losses['cons'].item():.4f} | "
-                        f"λ=({_criterion.lambda_ot:.3f},{_criterion.lambda_span:.3f},{_criterion.lambda_cons:.3f})"
+                        f"λ_ot={_criterion.lambda_ot:.3f}"
                     )
 
                     # --- TENSORBOARD LOGGING ---
@@ -653,21 +568,17 @@ def run_training(config: dict, device: torch.device):
                         writer.add_scalar("Loss/QA_End",              losses['qa_end'].item(),   global_step)
                         writer.add_scalar("Loss/HasAnswer (BCE)",     losses.get('has_ans', torch.tensor(0)).item(), global_step)
                         writer.add_scalar("Loss/OT (Transport)",      losses['ot'].item(),       global_step)
-                        writer.add_scalar("Loss/Span (Vietnamese)",   losses['span_proj'].item(),global_step)
-                        writer.add_scalar("Loss/Consistency",         losses['cons'].item(),     global_step)
 
-                        # New entropy and transport mass metrics
+                        # Entropy metrics
                         if 'dbg/entropy_start' in losses:
                             writer.add_scalar("Metrics/VI_StartLogit_Entropy", losses['dbg/entropy_start'], global_step)
                             writer.add_scalar("Metrics/VI_EndLogit_Entropy",   losses['dbg/entropy_end'],   global_step)
-                        if 'dbg/mean_start_mass' in losses:
-                            writer.add_scalar("Metrics/OT_MeanStartMass",      losses['dbg/mean_start_mass'], global_step)
-                            writer.add_scalar("Metrics/OT_MeanEndMass",        losses['dbg/mean_end_mass'],   global_step)
-                            writer.add_scalar("Metrics/OT_ValidPseudoRatio",   losses['dbg/valid_ratio'],     global_step)
 
-                        writer.add_scalar("Lambda/OT",   _criterion.lambda_ot,   global_step)
-                        writer.add_scalar("Lambda/Span", _criterion.lambda_span, global_step)
-                        writer.add_scalar("Lambda/Cons", _criterion.lambda_cons, global_step)
+                        # VI has_ans probability (zero-shot monitoring)
+                        if 'dbg/vi_has_ans_prob' in losses:
+                            writer.add_scalar("Metrics/VI_HasAns_Prob", losses['dbg/vi_has_ans_prob'], global_step)
+
+                        writer.add_scalar("Lambda/OT", _criterion.lambda_ot, global_step)
 
                         writer.add_scalar("Learning_Rate/Backbone", optimizer.param_groups[0]['lr'], global_step)
                         writer.add_scalar("Learning_Rate/Head",     optimizer.param_groups[1]['lr'], global_step)
@@ -698,9 +609,7 @@ def run_training(config: dict, device: torch.device):
                 log.info(f"  qa_loss    : {avg_losses.get('qa', 0):.4f} (Span Extraction)")
                 log.info(f"  has_ans    : {avg_losses.get('has_ans', 0):.4f} (Answerable BCE)")
                 log.info(f"  ot_loss    : {avg_losses.get('ot', 0):.4f} (Transport Cost)")
-                log.info(f"  span_loss  : {avg_losses.get('span_proj', 0):.4f} (Pseudo-label)")
-                log.info(f"  cons_loss  : {avg_losses.get('cons', 0):.4f} (Consistency)")
-                log.info(f"  Current λ  : OT={_criterion.lambda_ot:.3f}, Span={_criterion.lambda_span:.3f}, Cons={_criterion.lambda_cons:.3f}")
+                log.info(f"  Current λ  : OT={_criterion.lambda_ot:.3f}")
                 with torch.no_grad():
                     lw = torch.softmax(_model.layer_weights, dim=0)
                     log.info(
@@ -827,27 +736,9 @@ def main():
     parser.add_argument("--sinkhorn_iters",   type=int,   default=DEFAULT_CONFIG["sinkhorn_iters"],
                         help="Number of Sinkhorn iterations")
 
-    # Loss weights (ablation)
+    # Loss weights (only OT remains as tunable)
     parser.add_argument("--lambda_ot",   type=float, default=DEFAULT_CONFIG["lambda_ot"],
                         help="Weight for OT transport cost loss. Set=0 to disable.")
-    parser.add_argument("--lambda_span", type=float, default=DEFAULT_CONFIG["lambda_span"],
-                        help="Weight for Span Projection loss. Set=0 to disable.")
-    parser.add_argument("--lambda_cons", type=float, default=DEFAULT_CONFIG["lambda_cons"],
-                        help="Weight for Consistency loss. Set=0 to disable.")
-    parser.add_argument("--cons_temp",   type=float, default=DEFAULT_CONFIG["cons_temp"],
-                        help="Temperature for consistency KL divergence.")
-    parser.add_argument("--span_soft",   type=str, default="True", choices=["True", "False"],
-                        help="Use soft span targets instead of hard argmax.")
-
-    # Curriculum epoch milestones
-    parser.add_argument("--cons_start_epoch", type=int, default=DEFAULT_CONFIG.get("cons_start_epoch", 3),
-                        help="Epoch at which L_cons starts warming up. Default: 3.")
-    parser.add_argument("--cons_warmup_epochs", type=int, default=DEFAULT_CONFIG.get("cons_warmup_epochs", 2),
-                        help="Number of epochs for L_cons linear warmup. Default: 2.")
-    parser.add_argument("--span_start_epoch", type=int, default=DEFAULT_CONFIG.get("span_start_epoch", 5),
-                        help="Epoch at which L_span starts warming up. Must be > cons_start_epoch. Default: 5.")
-    parser.add_argument("--span_warmup_epochs", type=int, default=DEFAULT_CONFIG.get("span_warmup_epochs", 2),
-                        help="Number of epochs for L_span linear warmup. Default: 2.")
 
     args = parser.parse_args()
 
@@ -865,28 +756,13 @@ def main():
         "sinkhorn_epsilon"  : args.sinkhorn_epsilon,
         "sinkhorn_iters"    : args.sinkhorn_iters,
         "lambda_ot"         : args.lambda_ot,
-        "lambda_span"       : args.lambda_span,
-        "lambda_cons"       : args.lambda_cons,
-        "cons_temp"         : args.cons_temp,
-        "span_soft"         : args.span_soft == "True",
-        "cons_start_epoch"  : args.cons_start_epoch,
-        "cons_warmup_epochs": args.cons_warmup_epochs,
-        "span_start_epoch"  : args.span_start_epoch,
-        "span_warmup_epochs": args.span_warmup_epochs,
     })
 
     # Log ablation config
-    _ablation_flags = []
     if config["lambda_ot"] == 0.0:
-        _ablation_flags.append("No OT")
-    if config["lambda_span"] == 0.0:
-        _ablation_flags.append("No Span Proj")
-    if config["lambda_cons"] == 0.0:
-        _ablation_flags.append("No Consistency")
-    if _ablation_flags:
-        log.info(f"⚗️  ABLATION MODE: {' + '.join(_ablation_flags)}")
+        log.info("⚗️  ABLATION MODE: No OT (pure zero-shot baseline)")
     else:
-        log.info(f"🔬 FULL MODEL: λ_ot={config['lambda_ot']}, λ_span={config['lambda_span']}, λ_cons={config['lambda_cons']}")
+        log.info(f"🔬 Zero-Shot + Global OT: λ_ot={config['lambda_ot']}")
 
     # Initialize distributed if running with torchrun
     setup_distributed()
