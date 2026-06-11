@@ -312,8 +312,8 @@ class OTAlignmentLoss(nn.Module):
         self,
         hidden_size: int = 768,          # XLM-R hidden dimension
         lambda_ot: float = 0.1,          # weight for OT transport cost
-        sinkhorn_epsilon: float = 0.05,  # entropic regularization
-        sinkhorn_iters: int = 300,       # Sinkhorn iterations
+        sinkhorn_epsilon: float = 0.1,  # entropic regularization
+        sinkhorn_iters: int = 100,       # Sinkhorn iterations
     ):
         """
         Args:

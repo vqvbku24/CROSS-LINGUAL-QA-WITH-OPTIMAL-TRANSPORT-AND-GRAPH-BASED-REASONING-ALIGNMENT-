@@ -114,6 +114,13 @@ class CrossLingualOTModel(nn.Module):
         C = C.masked_fill(en_pad_mask.unsqueeze(2), 1e4)   # PAD rows  → 1e4
         C = C.masked_fill(vi_pad_mask.unsqueeze(1), 1e4)   # PAD cols  → 1e4
 
+        # NOTE: Do NOT mask shared BPE tokens (numbers, punctuation, "Paris").
+        # Sinkhorn has doubly-stochastic marginal constraints — every token must
+        # ship exactly 1/L mass. Blocking "Paris_EN"→"Paris_VI" (cost≈0) forces
+        # that mass onto unrelated tokens, corrupting their embeddings via L_ot.
+        # Shared tokens act as natural zero-cost anchors: they satisfy their
+        # marginal cheaply with ∇≈0, freeing other tokens to find semantic matches.
+
         return {
             "en_hidden":   H_en,          # (B, L, H)
             "vi_hidden":   H_vi,          # (B, L, H)

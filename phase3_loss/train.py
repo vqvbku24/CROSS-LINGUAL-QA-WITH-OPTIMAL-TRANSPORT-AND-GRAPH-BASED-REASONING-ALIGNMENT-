@@ -104,8 +104,8 @@ DEFAULT_CONFIG = {
     "model_name"        : "xlm-roberta-base",
 
     # OT hyperparameters
-    "sinkhorn_epsilon"  : 0.05,
-    "sinkhorn_iters"    : 300,
+    "sinkhorn_epsilon"  : 0.1,
+    "sinkhorn_iters"    : 100,
 
     # Loss weights (Zero-Shot + Global OT: only λ_ot)
     "lambda_ot"         : 0.1,
