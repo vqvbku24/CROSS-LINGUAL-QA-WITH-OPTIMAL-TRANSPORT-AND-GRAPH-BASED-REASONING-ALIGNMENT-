@@ -103,23 +103,23 @@ DEFAULT_CONFIG = {
 
     # OT hyperparameters
     "sinkhorn_epsilon"  : 0.05,  # ← reset to 0.05 (for sharper transport plan)
-    "sinkhorn_iters"    : 100,  # ← changed from 50  (K=50 under-converged, noisy gradients)
+    "sinkhorn_iters"    : 300,  # ← changed from 50  (K=50 under-converged, noisy gradients)
 
     # Loss weights
     "lambda_ot"         : 0.1,
     "lambda_span"       : 0.3,
     "lambda_cons"       : 0.15,
-    "cons_temp"         : 2.0,
-    "span_soft"         : True,
+    "cons_temp"         : 1.0,
+    "span_soft"         : False,
 
     # Training hyperparameters
-    "batch_size"        : 4,
-    "grad_accum_steps"  : 4,
+    "batch_size"        : 32,
+    "grad_accum_steps"  : 1,
     "lr"                : 1e-5,
     "head_lr"           : 8e-5,
     "weight_decay"      : 0.01,
     "warmup_ratio"      : 0.08,
-    "max_epochs"        : 10,
+    "max_epochs"        : 15,
     "max_grad_norm"     : 1.0,
     "pairing_strategy"  : "topic",
 

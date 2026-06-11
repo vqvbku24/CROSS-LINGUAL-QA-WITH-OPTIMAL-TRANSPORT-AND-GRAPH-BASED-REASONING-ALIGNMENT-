@@ -1,188 +1,159 @@
-# PHASE_SYNC_SPEC.md — Đồng bộ Phase 2 với `span_start_epoch`
+# DIAGNOSTIC_SPEC.md — Span Loss = 0 Root Cause Investigation
 
-> **Dành cho coding agent.** Fix conflict giữa lambda curriculum (train.py) và phase curriculum
-> (losses.py). Hiện tại Phase 2 bắt đầu ở epoch 4 (hardcode) trong khi lambda_span = 0 đến epoch 7
-> → valid_pseudo_mask được tính khi γ chưa chín → span_loss = 0 mãi sau khi lambda bật lên.
-> Agent tự quyết định cách refactor. Không được chỉnh sửa file ngoài Allowed Files.
+> **Dành cho coding agent.** Đây là spec CHẨN ĐOÁN, không phải fix spec.
+> Mục tiêu: Tìm ra chính xác tại sao `Loss/Span (Vietnamese)` = 0 sau khi `lambda_span` đã bật
+> (cons_start_epoch=4, span_start_epoch=6, confidence_threshold=0.07).
+> Agent KHÔNG được sửa logic nghiệp vụ, KHÔNG được thay đổi hyperparameter.
+> Agent chỉ được thêm temporary diagnostic code, chạy, đọc kết quả, rồi báo cáo.
 
 ---
 
-## Allowed Files (Touch Zone)
+## Allowed Files (Touch Zone — diagnostic only)
 
-| File | Phạm vi được phép chỉnh sửa |
+| File | Phạm vi được phép |
 |---|---|
-| `losses.py` | Chỉ `span_projection_loss` signature + `is_hard_phase` condition + call-site trong `OTAlignmentLoss.forward` |
-| `train.py` | Chỉ call-site `criterion(...)` — truyền thêm `span_start_epoch` vào kwargs nếu cần |
+| `losses.py` | Thêm `print`/`log` statements tạm thời để đo giá trị nội bộ |
+| `train.py` | Thêm `print`/`log` statements tạm thời nếu cần trace curriculum state |
 
-## No-Touch Zone
+## No-Touch Zone (tuyệt đối)
 
-| File | Lý do |
+| File/Thành phần | Lý do |
 |---|---|
-| `backbone.py` | Stable |
-| `model_core.py` | Stable |
-| `train.py` — lambda curriculum | Lớp curriculum này đúng, không đổi |
-| `losses.py` — `consistency_loss` | Không liên quan |
-| `losses.py` — `OTAlignmentLoss.__init__` | Không cần thêm attribute mới nếu agent dùng cách forward-pass param |
+| Bất kỳ logic tính loss nào | Không được thay đổi kết quả tính toán |
+| Hyperparameters (`threshold`, `epsilon`, `lambda_*`) | Đây là input của chẩn đoán, không phải output |
+| `backbone.py`, `model_core.py` | Không liên quan |
+| `optimizer`, `scheduler` | Không liên quan |
 
 ---
 
-## Priority Table
+## Bối cảnh vấn đề
 
-| Priority | ID | File | Rủi ro | Mô tả |
-|---|---|---|---|---|
-| 🔴 P1 | `SYNC-01` | `losses.py` | Trung bình | Thay `4 * spe` bằng `span_start_epoch * spe` trong `is_hard_phase` |
-| 🔴 P1 | `losses.py` | Trung bình | Cập nhật signature `span_projection_loss` nhận `span_start_epoch` |
-| 🔴 P1 | `SYNC-02` | `losses.py` | Thấp | Cập nhật call-site trong `OTAlignmentLoss.forward` truyền `span_start_epoch` |
-| 🟠 P2 | `SYNC-03` | `train.py` | Thấp | Truyền `span_start_epoch` vào `criterion()` call nếu cần |
+**Triệu chứng quan sát được:**
+- `Loss/Span (Vietnamese)` = 0 từ khi `lambda_span` bắt đầu bật (epoch 6 trở đi)
+- `Metrics/OT_MeanStartMass` = 0 suốt toàn bộ run
+- `Metrics/OT_MeanEndMass` = 0 suốt toàn bộ run
+- `Metrics/OT_ValidPseudoRatio` = 0 suốt toàn bộ run
+- `Loss/Span` ở Phase 1 (soft) tăng dần rồi drop về 0 khi Phase 2 kick in
 
----
-
-## Chi tiết
-
----
-
-### SYNC-01 — Fix `is_hard_phase` trong `span_projection_loss`
-
-**File:** `losses.py`
-**Function:** `span_projection_loss`
-
-**Problem:**
-```python
-def span_projection_loss(
-    vi_start_logits, vi_end_logits, gamma,
-    en_start, en_end,
-    global_step: int,
-    spe: int,
-) -> tuple:
-    ...
-    is_hard_phase = global_step > (4 * spe)   # ← hardcode epoch 4, không đồng bộ với span_start_epoch
+**Config đang chạy:**
+```
+cons_start_epoch  = 4
+span_start_epoch  = 6
+confidence_threshold = 0.07   ← đã hạ từ 0.25 xuống 0.07
+sinkhorn_epsilon  = 0.05
+sinkhorn_iters    = 100
 ```
 
-**Fix — thêm param `span_start_epoch`, xóa hardcode `4`:**
-```python
-def span_projection_loss(
-    vi_start_logits, vi_end_logits, gamma,
-    en_start, en_end,
-    global_step: int,
-    spe: int,
-    span_start_epoch: int = 5,   # ← default khớp với DEFAULT_CONFIG
-) -> tuple:
-    ...
-    # Phase 2 bắt đầu đúng lúc lambda_span warmup bắt đầu
-    # → γ đã có (span_start_epoch) epochs để học trước khi hard threshold được áp dụng
-    is_hard_phase = global_step > (span_start_epoch * spe)
-```
-
-**Lý do:** Phase 2 (hard pseudo-label với threshold) chỉ có ý nghĩa khi γ đã đủ sắc nét.
-γ sắc nét được nhờ OT + Cons chạy từ epoch 1 đến `span_start_epoch`.
-Bật Phase 2 sớm hơn (epoch 4 hardcode) khi γ còn flat → `valid_pseudo_mask` toàn False →
-khi `lambda_span` bật lên ở epoch 7 thì Phase 2 đã "thất bại" từ trước, loss vẫn = 0.
+**Câu hỏi cần trả lời:**
+1. `is_hard_phase` có thực sự = `True` sau epoch 6 không?
+2. `valid_pseudo_mask` có sample nào = `True` không? Tỷ lệ bao nhiêu?
+3. Giá trị thực tế của `max_start_mass` và `max_end_mass` là bao nhiêu so với threshold 0.07?
+4. γ (gamma) có cấu trúc hay vẫn flat (uniform)?
+5. `span_projection_loss` có được gọi không, hay bị short-circuit trước đó?
 
 ---
 
-### SYNC-02 — Cập nhật call-site trong `OTAlignmentLoss.forward`
+## Nhiệm vụ Agent
 
-**File:** `losses.py`
-**Function:** `OTAlignmentLoss.forward`
+### Task 1 — Đọc và map toàn bộ data flow của `span_projection_loss`
 
-**Problem (call-site hiện tại):**
-```python
-l_span, mean_s_mass, mean_e_mass, valid_ratio = span_projection_loss(
-    vi_start_logits[answerable_mask],
-    vi_end_logits[answerable_mask],
-    gamma[answerable_mask],
-    en_start[answerable_mask],
-    en_end[answerable_mask],
-    global_step=global_step,
-    spe=spe,
-    # ← span_start_epoch không được truyền vào
-)
-```
+Scan theo thứ tự:
 
-**Fix:**
-```python
-l_span, mean_s_mass, mean_e_mass, valid_ratio = span_projection_loss(
-    vi_start_logits[answerable_mask],
-    vi_end_logits[answerable_mask],
-    gamma[answerable_mask],
-    en_start[answerable_mask],
-    en_end[answerable_mask],
-    global_step=global_step,
-    spe=spe,
-    span_start_epoch=self.span_start_epoch,   # ← từ OTAlignmentLoss attribute
-)
-```
+1. **`train.py`**: Tìm dòng gọi `criterion(...)` hoặc `criterion.forward(...)`.
+   - `global_step` và `spe` được truyền vào như thế nào?
+   - `span_start_epoch` có được truyền vào không, hay dùng default?
 
-**Agent quyết định cách lưu `span_start_epoch` vào OTAlignmentLoss:**
+2. **`losses.py` — `OTAlignmentLoss.forward`**: Tìm chỗ gọi `span_projection_loss(...)`.
+   - `answerable_mask` được tính như thế nào? Có sample nào pass mask không?
+   - Nếu `answerable_mask.sum() == 0` → hàm không bao giờ được gọi → đây là root cause.
 
-Option A (đơn giản nhất): Thêm `span_start_epoch: int = 5` vào `OTAlignmentLoss.__init__` và `self.span_start_epoch = span_start_epoch`.
+3. **`losses.py` — `span_projection_loss`**: Đọc toàn bộ hàm.
+   - `is_hard_phase` được tính bằng công thức nào (`4 * spe`? `span_start_epoch * spe`?).
+   - `confidence_threshold` được lấy từ đâu — hardcode hay param?
+   - Metrics `mean_start_mass`, `mean_end_mass`, `valid_ratio` được gán ở đâu (trong hay ngoài `if valid_pseudo_mask.any()`)?
 
-Option B: Truyền trực tiếp qua `OTAlignmentLoss.forward(... span_start_epoch: int = 5)` và forward xuống call-site — không cần lưu vào `self`.
-
-Option C: Đọc từ `config` dict nếu `forward()` đã nhận config. Không preferred vì tăng coupling.
-
-**Agent chọn option phù hợp nhất với convention hiện tại của codebase.**
+4. **`losses.py` — `sinkhorn_log_domain`**: Kiểm tra output γ.
+   - γ được normalize như thế nào? Row-sum = 1 hay column-sum = 1?
+   - Với sequence length ~256-512 tokens và epsilon=0.05, giá trị max mỗi row của γ kỳ vọng là bao nhiêu?
 
 ---
 
-### SYNC-03 — Truyền `span_start_epoch` từ `train.py` (nếu cần theo Option B)
+### Task 2 — Thêm Diagnostic Prints tạm thời
 
-**File:** `train.py`
-**Function:** `run_training`, dòng gọi `criterion(...)`
-
-**Chỉ cần thay đổi nếu agent chọn Option B:**
+Thêm các print sau vào `span_projection_loss`, **bao bọc bằng `with torch.no_grad()`**, chỉ in khi `global_step % 50 == 0` để tránh spam:
 
 ```python
-# TRƯỚC:
-losses = criterion(outputs, batch, global_step=global_step, spe=_SPE)
-
-# SAU (Option B):
-losses = criterion(
-    outputs, batch,
-    global_step=global_step,
-    spe=_SPE,
-    span_start_epoch=config.get("span_start_epoch", 5),
-)
+# ── DIAGNOSTIC BLOCK (tạm thời — xóa sau khi chẩn đoán xong) ──
+if global_step % 50 == 0:
+    print(f"\n[DIAG step={global_step}] is_hard_phase={is_hard_phase}")
+    print(f"[DIAG] gamma shape: {gamma.shape}")
+    print(f"[DIAG] gamma row-sum (mean): {gamma.sum(dim=2).mean():.4f}")   # nên = 1.0 nếu row-normalized
+    print(f"[DIAG] gamma max per cell (mean): {gamma.max(dim=2).values.mean():.6f}")
+    
+    # Chỉ in thêm nếu đang ở Phase 2
+    if is_hard_phase:
+        start_mass = gamma[torch.arange(gamma.size(0)), en_start, :]
+        max_start  = start_mass.max(dim=1).values
+        print(f"[DIAG Phase2] max_start_mass — mean={max_start.mean():.6f}, min={max_start.min():.6f}, max={max_start.max():.6f}")
+        print(f"[DIAG Phase2] threshold={confidence_threshold}")
+        print(f"[DIAG Phase2] samples above threshold: {(max_start > confidence_threshold).sum().item()} / {gamma.size(0)}")
+        print(f"[DIAG Phase2] valid_pseudo_mask: {valid_pseudo_mask.sum().item()} / {valid_pseudo_mask.size(0)}")
+# ── END DIAGNOSTIC BLOCK ──
 ```
 
-**Nếu agent chọn Option A** (lưu vào `__init__`), cần truyền `span_start_epoch` khi khởi tạo trong `setup_model_and_criterion`:
+**Lưu ý vị trí đặt print:**
+- Print `is_hard_phase` và `gamma` ngay đầu hàm, trước `if not is_hard_phase`.
+- Print Phase 2 metrics ngay sau khi tính `valid_pseudo_mask`, trước `if valid_pseudo_mask.any()`.
+
+---
+
+### Task 3 — Thêm Diagnostic tại `OTAlignmentLoss.forward`
+
+Ngay trước call-site `span_projection_loss(...)`, thêm:
+
 ```python
-criterion = OTAlignmentLoss(
-    ...
-    span_start_epoch = config.get("span_start_epoch", 5),
-)
+# ── DIAGNOSTIC BLOCK ──
+if global_step % 50 == 0:
+    print(f"[DIAG forward] answerable_mask sum: {answerable_mask.sum().item()} / {answerable_mask.size(0)}")
+    print(f"[DIAG forward] lambda_span={self.lambda_span:.4f}")
+    print(f"[DIAG forward] global_step={global_step}, spe={spe}")
+# ── END DIAGNOSTIC BLOCK ──
+```
+
+---
+### Task 4 — Báo cáo
+
+Sau khi có output, agent tổng hợp kết quả theo template:
+
+```
+## Diagnostic Report
+
+### 1. Data flow
+- `span_projection_loss` có được gọi không? [Yes/No]
+- `answerable_mask.sum()` trung bình: [giá trị]
+- `is_hard_phase` trở thành True từ step nào? [step]
+- Công thức `is_hard_phase` đang dùng: [4 * spe / span_start_epoch * spe / khác]
+- `confidence_threshold` đang là: [giá trị — hardcode hay param?]
+
+### 2. Gamma analysis
+- γ row-sum mean: [giá trị — nên = 1.0]
+- γ max per cell mean: [giá trị]
+- Với threshold=0.07: [X%] samples vượt ngưỡng
+
+### 3. Root cause (agent kết luận)
+- [ ] `answerable_mask` rỗng → hàm không được gọi
+- [ ] `is_hard_phase` không bao giờ True (spe=0 hoặc công thức sai)
+- [ ] γ quá flat → max mass << threshold kể cả 0.07
+- [ ] `confidence_threshold` hardcode sai giá trị (không dùng 0.07)
+- [ ] Metrics chỉ log trong `if valid_pseudo_mask.any()` → không bao giờ log
+- [ ] Khác: [mô tả]
+
+### 4. Recommended fix
+[Agent mô tả fix ngắn gọn, không implement — chờ approval]
 ```
 
 ---
 
-## Validation — Agent tự kiểm tra
+## Cleanup sau chẩn đoán
 
-- [ ] `span_projection_loss` không còn hardcode `4` — thay bằng `span_start_epoch`
-- [ ] `is_hard_phase` với `span_start_epoch=7, spe=100, global_step=650` → `False` (epoch 6.5, chưa đến)
-- [ ] `is_hard_phase` với `span_start_epoch=7, spe=100, global_step=701` → `True` (epoch 7.01)
-- [ ] Chạy 1 forward pass với `global_step = span_start_epoch * spe + 1`: `mean_start_mass` và `mean_end_mass` được gán (có thể vẫn 0 nếu γ flat — nhưng không còn là "Phase 1 never executed Phase 2")
-- [ ] `DEFAULT_CONFIG["span_start_epoch"]` và default của `span_start_epoch` param nhất quán (đều = 5 hoặc đều được override bởi CLI arg)
-- [ ] Không có regression ở `run_overfit` và `run_overfit_full` (không trong scope nhưng kiểm tra không bị ảnh hưởng)
-
----
-
-## Ghi chú
-
-```
-Timeline sau fix (span_start_epoch=7, cons_start_epoch=4):
-
-  Epoch 1-4:  Phase 1 (soft), lambda_span=0, lambda_cons=0
-              → L_span = 0 * soft_loss = 0 (đúng — chưa bật)
-              → γ học qua L_ot
-
-  Epoch 4-7:  Phase 1 (soft), lambda_cons warmup, lambda_span=0
-              → L_span = 0 (đúng — chưa bật)
-              → γ sắc nét dần qua OT + Cons
-              → "gò đất" VI distribution được đắp lên
-
-  Epoch 7+:   Phase 2 (hard), lambda_span warmup → 0.3
-              → γ đã có 7 epochs để học → mass vượt threshold
-              → valid_pseudo_mask có True samples
-              → span_loss > 0 ✓
-              → Metrics/OT_MeanStartMass > 0 ✓
-```
+Sau khi báo cáo xong, agent **xóa toàn bộ diagnostic print blocks** (tìm bằng comment `# ── DIAGNOSTIC BLOCK ──`). Code phải trở về trạng thái ban đầu, chỉ khác ở báo cáo.

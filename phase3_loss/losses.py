@@ -255,11 +255,14 @@ def span_projection_loss(
     global_step: int,
     spe: int,
     span_start_epoch: int = 5,
+    confidence_threshold: float = 0.10,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Curriculum Span Loss:
       Phase 1 (step <= span_start_epoch*spe): Soft supervision — dùng hàng gamma làm soft target.
-      Phase 2 (step >  span_start_epoch*spe): Hard pseudo-label với confidence threshold = 0.25.
+      Phase 2 (step >  span_start_epoch*spe): Hard pseudo-label với normalized confidence threshold.
+        γ rows are normalized to sum=1 before thresholding (fixes scale mismatch
+        where raw mass ≈ 1/n_valid is too small for any absolute threshold).
     Returns: (loss, mean_start_mass, mean_end_mass, valid_ratio)
     """
     B_ans = gamma.size(0)
@@ -290,23 +293,29 @@ def span_projection_loss(
 
     else:
         # ---- PHASE 2: HARD PSEUDO-LABELING + THRESHOLD ----
+        # γ rows sum to 1/n_valid (≈0.0025 for 400 tokens) due to doubly-stochastic
+        # marginals. Normalize each row to sum=1 so threshold compares fractions,
+        # not raw transport mass. (Phase 1 already does this for soft targets.)
         with torch.no_grad():
-            start_mass_dist = gamma[batch_idx, en_start, :]
-            max_start_mass, hat_s_vi = start_mass_dist.max(dim=1)
+            start_mass_raw = gamma[batch_idx, en_start, :]  # (B_ans, L_vi)
+            start_mass_norm = start_mass_raw / start_mass_raw.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            max_start_mass, hat_s_vi = start_mass_norm.max(dim=1)
 
-            end_mass_dist = gamma[batch_idx, en_end, :]
-            position_idx  = torch.arange(L_vi, device=device).unsqueeze(0)
+            end_mass_raw = gamma[batch_idx, en_end, :]  # (B_ans, L_vi)
+            end_mass_norm = end_mass_raw / end_mass_raw.sum(dim=1, keepdim=True).clamp(min=1e-8)
+
+            # Mask positions before predicted start (enforce end >= start)
+            position_idx = torch.arange(L_vi, device=device).unsqueeze(0)
             before_start_mask = position_idx < hat_s_vi.unsqueeze(1)
-            end_mass_dist_masked = end_mass_dist.masked_fill(before_start_mask, float('-inf'))
+            end_mass_masked = end_mass_norm.masked_fill(before_start_mask, 0.0)
 
-            # GUARD (FIX-03): xử lý trường hợp toàn bộ là -inf
-            all_inf_mask = (end_mass_dist_masked == float('-inf')).all(dim=1)
-            if all_inf_mask.any():
-                end_mass_dist_masked[all_inf_mask, hat_s_vi[all_inf_mask]] = 0.0
+            # GUARD: if all positions masked (start at last position), fallback to start
+            all_zero_mask = (end_mass_masked.sum(dim=1) < 1e-8)
+            if all_zero_mask.any():
+                end_mass_masked[all_zero_mask, hat_s_vi[all_zero_mask]] = 1.0
 
-            max_end_mass, hat_e_vi = end_mass_dist_masked.max(dim=1)
+            max_end_mass, hat_e_vi = end_mass_masked.max(dim=1)
 
-            confidence_threshold = 0.15
             valid_pseudo_mask = (
                 (max_start_mass > confidence_threshold) &
                 (max_end_mass   > confidence_threshold)
@@ -464,11 +473,11 @@ class OTAlignmentLoss(nn.Module):
         lambda_ot: float = 0.1,          # weight for OT transport cost
         lambda_span: float = 0.3,        # weight for span projection loss
         lambda_cons: float = 0.15,       # weight for consistency loss
-        consistency_temperature: float = 2.0,
-        sinkhorn_epsilon: float = 0.1,   # entropic regularization  ← changed from 0.05 (ACL ablation: ε=0.1 best for soft span alignment)
-        sinkhorn_iters: int = 100,       # Sinkhorn iterations       ← changed from 50  (K=50 under-converged, noisy gradients)
-        span_confidence_threshold: float = 0.0,
-        span_soft: bool = True,
+        consistency_temperature: float = 1.0,
+        sinkhorn_epsilon: float = 0.05,   # entropic regularization  ← changed from 0.05 (ACL ablation: ε=0.1 best for soft span alignment)
+        sinkhorn_iters: int = 300,       # Sinkhorn iterations       ← changed from 50  (K=50 under-converged, noisy gradients)
+        span_confidence_threshold: float = 0.10,
+        span_soft: bool = False,
         span_start_epoch: int = 5,
     ):
         """
@@ -639,6 +648,7 @@ class OTAlignmentLoss(nn.Module):
                 global_step=global_step,
                 spe=spe,
                 span_start_epoch=self.span_start_epoch,
+                confidence_threshold=self.span_confidence_threshold,
             )
         else:
             l_span = torch.tensor(0.0, device=device)
