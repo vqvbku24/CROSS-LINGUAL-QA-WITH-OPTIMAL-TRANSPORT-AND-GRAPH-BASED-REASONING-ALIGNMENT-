@@ -1,10 +1,9 @@
-# CURRICULUM_REORDER_SPEC.md — 3-Stage Rocket Curriculum
+# PHASE_SYNC_SPEC.md — Đồng bộ Phase 2 với `span_start_epoch`
 
-> **Dành cho coding agent.** Thay đổi thứ tự curriculum từ QA→Span→Cons thành QA→Cons→Span,
-> đồng thời đưa các mốc epoch ra thành CLI arguments để dễ ablation.
-> Agent tự quyết định cách integrate, đặt tên biến, và refactor nếu cần.
-> Không được chỉnh sửa bất kỳ file nào ngoài danh sách Allowed Files.
-> **Scope:** Chỉ `run_training`. Các hàm `run_overfit` và `run_overfit_full` KHÔNG nằm trong scope lần này.
+> **Dành cho coding agent.** Fix conflict giữa lambda curriculum (train.py) và phase curriculum
+> (losses.py). Hiện tại Phase 2 bắt đầu ở epoch 4 (hardcode) trong khi lambda_span = 0 đến epoch 7
+> → valid_pseudo_mask được tính khi γ chưa chín → span_loss = 0 mãi sau khi lambda bật lên.
+> Agent tự quyết định cách refactor. Không được chỉnh sửa file ngoài Allowed Files.
 
 ---
 
@@ -12,153 +11,145 @@
 
 | File | Phạm vi được phép chỉnh sửa |
 |---|---|
-| `train.py` | `DEFAULT_CONFIG`, `ArgumentParser`, `run_training` only |
+| `losses.py` | Chỉ `span_projection_loss` signature + `is_hard_phase` condition + call-site trong `OTAlignmentLoss.forward` |
+| `train.py` | Chỉ call-site `criterion(...)` — truyền thêm `span_start_epoch` vào kwargs nếu cần |
 
 ## No-Touch Zone
 
 | File | Lý do |
 |---|---|
-| `losses.py` | Không liên quan đến thay đổi lần này |
 | `backbone.py` | Stable |
 | `model_core.py` | Stable |
+| `train.py` — lambda curriculum | Lớp curriculum này đúng, không đổi |
+| `losses.py` — `consistency_loss` | Không liên quan |
+| `losses.py` — `OTAlignmentLoss.__init__` | Không cần thêm attribute mới nếu agent dùng cách forward-pass param |
 
 ---
 
 ## Priority Table
 
-| Priority | ID | Mức độ rủi ro | Mô tả ngắn |
-|---|---|---|---|
-| 🔴 P1 | `CUR-01` | Trung bình | Đổi thứ tự delay: Cons trước Span trong `run_training` |
-| 🔴 P1 | `CUR-02` | Thấp | Đưa `cons_start_epoch` và `span_start_epoch` ra CLI args |
-| 🟠 P2 | `CUR-03` | Thấp | Đưa `cons_start_epoch` và `span_start_epoch` vào `DEFAULT_CONFIG` |
-| 🟡 P3 | `CUR-04` | Thấp | Cập nhật log message curriculum để phản ánh thứ tự mới |
+| Priority | ID | File | Rủi ro | Mô tả |
+|---|---|---|---|---|
+| 🔴 P1 | `SYNC-01` | `losses.py` | Trung bình | Thay `4 * spe` bằng `span_start_epoch * spe` trong `is_hard_phase` |
+| 🔴 P1 | `losses.py` | Trung bình | Cập nhật signature `span_projection_loss` nhận `span_start_epoch` |
+| 🔴 P1 | `SYNC-02` | `losses.py` | Thấp | Cập nhật call-site trong `OTAlignmentLoss.forward` truyền `span_start_epoch` |
+| 🟠 P2 | `SYNC-03` | `train.py` | Thấp | Truyền `span_start_epoch` vào `criterion()` call nếu cần |
 
 ---
 
-## Chi tiết từng Change
+## Chi tiết
 
 ---
 
-### CUR-01 — Đổi thứ tự delay Cons → trước Span
+### SYNC-01 — Fix `is_hard_phase` trong `span_projection_loss`
 
-**File:** `train.py`
-**Function:** `run_training`
+**File:** `losses.py`
+**Function:** `span_projection_loss`
 
-**Problem (thứ tự hiện tại — Span và Cons bật cùng lúc sau epoch 4):**
+**Problem:**
 ```python
-_SPAN_DELAY, _SPAN_WARMUP = _SPE * 4,   _SPE * 2
-_CONS_DELAY, _CONS_WARMUP = _SPE * 4,   _SPE * 2
+def span_projection_loss(
+    vi_start_logits, vi_end_logits, gamma,
+    en_start, en_end,
+    global_step: int,
+    spe: int,
+) -> tuple:
+    ...
+    is_hard_phase = global_step > (4 * spe)   # ← hardcode epoch 4, không đồng bộ với span_start_epoch
 ```
 
-**Fix — Cons trước Span, lệch nhau 2 epoch:**
+**Fix — thêm param `span_start_epoch`, xóa hardcode `4`:**
 ```python
-# Tầng 2: Bật Cons sau Epoch 3 (step = 3 * _SPE)
-_CONS_DELAY  = int(_SPE * config.get("cons_start_epoch",  3))
-_CONS_WARMUP = int(_SPE * config.get("cons_warmup_epochs", 2))
-
-# Tầng 3: Bật Span sau Epoch 5 (step = 5 * _SPE)
-_SPAN_DELAY  = int(_SPE * config.get("span_start_epoch",  5))
-_SPAN_WARMUP = int(_SPE * config.get("span_warmup_epochs", 2))
+def span_projection_loss(
+    vi_start_logits, vi_end_logits, gamma,
+    en_start, en_end,
+    global_step: int,
+    spe: int,
+    span_start_epoch: int = 5,   # ← default khớp với DEFAULT_CONFIG
+) -> tuple:
+    ...
+    # Phase 2 bắt đầu đúng lúc lambda_span warmup bắt đầu
+    # → γ đã có (span_start_epoch) epochs để học trước khi hard threshold được áp dụng
+    is_hard_phase = global_step > (span_start_epoch * spe)
 ```
 
-**Lý do thứ tự:** `L_cons` không có confidence threshold → học được ngay khi γ còn noisy.
-`L_span` Phase 2 có `confidence_threshold = 0.25` → cần γ đủ sắc nét mới có valid samples.
-Cho Cons chạy trước 2 epoch = cho OT + Cons đủ thời gian làm sắc nét γ trước khi Span enforce hard threshold.
-
-**Điều kiện bất biến phải giữ:** `_SPAN_DELAY > _CONS_DELAY` luôn luôn đúng.
-Agent nên thêm assertion hoặc log warning nếu user truyền tham số vi phạm điều kiện này.
+**Lý do:** Phase 2 (hard pseudo-label với threshold) chỉ có ý nghĩa khi γ đã đủ sắc nét.
+γ sắc nét được nhờ OT + Cons chạy từ epoch 1 đến `span_start_epoch`.
+Bật Phase 2 sớm hơn (epoch 4 hardcode) khi γ còn flat → `valid_pseudo_mask` toàn False →
+khi `lambda_span` bật lên ở epoch 7 thì Phase 2 đã "thất bại" từ trước, loss vẫn = 0.
 
 ---
 
-### CUR-02 — CLI Arguments mới
+### SYNC-02 — Cập nhật call-site trong `OTAlignmentLoss.forward`
 
-**File:** `train.py`
-**Function:** `main` → `ArgumentParser`
+**File:** `losses.py`
+**Function:** `OTAlignmentLoss.forward`
 
-**Fix — thêm 4 args sau nhóm `--lambda_*` args:**
+**Problem (call-site hiện tại):**
 ```python
-# Curriculum epoch milestones
-parser.add_argument(
-    "--cons_start_epoch", type=int, default=3,
-    help="Epoch at which L_cons starts warming up. Default: 3."
-)
-parser.add_argument(
-    "--cons_warmup_epochs", type=int, default=2,
-    help="Number of epochs for L_cons linear warmup. Default: 2."
-)
-parser.add_argument(
-    "--span_start_epoch", type=int, default=5,
-    help="Epoch at which L_span starts warming up. Must be > cons_start_epoch. Default: 5."
-)
-parser.add_argument(
-    "--span_warmup_epochs", type=int, default=2,
-    help="Number of epochs for L_span linear warmup. Default: 2."
-)
-```
-
-**Cập nhật `config` dict trong `main`:**
-```python
-config.update({
-    # ... existing keys ...
-    "cons_start_epoch"   : args.cons_start_epoch,
-    "cons_warmup_epochs" : args.cons_warmup_epochs,
-    "span_start_epoch"   : args.span_start_epoch,
-    "span_warmup_epochs" : args.span_warmup_epochs,
-})
-```
-
----
-
-### CUR-03 — Cập nhật DEFAULT_CONFIG
-
-**File:** `train.py`
-**Section:** `DEFAULT_CONFIG` dict
-
-**Fix — thêm 4 keys:**
-```python
-DEFAULT_CONFIG = {
-    # ... existing keys ...
-
-    # Curriculum epoch milestones (3-Stage Rocket)
-    # Stage 1: QA + OT only (Epochs 1 → cons_start_epoch)
-    # Stage 2: + Cons warmup (cons_start_epoch → span_start_epoch)
-    # Stage 3: + Span warmup (span_start_epoch → span_start_epoch + span_warmup_epochs)
-    "cons_start_epoch"   : 3,
-    "cons_warmup_epochs" : 2,
-    "span_start_epoch"   : 5,
-    "span_warmup_epochs" : 2,
-}
-```
-
----
-
-### CUR-04 — Cập nhật log message
-
-**File:** `train.py`
-**Function:** `run_training`, đoạn log curriculum delays
-
-**Problem (log hiện tại không phản ánh thứ tự mới):**
-```python
-log.info(
-    f"Curriculum delays (steps): "
-    f"OT={_OT_DELAY}→{_OT_DELAY+_OT_WARMUP} | "
-    f"Span={_SPAN_DELAY}→{_SPAN_DELAY+_SPAN_WARMUP} | "
-    f"Cons={_CONS_DELAY}→{_CONS_DELAY+_CONS_WARMUP}"
+l_span, mean_s_mass, mean_e_mass, valid_ratio = span_projection_loss(
+    vi_start_logits[answerable_mask],
+    vi_end_logits[answerable_mask],
+    gamma[answerable_mask],
+    en_start[answerable_mask],
+    en_end[answerable_mask],
+    global_step=global_step,
+    spe=spe,
+    # ← span_start_epoch không được truyền vào
 )
 ```
 
 **Fix:**
 ```python
-log.info(
-    f"3-Stage Curriculum (steps): "
-    f"[Stage1] OT: {_OT_DELAY}→{_OT_DELAY+_OT_WARMUP} | "
-    f"[Stage2] Cons: {_CONS_DELAY}→{_CONS_DELAY+_CONS_WARMUP} | "
-    f"[Stage3] Span: {_SPAN_DELAY}→{_SPAN_DELAY+_SPAN_WARMUP}"
+l_span, mean_s_mass, mean_e_mass, valid_ratio = span_projection_loss(
+    vi_start_logits[answerable_mask],
+    vi_end_logits[answerable_mask],
+    gamma[answerable_mask],
+    en_start[answerable_mask],
+    en_end[answerable_mask],
+    global_step=global_step,
+    spe=spe,
+    span_start_epoch=self.span_start_epoch,   # ← từ OTAlignmentLoss attribute
 )
-log.info(
-    f"Epoch milestones: "
-    f"Cons starts ep.{config['cons_start_epoch']} | "
-    f"Span starts ep.{config['span_start_epoch']}"
+```
+
+**Agent quyết định cách lưu `span_start_epoch` vào OTAlignmentLoss:**
+
+Option A (đơn giản nhất): Thêm `span_start_epoch: int = 5` vào `OTAlignmentLoss.__init__` và `self.span_start_epoch = span_start_epoch`.
+
+Option B: Truyền trực tiếp qua `OTAlignmentLoss.forward(... span_start_epoch: int = 5)` và forward xuống call-site — không cần lưu vào `self`.
+
+Option C: Đọc từ `config` dict nếu `forward()` đã nhận config. Không preferred vì tăng coupling.
+
+**Agent chọn option phù hợp nhất với convention hiện tại của codebase.**
+
+---
+
+### SYNC-03 — Truyền `span_start_epoch` từ `train.py` (nếu cần theo Option B)
+
+**File:** `train.py`
+**Function:** `run_training`, dòng gọi `criterion(...)`
+
+**Chỉ cần thay đổi nếu agent chọn Option B:**
+
+```python
+# TRƯỚC:
+losses = criterion(outputs, batch, global_step=global_step, spe=_SPE)
+
+# SAU (Option B):
+losses = criterion(
+    outputs, batch,
+    global_step=global_step,
+    spe=_SPE,
+    span_start_epoch=config.get("span_start_epoch", 5),
+)
+```
+
+**Nếu agent chọn Option A** (lưu vào `__init__`), cần truyền `span_start_epoch` khi khởi tạo trong `setup_model_and_criterion`:
+```python
+criterion = OTAlignmentLoss(
+    ...
+    span_start_epoch = config.get("span_start_epoch", 5),
 )
 ```
 
@@ -166,47 +157,32 @@ log.info(
 
 ## Validation — Agent tự kiểm tra
 
-- [ ] `_SPAN_DELAY > _CONS_DELAY` — assertion hoặc log warning nếu user truyền tham số vi phạm
-- [ ] `python train.py --mode train --cons_start_epoch 3 --span_start_epoch 5` — chạy không error
-- [ ] `python train.py --mode train --cons_start_epoch 2 --span_start_epoch 4` — ablation variant chạy được
-- [ ] Log output hiển thị đúng: `[Stage2] Cons: X→Y` trước `[Stage3] Span: A→B`
-- [ ] `python train.py --help` — 4 args mới xuất hiện trong help text
-- [ ] Các args cũ (`--lambda_ot`, `--lambda_span`, etc.) không bị ảnh hưởng
-- [ ] `run_overfit` và `run_overfit_full` **không bị chỉnh sửa**
+- [ ] `span_projection_loss` không còn hardcode `4` — thay bằng `span_start_epoch`
+- [ ] `is_hard_phase` với `span_start_epoch=7, spe=100, global_step=650` → `False` (epoch 6.5, chưa đến)
+- [ ] `is_hard_phase` với `span_start_epoch=7, spe=100, global_step=701` → `True` (epoch 7.01)
+- [ ] Chạy 1 forward pass với `global_step = span_start_epoch * spe + 1`: `mean_start_mass` và `mean_end_mass` được gán (có thể vẫn 0 nếu γ flat — nhưng không còn là "Phase 1 never executed Phase 2")
+- [ ] `DEFAULT_CONFIG["span_start_epoch"]` và default của `span_start_epoch` param nhất quán (đều = 5 hoặc đều được override bởi CLI arg)
+- [ ] Không có regression ở `run_overfit` và `run_overfit_full` (không trong scope nhưng kiểm tra không bị ảnh hưởng)
 
 ---
 
-## Ablation Variants Gợi ý (cho paper)
-
-| Run | `--cons_start_epoch` | `--span_start_epoch` | Mục đích |
-|---|---|---|---|
-| **Proposed** | 3 | 5 | Chiến lược đề xuất |
-| Aggressive | 2 | 4 | Bật sớm hơn 1 epoch |
-| Conservative | 4 | 7 | Cho OT nhiều thời gian hơn |
-| Simultaneous | 4 | 4 | Baseline — bật cùng lúc (config cũ) |
-| No-Cons | 99 | 5 | Ablation: bỏ Cons, chỉ Span |
-
-Chạy 5 variants này = đủ dữ liệu cho ablation table trong paper.
-
----
-
-## Ghi chú Kiến trúc
+## Ghi chú
 
 ```
-3-Stage Rocket Timeline (default):
-  Epoch 1-3:  QA + OT only
-              → XLM-R học EN span extraction
-              → OT kéo EN↔VI embeddings gần nhau
-              → γ bắt đầu có cấu trúc
+Timeline sau fix (span_start_epoch=7, cons_start_epoch=4):
 
-  Epoch 3-5:  + Cons warmup (linear 0 → lambda_cons)
-              → VI logits học hình dáng phân phối EN qua γ
-              → γ tiếp tục sắc nét nhờ OT
-              → "Gò đất" VI distribution nhô lên gần threshold
+  Epoch 1-4:  Phase 1 (soft), lambda_span=0, lambda_cons=0
+              → L_span = 0 * soft_loss = 0 (đúng — chưa bật)
+              → γ học qua L_ot
 
-  Epoch 5-7:  + Span warmup (linear 0 → lambda_span)
-              → confidence_threshold = 0.25 được vượt bởi các samples tốt
-              → span_loss != 0.0 → logits VI vót nhọn thành Start/End boundaries
+  Epoch 4-7:  Phase 1 (soft), lambda_cons warmup, lambda_span=0
+              → L_span = 0 (đúng — chưa bật)
+              → γ sắc nét dần qua OT + Cons
+              → "gò đất" VI distribution được đắp lên
 
-  Epoch 7+:   Full model — tất cả loss components ở max weight
+  Epoch 7+:   Phase 2 (hard), lambda_span warmup → 0.3
+              → γ đã có 7 epochs để học → mass vượt threshold
+              → valid_pseudo_mask có True samples
+              → span_loss > 0 ✓
+              → Metrics/OT_MeanStartMass > 0 ✓
 ```

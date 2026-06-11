@@ -254,11 +254,12 @@ def span_projection_loss(
     en_end: torch.Tensor,           # (B_ans,) — EN answer end position
     global_step: int,
     spe: int,
+    span_start_epoch: int = 5,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Curriculum Span Loss:
-      Phase 1 (step <= 4*spe): Soft supervision — dùng hàng gamma làm soft target.
-      Phase 2 (step >  4*spe): Hard pseudo-label với confidence threshold = 0.25.
+      Phase 1 (step <= span_start_epoch*spe): Soft supervision — dùng hàng gamma làm soft target.
+      Phase 2 (step >  span_start_epoch*spe): Hard pseudo-label với confidence threshold = 0.25.
     Returns: (loss, mean_start_mass, mean_end_mass, valid_ratio)
     """
     B_ans = gamma.size(0)
@@ -266,7 +267,7 @@ def span_projection_loss(
     device = gamma.device
     batch_idx = torch.arange(B_ans, device=device)
 
-    is_hard_phase = global_step > (4 * spe)
+    is_hard_phase = global_step > (span_start_epoch * spe)
 
     # Initialize metrics
     mean_start_mass = torch.tensor(0.0, device=device)
@@ -468,6 +469,7 @@ class OTAlignmentLoss(nn.Module):
         sinkhorn_iters: int = 100,       # Sinkhorn iterations       ← changed from 50  (K=50 under-converged, noisy gradients)
         span_confidence_threshold: float = 0.0,
         span_soft: bool = True,
+        span_start_epoch: int = 5,
     ):
         """
         Args:
@@ -480,6 +482,7 @@ class OTAlignmentLoss(nn.Module):
             sinkhorn_iters   : number of Sinkhorn iterations
             span_confidence_threshold : threshold for gating pseudo-labels
             span_soft        : whether to use soft span projection
+            span_start_epoch : epoch when phase 2 (hard span projection) starts
         """
         super().__init__()
         self.lambda_ot          = lambda_ot
@@ -490,6 +493,7 @@ class OTAlignmentLoss(nn.Module):
         self.sinkhorn_iters     = sinkhorn_iters
         self.span_confidence_threshold = span_confidence_threshold
         self.span_soft          = span_soft
+        self.span_start_epoch   = span_start_epoch
 
         # QA Head: shared for EN and VI, operates on full 512-token sequences
         self.qa_head = QAHead(hidden_size=hidden_size)
@@ -634,6 +638,7 @@ class OTAlignmentLoss(nn.Module):
                 en_end[answerable_mask],
                 global_step=global_step,
                 spe=spe,
+                span_start_epoch=self.span_start_epoch,
             )
         else:
             l_span = torch.tensor(0.0, device=device)

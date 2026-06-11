@@ -221,6 +221,7 @@ def setup_model_and_criterion(config: dict, device: torch.device):
         sinkhorn_epsilon    = config["sinkhorn_epsilon"],
         sinkhorn_iters      = config["sinkhorn_iters"],
         span_soft           = config.get("span_soft", True),
+        span_start_epoch    = config.get("span_start_epoch", 5),
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
