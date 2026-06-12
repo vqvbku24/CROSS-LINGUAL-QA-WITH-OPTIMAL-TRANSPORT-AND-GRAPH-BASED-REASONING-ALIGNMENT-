@@ -938,51 +938,52 @@ class Stage2Loss(nn.Module):
         lambda_ot: float   = 1.0,
         lambda_span: float = 1.0,
         lambda_cons: float = 0.5,
-        cons_delay: int    = 0,   # global step when L_cons warmup starts
-        cons_warmup: int   = 1,   # steps over which L_cons ramps to full weight
     ):
         """
         Args:
             lambda_ot    : weight for L_ot (transport cost)
             lambda_span  : weight for L_span (pseudo-label KL)
             lambda_cons  : weight for L_cons (feature consistency MSE)
-            cons_delay   : global step at which L_cons warmup begins
-            cons_warmup  : number of steps for L_cons to ramp from 0 → lambda_cons
         """
         super().__init__()
         self.lambda_ot    = lambda_ot
         self.lambda_span  = lambda_span
         self.lambda_cons  = lambda_cons
-        self.cons_delay   = cons_delay
-        self.cons_warmup  = cons_warmup
 
     def forward(
         self,
         L_ot: torch.Tensor,
         L_span: torch.Tensor,
         L_cons: torch.Tensor,
-        global_step: int,
+        epoch: int,
     ) -> dict[str, torch.Tensor]:
         """
-        Combine loss components with curriculum weighting.
+        Combine loss components with epoch-based curriculum weighting.
 
         Returns:
-            dict with "total", "ot", "span", "cons", "cons_weight"
+            dict with "total", "ot", "span", "cons", "cons_weight", "span_weight"
         """
-        w_cons = max(0.0, min(1.0,
-            (global_step - self.cons_delay) / max(self.cons_warmup, 1)
-        ))
+        if epoch == 1:
+            w_cons = 0.0
+            w_span = 0.0
+        elif epoch in [2, 3]:
+            w_cons = 1.0
+            w_span = 0.0
+        else:
+            w_cons = 1.0
+            w_span = 1.0
 
         L_total = (
-            self.lambda_ot   * L_ot
-            + self.lambda_span * L_span
+            self.lambda_ot * L_ot
+            + self.lambda_span * w_span * L_span
             + self.lambda_cons * w_cons * L_cons
         )
 
         return {
             "total":        L_total,
             "ot":           L_ot.detach(),
-            "span":         L_span.detach(),
-            "cons":         L_cons.detach(),
-            "cons_weight":  torch.tensor(w_cons),
+            "span":         (L_span.detach() * w_span),
+            "cons":         (L_cons.detach() * w_cons),
+            "cons_weight":  torch.tensor(float(w_cons)),
+            "span_weight":  torch.tensor(float(w_span)),
         }

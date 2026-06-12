@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel
+from peft import get_peft_model, LoraConfig, TaskType
 
 
 class CrossLingualOTModel(nn.Module):
@@ -31,14 +32,25 @@ class CrossLingualOTModel(nn.Module):
         super().__init__()
         self.compute_cost_matrix = compute_cost_matrix
         # Bắt buộc bật output_hidden_states=True để lấy được các layer ở giữa
-        self.backbone = AutoModel.from_pretrained(model_name, output_hidden_states=True)
-        self.hidden_size = self.backbone.config.hidden_size  # 768 (base) / 1024 (large)
+        base_backbone = AutoModel.from_pretrained(model_name, output_hidden_states=True)
+        self.hidden_size = base_backbone.config.hidden_size  # 768 (base) / 1024 (large)
+        
+        # Cấu hình LoRA
+        lora_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0.05,
+            target_modules=["query", "key", "value", "dense"]
+        )
+        
+        self.backbone = get_peft_model(base_backbone, lora_config)
         self.backbone.hidden_size = self.hidden_size         # alias for train.py compatibility
         
         # ── Trainable layer-mixing weights for layers 6, 7, 8, 9 ──
         # Initialized to ones → after softmax → equal weight (0.25 each).
         # Optimizer learns which layer combination is best for the QA+OT task.
-        self.layer_weights = nn.Parameter(torch.ones(4))
+        self.layer_weights = nn.Parameter(torch.ones(4), requires_grad=True)
 
     # ──────────────────────────────────────────────────────────
     # Forward

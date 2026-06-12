@@ -107,9 +107,18 @@ def load_stage1_checkpoint(ckpt_path: str, model, criterion, device: torch.devic
     log.info(f"Loading Stage 1 checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device)
 
-    model.load_state_dict(ckpt["model_state"])
+    # Adjust keys for PEFT wrapper
+    new_model_state = {}
+    for k, v in ckpt["model_state"].items():
+        if k.startswith("backbone."):
+            new_k = k.replace("backbone.", "backbone.base_model.model.", 1)
+            new_model_state[new_k] = v
+        else:
+            new_model_state[k] = v
+
+    model.load_state_dict(new_model_state, strict=False)
     criterion.load_state_dict(ckpt["criterion_state"])
-    log.info("  Stage 1 weights loaded (model + criterion/QA head)")
+    log.info("  Stage 1 weights loaded (model base + criterion/QA head)")
 
     en_em_baseline = ckpt.get("em", None)
     if en_em_baseline is not None:
@@ -118,12 +127,6 @@ def load_stage1_checkpoint(ckpt_path: str, model, criterion, device: torch.devic
     return en_em_baseline
 
 
-def freeze_en_backbone(model):
-    """Freeze EN backbone: disable gradients and set eval mode."""
-    for p in model.backbone.parameters():
-        p.requires_grad_(False)
-    model.backbone.eval()
-    log.info("EN backbone frozen (requires_grad=False, eval mode)")
 
 
 def freeze_qa_head(criterion):
@@ -142,16 +145,24 @@ def unfreeze_qa_head(criterion):
 
 def save_stage2_checkpoint(path: str, epoch: int, global_step: int,
                             model, criterion, optimizer, scheduler,
-                            config: dict, vi_em: float):
+                            config: dict, vi_em: float, best_vi_em: float,
+                            patience_count: int):
+    # Save only trainable parameters to save space (LoRA + layer_weights)
+    trainable_state_dict = {k: v for k, v in model.state_dict().items() if v.requires_grad}
+
     torch.save({
         "epoch"           : epoch,
         "global_step"     : global_step,
-        "model_state"     : model.state_dict(),
+        "model_state"     : trainable_state_dict,
         "criterion_state" : criterion.state_dict(),
         "optimizer_state" : optimizer.state_dict(),
         "scheduler_state" : scheduler.state_dict() if scheduler else None,
         "config"          : config,
         "vi_em"           : vi_em,
+        "best_vi_em"      : best_vi_em,
+        "patience_count"  : patience_count,
+        "rng_state_cpu"   : torch.get_rng_state(),
+        "rng_state_cuda"  : torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
     }, path)
     log.info(f"  Checkpoint saved: {path}")
 
@@ -189,7 +200,7 @@ def stage2_step(
     stage2_loss,
     epsilon: float,
     n_iters: int,
-    global_step: int,
+    epoch: int,
     device: torch.device,
 ) -> dict:
     """
@@ -209,19 +220,20 @@ def stage2_step(
 
     # ── 1. EN branch — no gradient ──────────────────────────────
     with torch.no_grad():
-        en_out = model(batch, branch="en")
-        h_en      = en_out["hidden"]       # (B, T_en, H)
-        en_mask   = ~en_out["en_pad_mask"] # True = real token
-
-        # QA head on EN to get soft pseudo-label distributions
-        en_q_emb, en_q_mask = _extract_question_embeddings(
-            h_en, batch["en_question_end"]
-        )
-        en_start_logits, en_end_logits, _ = criterion.qa_head(
-            h_en, en_q_emb, en_q_mask
-        )
-        p_en_start = F.softmax(en_start_logits, dim=-1)  # (B, T_en)
-        p_en_end   = F.softmax(en_end_logits,   dim=-1)  # (B, T_en)
+        with model.backbone.disable_adapter():
+            en_out = model(batch, branch="en")
+            h_en      = en_out["hidden"]       # (B, T_en, H)
+            en_mask   = ~en_out["en_pad_mask"] # True = real token
+    
+            # QA head on EN to get soft pseudo-label distributions
+            en_q_emb, en_q_mask = _extract_question_embeddings(
+                h_en, batch["en_question_end"]
+            )
+            en_start_logits, en_end_logits, _ = criterion.qa_head(
+                h_en, en_q_emb, en_q_mask
+            )
+            p_en_start = F.softmax(en_start_logits, dim=-1)  # (B, T_en)
+            p_en_end   = F.softmax(en_end_logits,   dim=-1)  # (B, T_en)
 
     # ── 2. VI branch — with gradient ────────────────────────────
     vi_out = model(batch, branch="vi")
@@ -253,7 +265,7 @@ def stage2_step(
     L_cons = compute_cons_loss(gamma_list, h_en, h_vi, en_mask, vi_mask)
 
     # ── 6. Combine losses with curriculum ───────────────────────
-    losses = stage2_loss(L_ot, L_span, L_cons, global_step)
+    losses = stage2_loss(L_ot, L_span, L_cons, epoch)
 
     # ── 7. Debug metrics ────────────────────────────────────────
     with torch.no_grad():
@@ -307,9 +319,7 @@ def run_stage2(config: dict):
 
     en_em_baseline = load_stage1_checkpoint(ckpt_path, model, criterion, device)
 
-    # ── Freeze EN backbone immediately ──────────────────────────
-    freeze_en_backbone(model)
-
+    # ── Verify QA Head Freeze State ─────────────────────────────
     if config.get("freeze_qa_head", False):
         freeze_qa_head(criterion)
 
@@ -331,20 +341,22 @@ def run_stage2(config: dict):
     log.info(f"XQuAD: {len(train_loader)} train batches | {len(val_pairs)} val pairs")
 
     # ── Optimizer — differential learning rates ──────────────────
-    # backbone: lr=0.0 (frozen)
+    # backbone: frozen except for LoRA parameters
     # layer_weights + QA head: stage2_head_lr (QA head frozen if freeze_qa_head is True)
+    trainable_backbone = [p for p in model.backbone.parameters() if p.requires_grad]
     if config.get("freeze_qa_head", False):
         optimizer = AdamW([
-            {"params": list(model.backbone.parameters()),  "lr": 0.0},  # frozen
+            {"params": trainable_backbone,                 "lr": config["stage2_head_lr"]},
             {"params": [model.layer_weights],              "lr": config["stage2_head_lr"]},
         ], weight_decay=config["weight_decay"])
-        log.info("Optimizer: only layer_weights trainable (QA head frozen)")
+        log.info("Optimizer: LoRA + layer_weights trainable (QA head frozen)")
     else:
         optimizer = AdamW([
-            {"params": list(model.backbone.parameters()),  "lr": 0.0},  # frozen
+            {"params": trainable_backbone,                 "lr": config["stage2_head_lr"]},
             {"params": [model.layer_weights],              "lr": config["stage2_head_lr"]},
             {"params": list(criterion.parameters()),       "lr": config["stage2_head_lr"]},
         ], weight_decay=config["weight_decay"])
+        log.info("Optimizer: LoRA + layer_weights + QA head trainable")
 
     # ── Scheduler ────────────────────────────────────────────────
     steps_per_epoch = len(train_loader)
@@ -358,20 +370,14 @@ def run_stage2(config: dict):
     )
     log.info(f"Scheduler: linear warmup {warmup_steps}/{total_steps} steps")
 
-    # ── Curriculum delays ────────────────────────────────────────
-    CONS_DELAY  = steps_per_epoch // 2   # L_cons starts after 50% of epoch 1
-    CONS_WARMUP = steps_per_epoch        # ramps over 1 full epoch
-
     stage2_loss = Stage2Loss(
         lambda_ot   = config["lambda_ot"],
         lambda_span = config["lambda_span"],
         lambda_cons = config["lambda_cons"],
-        cons_delay  = CONS_DELAY,
-        cons_warmup = CONS_WARMUP,
     ).to(device)
 
     log.info(
-        f"Curriculum: CONS_DELAY={CONS_DELAY} steps | CONS_WARMUP={CONS_WARMUP} steps"
+        f"Curriculum: Epoch-based (OT -> OT+Cons -> OT+Cons+Span)"
     )
 
     # ── TensorBoard ─────────────────────────────────────────────
@@ -387,25 +393,55 @@ def run_stage2(config: dict):
         assert any(p.requires_grad for p in criterion.qa_head.parameters()), \
             "BUG: QA head does not have requires_grad=True"
 
-    assert not any(p.requires_grad for p in model.backbone.parameters()), \
-        "BUG: EN backbone still has requires_grad=True"
+    assert any(p.requires_grad for p in model.backbone.parameters()), \
+        "BUG: Backbone has no trainable parameters (LoRA missing)"
 
     assert model.layer_weights.requires_grad, \
         "BUG: layer_weights is frozen"
 
     log.info("Ablation setup verified successfully.")
 
-    # ── Early stopping state ─────────────────────────────────────
+    # ── Initial state ───────────────────────────────────────────
+    start_epoch    = 1
     best_vi_em     = 0.0
     patience_count = 0
     global_step    = 0
 
-    # ── Training epochs ─────────────────────────────────────────
-    for epoch in range(1, config["max_epochs"] + 1):
+    # ── Resume Logic ─────────────────────────────────────────────
+    if config.get("resume_from"):
+        resume_path = config["resume_from"]
+        if os.path.exists(resume_path):
+            log.info(f"Resuming from checkpoint: {resume_path}")
+            ckpt = torch.load(resume_path, map_location=device)
+            
+            # Load states
+            model.load_state_dict(ckpt["model_state"], strict=False)
+            criterion.load_state_dict(ckpt["criterion_state"])
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+            if ckpt.get("scheduler_state") and scheduler:
+                scheduler.load_state_dict(ckpt["scheduler_state"])
+                
+            # Restore iteration state
+            start_epoch    = ckpt["epoch"] + 1
+            global_step    = ckpt["global_step"]
+            best_vi_em     = ckpt.get("best_vi_em", 0.0)
+            patience_count = ckpt.get("patience_count", 0)
+            
+            # Restore RNG state
+            if "rng_state_cpu" in ckpt:
+                torch.set_rng_state(ckpt["rng_state_cpu"])
+            if "rng_state_cuda" in ckpt and torch.cuda.is_available() and ckpt["rng_state_cuda"] is not None:
+                torch.cuda.set_rng_state(ckpt["rng_state_cuda"])
+                
+            log.info(f"  Resumed at Epoch {start_epoch}, Global Step {global_step}, Best VI EM: {best_vi_em:.2f}%")
+        else:
+            log.warning(f"Resume checkpoint not found: {resume_path}. Starting from scratch.")
 
-        # EN backbone must stay in eval mode even after model.train()
+    # ── Training epochs ─────────────────────────────────────────
+    for epoch in range(start_epoch, config["max_epochs"] + 1):
+
+        # LoRA adapter handles freeze/unfreeze automatically during forward
         model.train()
-        model.backbone.eval()   # ← spec requirement: called every epoch
         criterion.train()
 
         log.info(f"{'━'*60}")
@@ -423,7 +459,7 @@ def run_stage2(config: dict):
                 batch, model, criterion, stage2_loss,
                 epsilon=config["epsilon"],
                 n_iters=config["sinkhorn_iters"],
-                global_step=global_step,
+                epoch=epoch,
                 device=device,
             )
 
@@ -514,30 +550,33 @@ def run_stage2(config: dict):
             save_stage2_checkpoint(
                 ckpt_out, epoch, global_step,
                 model, criterion, optimizer, scheduler,
-                config, vi_em,
+                config, vi_em, best_vi_em, patience_count,
             )
 
         # ── Early stopping ────────────────────────────────────────
-        if vi_em > best_vi_em + config["min_delta_em"]:
-            best_vi_em     = vi_em
-            patience_count = 0
-            best_path = os.path.join(config["output_dir"], "stage2_best.pt")
-            save_stage2_checkpoint(
-                best_path, epoch, global_step,
-                model, criterion, optimizer, scheduler,
-                config, vi_em,
-            )
-            log.info(f"  ★ New best VI EM={vi_em:.2f}% — saved {best_path}")
-        else:
-            patience_count += 1
-            log.info(
-                f"  No improvement. Patience {patience_count}/{config['patience']}"
-            )
-            if patience_count >= config["patience"]:
-                log.info(
-                    f"Early stopping at epoch {epoch} — best VI EM={best_vi_em:.2f}%"
+        if epoch >= 4:
+            if vi_em > best_vi_em + config["min_delta_em"]:
+                best_vi_em     = vi_em
+                patience_count = 0
+                best_path = os.path.join(config["output_dir"], "stage2_best.pt")
+                save_stage2_checkpoint(
+                    best_path, epoch, global_step,
+                    model, criterion, optimizer, scheduler,
+                    config, vi_em, best_vi_em, patience_count,
                 )
-                break
+                log.info(f"  ★ New best VI EM={vi_em:.2f}% — saved {best_path}")
+            else:
+                patience_count += 1
+                log.info(
+                    f"  No improvement. Patience {patience_count}/{config['patience']}"
+                )
+                if patience_count >= config["patience"]:
+                    log.info(
+                        f"Early stopping at epoch {epoch} — best VI EM={best_vi_em:.2f}%"
+                    )
+                    break
+        else:
+            log.info(f"  Epoch {epoch} < 4. Early stopping monitoring is suspended.")
 
     writer.close()
     log.info("=" * 60)
@@ -569,6 +608,8 @@ def parse_args() -> dict:
     parser.add_argument("--log_every",      type=int,   default=STAGE2_CONFIG["log_every"])
     parser.add_argument("--freeze_qa_head", action="store_true", default=False,
                         help="Freeze QA head (ablation: pure OT backbone alignment)")
+    parser.add_argument("--resume_from",    type=str,   default=None,
+                        help="Path to Stage 2 checkpoint to resume training from")
     parser.add_argument("--en_em_safety", type=float, default=STAGE2_CONFIG["en_em_safety"],
                         help="Hard stop threshold for EN EM drop")
     args = parser.parse_args()
