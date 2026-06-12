@@ -126,6 +126,85 @@ def sinkhorn_log_domain(
 
 
 # ══════════════════════════════════════════════════════════════
+# Sliced Wasserstein Distance (SWD) — Non-Parallel Data
+# ══════════════════════════════════════════════════════════════
+
+def sliced_wasserstein_distance(
+    H_en: torch.Tensor,          # (B, T_en, H)
+    H_vi: torch.Tensor,          # (B, T_vi, H)
+    en_pad_mask: torch.Tensor,   # (B, T_en) True = PAD
+    vi_pad_mask: torch.Tensor,   # (B, T_vi) True = PAD
+    num_projections: int = 50,
+) -> torch.Tensor:
+    """
+    Sliced Wasserstein Distance for non-parallel cross-lingual alignment.
+
+    Pools all valid (non-PAD) tokens from EN and VI across the batch,
+    then computes SWD between the two token distributions.
+
+    Unlike Sinkhorn OT, SWD does NOT require parallel data — it compares
+    marginal distributions directly without token-to-token coupling.
+
+    Algorithm:
+        1. Pool valid tokens: (B, T, H) → (N, H)
+        2. L2-normalize (scale-invariant, consistent with cosine distance)
+        3. Subsample to min(N_en, N_vi) for equal-size comparison
+        4. For each random 1D projection: sort both, compute L2
+        5. Average across projections
+
+    Args:
+        H_en           : (B, T_en, H) EN hidden states
+        H_vi           : (B, T_vi, H) VI hidden states
+        en_pad_mask    : (B, T_en) True = PAD token
+        vi_pad_mask    : (B, T_vi) True = PAD token
+        num_projections: number of random 1D projections
+
+    Returns:
+        scalar SWD loss (mean over projections)
+    """
+    device = H_en.device
+    H = H_en.size(-1)
+
+    # 1. Pool valid tokens across batch: (B, T, H) → (N, H)
+    X_en = H_en[~en_pad_mask]    # (N_en, H)
+    X_vi = H_vi[~vi_pad_mask]    # (N_vi, H)
+
+    N_en, N_vi = X_en.size(0), X_vi.size(0)
+    N = min(N_en, N_vi)
+
+    if N == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    # 2. L2-normalize for scale-invariant alignment
+    X_en = F.normalize(X_en, p=2, dim=-1)
+    X_vi = F.normalize(X_vi, p=2, dim=-1)
+
+    # 3. Subsample larger set to equal size
+    if N_en > N:
+        idx = torch.randperm(N_en, device=device)[:N]
+        X_en = X_en[idx]
+    if N_vi > N:
+        idx = torch.randperm(N_vi, device=device)[:N]
+        X_vi = X_vi[idx]
+
+    # 4. Random projections on unit sphere
+    theta = torch.randn(num_projections, H, device=device, dtype=H_en.dtype)
+    theta = F.normalize(theta, p=2, dim=-1)  # (num_proj, H)
+
+    # 5. Project → sort → L2
+    proj_en = X_en @ theta.T               # (N, num_proj)
+    proj_vi = X_vi @ theta.T               # (N, num_proj)
+
+    proj_en_sorted, _ = torch.sort(proj_en, dim=0)
+    proj_vi_sorted, _ = torch.sort(proj_vi, dim=0)
+
+    # SWD = mean squared distance between sorted projections
+    swd = ((proj_en_sorted - proj_vi_sorted) ** 2).mean()
+
+    return swd
+
+
+# ══════════════════════════════════════════════════════════════
 # QA Head — Operates on Full Token Sequences (L=512)
 # ══════════════════════════════════════════════════════════════
 
@@ -293,37 +372,38 @@ def _extract_question_embeddings(
 
 class OTAlignmentLoss(nn.Module):
     """
-    Combined loss for Cross-Lingual QA with Sinkhorn OT.
+    Combined loss for Cross-Lingual QA with OT alignment.
+
+    Supports two OT methods:
+        - "swd"      : Sliced Wasserstein Distance (non-parallel data, default)
+        - "sinkhorn" : Sinkhorn OT (requires parallel data)
 
     Zero-Shot + Global OT strategy:
         L_total = L_qa + L_has_ans + λ_ot * L_ot
-
-    Contains:
-        - QAHead (trainable): cross-attention + span projections + has_answer
-        - Sinkhorn solver (non-parametric): computed each forward pass
-        - All loss computation logic
-
-    L_span and L_cons have been removed because Sinkhorn γ collapses onto
-    Topological Attractors (shared sub-word tokens across languages), producing
-    corrupted pseudo-labels that destroy span extraction capability.
     """
 
     def __init__(
         self,
-        hidden_size: int = 768,          # XLM-R hidden dimension
-        lambda_ot: float = 0.1,          # weight for OT transport cost
-        sinkhorn_epsilon: float = 0.1,  # entropic regularization
-        sinkhorn_iters: int = 100,       # Sinkhorn iterations
+        hidden_size: int = 768,
+        lambda_ot: float = 0.1,
+        ot_method: str = "swd",
+        num_projections: int = 50,
+        sinkhorn_epsilon: float = 0.1,
+        sinkhorn_iters: int = 100,
     ):
         """
         Args:
             hidden_size      : XLM-R hidden dim (768 base, 1024 large)
-            lambda_ot        : weight for L_ot (transport cost regularizer)
-            sinkhorn_epsilon : entropic regularization for Sinkhorn
-            sinkhorn_iters   : number of Sinkhorn iterations
+            lambda_ot        : weight for L_ot (OT alignment regularizer)
+            ot_method        : "swd" (Sliced Wasserstein) or "sinkhorn"
+            num_projections  : number of random projections for SWD
+            sinkhorn_epsilon : entropic regularization (sinkhorn only)
+            sinkhorn_iters   : Sinkhorn iterations (sinkhorn only)
         """
         super().__init__()
         self.lambda_ot          = lambda_ot
+        self.ot_method          = ot_method
+        self.num_projections    = num_projections
         self.sinkhorn_epsilon   = sinkhorn_epsilon
         self.sinkhorn_iters     = sinkhorn_iters
 
@@ -363,7 +443,6 @@ class OTAlignmentLoss(nn.Module):
         """
         en_hidden   = model_outputs["en_hidden"]     # (B, T_en, H)  — truncated to max valid tokens
         vi_hidden   = model_outputs["vi_hidden"]     # (B, T_vi, H)  — truncated to max valid tokens
-        C           = model_outputs["cost_matrix"]   # (B, T_en, T_vi)
         en_pad_mask = model_outputs["en_pad_mask"]   # (B, T_en)
         vi_pad_mask = model_outputs["vi_pad_mask"]   # (B, T_vi)
 
@@ -381,14 +460,21 @@ class OTAlignmentLoss(nn.Module):
         en_end   = en_end.clamp(max=en_seq_len - 1)
 
         # ══════════════════════════════════════════════════════
-        # 1. Sinkhorn OT — compute transport plan γ
+        # 1. OT Alignment — SWD or Sinkhorn
         # ══════════════════════════════════════════════════════
-        # C is already (B, T_en, T_vi) — no wasted 512-dim compute
-        gamma = sinkhorn_log_domain(
-            C, en_pad_mask, vi_pad_mask,
-            epsilon=self.sinkhorn_epsilon,
-            num_iters=self.sinkhorn_iters,
-        )  # (B, T_en, T_vi)
+        if self.ot_method == "swd":
+            l_ot = sliced_wasserstein_distance(
+                en_hidden, vi_hidden, en_pad_mask, vi_pad_mask,
+                num_projections=self.num_projections,
+            )
+        else:
+            C = model_outputs["cost_matrix"]
+            gamma = sinkhorn_log_domain(
+                C, en_pad_mask, vi_pad_mask,
+                epsilon=self.sinkhorn_epsilon,
+                num_iters=self.sinkhorn_iters,
+            )
+            l_ot = ot_transport_loss(gamma, C)
 
         # ══════════════════════════════════════════════════════
         # 2. Extract question embeddings for cross-attention
@@ -442,12 +528,7 @@ class OTAlignmentLoss(nn.Module):
             has_answer_label,
         )
 
-        # ══════════════════════════════════════════════════════
-        # 6. L_ot — transport cost regularizer
-        # ══════════════════════════════════════════════════════
-        # Gradient flows through C only (gamma is detached).
-        # This is the ONLY role of OT: pull VI space → EN space globally.
-        l_ot = ot_transport_loss(gamma, C)
+
 
         # ══════════════════════════════════════════════════════
         # 7. Total loss — Zero-Shot + Global OT
@@ -552,18 +633,26 @@ if __name__ == "__main__":
         "vi_attention_mask": vi_attn_mask,
     }
 
-    # ── Run forward ───────────────────────────────────────────
-    criterion = OTAlignmentLoss(hidden_size=H)
-    losses = criterion(mock_outputs, mock_batch)
+    # ── Test SWD mode (default) ────────────────────────────
+    print("\n--- SWD Mode ---")
+    criterion_swd = OTAlignmentLoss(hidden_size=H, ot_method="swd")
+    losses = criterion_swd(mock_outputs, mock_batch)
 
-    print("\n=== Loss Components ===")
+    print("\n=== Loss Components (SWD) ===")
     for k, v in losses.items():
         if isinstance(v, torch.Tensor):
             print(f"  {k:20s}: {v.item():.6f}")
 
-    # ── Backward pass ─────────────────────────────────────────
     losses["total"].backward()
-    print("\n[OK] Backward pass succeeded — gradient flow works!")
+    print("[OK] SWD backward pass succeeded!")
+
+    # ── Test Sinkhorn mode (backward compat) ──────────────
+    print("\n--- Sinkhorn Mode ---")
+    criterion_sink = OTAlignmentLoss(hidden_size=H, ot_method="sinkhorn")
+    losses2 = criterion_sink(mock_outputs, mock_batch)
+    print(f"  Sinkhorn l_ot: {losses2['ot'].item():.6f}")
+    losses2["total"].backward()
+    print("[OK] Sinkhorn backward pass succeeded!")
 
     # ── Verify Sinkhorn ───────────────────────────────────────
     gamma = sinkhorn_log_domain(C.detach(), en_pad, vi_pad)

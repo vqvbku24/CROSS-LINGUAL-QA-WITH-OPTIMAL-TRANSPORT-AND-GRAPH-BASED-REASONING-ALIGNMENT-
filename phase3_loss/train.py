@@ -104,6 +104,8 @@ DEFAULT_CONFIG = {
     "model_name"        : "xlm-roberta-base",
 
     # OT hyperparameters
+    "ot_method"         : "swd",
+    "num_projections"   : 50,
     "sinkhorn_epsilon"  : 0.1,
     "sinkhorn_iters"    : 100,
 
@@ -200,13 +202,18 @@ def setup_model_and_criterion(config: dict, device: torch.device):
     from phase2_model.model_core import CrossLingualOTModel
     from phase3_loss.losses import OTAlignmentLoss
 
+    ot_method = config.get("ot_method", "swd")
+
     model = CrossLingualOTModel(
         model_name=config["model_name"],
+        compute_cost_matrix=(ot_method == "sinkhorn"),
     ).to(device)
 
     criterion = OTAlignmentLoss(
         hidden_size         = model.backbone.hidden_size,
         lambda_ot           = config["lambda_ot"],
+        ot_method           = ot_method,
+        num_projections     = config.get("num_projections", 50),
         sinkhorn_epsilon    = config["sinkhorn_epsilon"],
         sinkhorn_iters      = config["sinkhorn_iters"],
     ).to(device)
@@ -739,6 +746,10 @@ def main():
     # Loss weights (only OT remains as tunable)
     parser.add_argument("--lambda_ot",   type=float, default=DEFAULT_CONFIG["lambda_ot"],
                         help="Weight for OT transport cost loss. Set=0 to disable.")
+    parser.add_argument("--ot_method",   choices=["swd", "sinkhorn"], default=DEFAULT_CONFIG["ot_method"],
+                        help="OT alignment method: 'swd' (Sliced Wasserstein) or 'sinkhorn'")
+    parser.add_argument("--num_projections", type=int, default=DEFAULT_CONFIG["num_projections"],
+                        help="Number of random projections for SWD (ignored for sinkhorn)")
 
     args = parser.parse_args()
 
@@ -756,13 +767,15 @@ def main():
         "sinkhorn_epsilon"  : args.sinkhorn_epsilon,
         "sinkhorn_iters"    : args.sinkhorn_iters,
         "lambda_ot"         : args.lambda_ot,
+        "ot_method"         : args.ot_method,
+        "num_projections"   : args.num_projections,
     })
 
     # Log ablation config
     if config["lambda_ot"] == 0.0:
         log.info("⚗️  ABLATION MODE: No OT (pure zero-shot baseline)")
     else:
-        log.info(f"🔬 Zero-Shot + Global OT: λ_ot={config['lambda_ot']}")
+        log.info(f"🔬 OT method: {config['ot_method']} | λ_ot={config['lambda_ot']}")
 
     # Initialize distributed if running with torchrun
     setup_distributed()

@@ -27,8 +27,9 @@ class CrossLingualOTModel(nn.Module):
     where T_en/T_vi = max valid tokens in the current batch — saving O(L²) memory+compute.
     """
 
-    def __init__(self, model_name: str = "xlm-roberta-base"):
+    def __init__(self, model_name: str = "xlm-roberta-base", compute_cost_matrix: bool = True):
         super().__init__()
+        self.compute_cost_matrix = compute_cost_matrix
         # Bắt buộc bật output_hidden_states=True để lấy được các layer ở giữa
         self.backbone = AutoModel.from_pretrained(model_name, output_hidden_states=True)
         self.hidden_size = self.backbone.config.hidden_size  # 768 (base) / 1024 (large)
@@ -99,32 +100,34 @@ class CrossLingualOTModel(nn.Module):
         H_en = H_en[:, :en_seq_len, :]  # (B, T_en, H)
         H_vi = H_vi[:, :vi_seq_len, :]  # (B, T_vi, H)
 
-        # ── 4. Cosine Distance Cost Matrix ─────────────────────────
-        # C[b,i,j] = 1 - cosine_sim(H_en[b,i], H_vi[b,j])
-        en_norm = F.normalize(H_en, p=2, dim=-1)   # (B, T_en, H)
-        vi_norm = F.normalize(H_vi, p=2, dim=-1)   # (B, T_vi, H)
-        C = 1.0 - torch.bmm(en_norm, vi_norm.transpose(1, 2))  # (B, T_en, T_vi)
-
-        # ── 5. PAD Masking ─────────────────────────────────────────
-        # Với truncated sequence, PAD chỉ còn ở cuối 1 số sample (batch không đồng đều)
+        # ── 4. PAD Masking ─────────────────────────────────────────
         en_pad_mask = (batch["en_attention_mask"][:, :en_seq_len] == 0)  # (B, T_en)
         vi_pad_mask = (batch["vi_attention_mask"][:, :vi_seq_len] == 0)  # (B, T_vi)
 
-        # Mask entire rows (EN PAD) and columns (VI PAD)
-        C = C.masked_fill(en_pad_mask.unsqueeze(2), 1e4)   # PAD rows  → 1e4
-        C = C.masked_fill(vi_pad_mask.unsqueeze(1), 1e4)   # PAD cols  → 1e4
-
-        # NOTE: Do NOT mask shared BPE tokens (numbers, punctuation, "Paris").
-        # Sinkhorn has doubly-stochastic marginal constraints — every token must
-        # ship exactly 1/L mass. Blocking "Paris_EN"→"Paris_VI" (cost≈0) forces
-        # that mass onto unrelated tokens, corrupting their embeddings via L_ot.
-        # Shared tokens act as natural zero-cost anchors: they satisfy their
-        # marginal cheaply with ∇≈0, freeing other tokens to find semantic matches.
-
-        return {
-            "en_hidden":   H_en,          # (B, L, H)
-            "vi_hidden":   H_vi,          # (B, L, H)
-            "cost_matrix": C,             # (B, L, L)
-            "en_pad_mask": en_pad_mask,   # (B, L)
-            "vi_pad_mask": vi_pad_mask,   # (B, L)
+        result = {
+            "en_hidden":   H_en,          # (B, T_en, H)
+            "vi_hidden":   H_vi,          # (B, T_vi, H)
+            "en_pad_mask": en_pad_mask,   # (B, T_en)
+            "vi_pad_mask": vi_pad_mask,   # (B, T_vi)
         }
+
+        # ── 5. Cosine Distance Cost Matrix (Sinkhorn only) ────────
+        if self.compute_cost_matrix:
+            en_norm = F.normalize(H_en, p=2, dim=-1)   # (B, T_en, H)
+            vi_norm = F.normalize(H_vi, p=2, dim=-1)   # (B, T_vi, H)
+            C = 1.0 - torch.bmm(en_norm, vi_norm.transpose(1, 2))  # (B, T_en, T_vi)
+
+            # Mask entire rows (EN PAD) and columns (VI PAD)
+            C = C.masked_fill(en_pad_mask.unsqueeze(2), 1e4)   # PAD rows  → 1e4
+            C = C.masked_fill(vi_pad_mask.unsqueeze(1), 1e4)   # PAD cols  → 1e4
+
+            # NOTE: Do NOT mask shared BPE tokens (numbers, punctuation, "Paris").
+            # Sinkhorn has doubly-stochastic marginal constraints — every token must
+            # ship exactly 1/L mass. Blocking "Paris_EN"→"Paris_VI" (cost≈0) forces
+            # that mass onto unrelated tokens, corrupting their embeddings via L_ot.
+            # Shared tokens act as natural zero-cost anchors: they satisfy their
+            # marginal cheaply with ∇≈0, freeing other tokens to find semantic matches.
+
+            result["cost_matrix"] = C     # (B, T_en, T_vi)
+
+        return result
