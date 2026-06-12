@@ -390,6 +390,11 @@ class OTAlignmentLoss(nn.Module):
         num_projections: int = 50,
         sinkhorn_epsilon: float = 0.1,
         sinkhorn_iters: int = 100,
+        lambda_span: float = 0.0,
+        lambda_cons: float = 0.0,
+        consistency_temperature: float = 1.0,
+        span_soft: bool = True,
+        span_start_epoch: int = 5,
     ):
         """
         Args:
@@ -406,6 +411,11 @@ class OTAlignmentLoss(nn.Module):
         self.num_projections    = num_projections
         self.sinkhorn_epsilon   = sinkhorn_epsilon
         self.sinkhorn_iters     = sinkhorn_iters
+        self.lambda_span        = lambda_span
+        self.lambda_cons        = lambda_cons
+        self.consistency_temperature = consistency_temperature
+        self.span_soft          = span_soft
+        self.span_start_epoch   = span_start_epoch
 
         # QA Head: shared for EN and VI, operates on full 512-token sequences
         self.qa_head = QAHead(hidden_size=hidden_size)
@@ -570,6 +580,8 @@ class OTAlignmentLoss(nn.Module):
             "qa_end"          : l_qa_end.detach(),
             "has_ans"         : l_has_ans.detach(),
             "ot"              : l_ot.detach(),
+            "span_proj"       : torch.tensor(0.0, device=device),
+            "cons"            : torch.tensor(0.0, device=device),
             # Debug & tracking
             "dbg/cls_start"   : cls_start,
             "dbg/max_start"   : max_start,

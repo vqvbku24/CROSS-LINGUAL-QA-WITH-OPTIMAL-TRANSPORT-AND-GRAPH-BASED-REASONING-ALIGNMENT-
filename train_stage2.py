@@ -60,7 +60,7 @@ STAGE2_CONFIG = {
 
     # OT hyperparameters
     "epsilon"         : 0.1,        # Sinkhorn regularization
-    "sinkhorn_iters"  : 50,
+    "sinkhorn_iters"  : 100,
 
     # Optimizer
     "stage2_head_lr"  : 5e-5,       # QA head + layer_weights
@@ -68,7 +68,7 @@ STAGE2_CONFIG = {
     "warmup_ratio"    : 0.06,
 
     # Training
-    "batch_size"      : 16,
+    "batch_size"      : 32,
     "max_epochs"      : 10,
     "max_grad_norm"   : 1.0,
     "max_length"      : 384,

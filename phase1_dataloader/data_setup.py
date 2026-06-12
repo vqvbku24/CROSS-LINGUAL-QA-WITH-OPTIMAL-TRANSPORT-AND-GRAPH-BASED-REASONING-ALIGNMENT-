@@ -116,7 +116,7 @@ class ListDataset(Dataset):
 def get_setup_objects(
   root_dir = "/content/drive/MyDrive/CROSS-LINGUAL-QA-WITH-OPTIMAL-TRANSPORT-AND-GRAPH-BASED-REASONING-ALIGNMENT-",
   teacher_file="dataset/Squad2.0/train-v2.0.json",
-  student_file="dataset/ViQA/ViQuAD_v2/UIT-ViQuAD_2.0/train.json",
+  student_file="dataset/xquad.vi.json",
   model_name="xlm-roberta-base"):
     """
     Load dataset local + tokenizer.
@@ -132,7 +132,7 @@ def get_setup_objects(
     student_path = os.path.join(root_dir, student_file)
 
     # Kiểm tra file tồn tại
-    for path, label in [(teacher_path, "Teacher SQuAD"), (student_path, "Student ViQuAD")]:
+    for path, label in [(teacher_path, "Teacher SQuAD"), (student_path, "Student XQuAD")]:
         if not os.path.exists(path):
             raise FileNotFoundError(
                 f"[{label}] Không tìm thấy:\n  {path}\n"
@@ -143,7 +143,7 @@ def get_setup_objects(
     teacher_dataset = ListDataset(_flatten_squad_json(teacher_path))
     print(f"  → {len(teacher_dataset):,} samples")
 
-    print("Loading Student (ViQuAD 2.0) từ local...")
+    print("Loading Student (XQuAD) từ local...")
     student_dataset = ListDataset(_flatten_squad_json(student_path))
     print(f"  → {len(student_dataset):,} samples")
 
