@@ -356,10 +356,10 @@ def run_overfit_full(config: dict, device: torch.device):
     )
 
     optimizer = AdamW([
-        {"params": backbone_params,  "lr": 1e-5},
-        {"params": layer_w_params,   "lr": 1e-4},   # layer mixing weights (6,7,8,9)
-        {"params": head_params,      "lr": 1e-4},
-    ], weight_decay=0.01)
+        {"params": backbone_params,  "lr": 1e-5, "weight_decay": 0.01},
+        {"params": layer_w_params,   "lr": 1e-4, "weight_decay": 0.0},   # layer mixing weights (6,7,8,9)
+        {"params": head_params,      "lr": 1e-4, "weight_decay": 0.0},
+    ])
 
     model.train()
     criterion.train()
@@ -482,10 +482,10 @@ def run_training(config: dict, device: torch.device):
     head_params     = list(_criterion.parameters())
 
     optimizer = AdamW([
-        {"params": backbone_params, "lr": config.get("lr", 1e-5)},
-        {"params": layer_w_params,  "lr": config.get("head_lr", 1e-4)},  # layer mixing weights
-        {"params": head_params,     "lr": config.get("head_lr", 1e-4)},
-    ], weight_decay=config["weight_decay"])
+        {"params": backbone_params, "lr": config.get("lr", 1e-5), "weight_decay": config["weight_decay"]},
+        {"params": layer_w_params,  "lr": config.get("head_lr", 1e-4), "weight_decay": 0.0},  # layer mixing weights
+        {"params": head_params,     "lr": config.get("head_lr", 1e-4), "weight_decay": 0.0},
+    ])
 
     steps_per_epoch = math.ceil(len(train_loader) / config["grad_accum_steps"])
     total_steps     = steps_per_epoch * config["max_epochs"]

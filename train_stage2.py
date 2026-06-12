@@ -109,16 +109,8 @@ def load_stage1_checkpoint(ckpt_path: str, model, criterion, device: torch.devic
     log.info(f"Loading Stage 1 checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device)
 
-    # Adjust keys for PEFT wrapper
-    new_model_state = {}
-    for k, v in ckpt["model_state"].items():
-        if k.startswith("backbone."):
-            new_k = k.replace("backbone.", "backbone.base_model.model.", 1)
-            new_model_state[new_k] = v
-        else:
-            new_model_state[k] = v
-
-    model.load_state_dict(new_model_state, strict=False)
+    # Khôi phục keys map 1-1, bỏ logic peft replace vì model chưa bọc LoRA
+    model.load_state_dict(ckpt["model_state"], strict=False)
     criterion.load_state_dict(ckpt["criterion_state"])
     log.info("  Stage 1 weights loaded (model base + criterion/QA head)")
 
@@ -253,7 +245,6 @@ def stage2_step(
     gamma_list, L_ot = sinkhorn_masked(
         h_en, h_vi, en_mask, vi_mask,
         epsilon=epsilon, n_iters=n_iters,
-        mu_override=p_en_start,
     )
 
     # ── 4. Span loss (KL pseudo-label) ──────────────────────────
@@ -311,15 +302,20 @@ def run_stage2(config: dict):
 
     model = CrossLingualOTModel(model_name=config["model_name"]).to(device)
     criterion = OTAlignmentLoss(
-        hidden_size=model.backbone.hidden_size,
+        hidden_size=model.hidden_size,
     ).to(device)
 
-    # ── Load Stage 1 checkpoint (read-only) ──────────────────────
+    # ── 1. Load Stage 1 checkpoint (trước khi bọc LoRA, keys khớp 1-1) ───────────────
     ckpt_path = config["stage1_ckpt"]
     if not os.path.isabs(ckpt_path):
         ckpt_path = os.path.join(config["root_dir"], ckpt_path)
 
     en_em_baseline = load_stage1_checkpoint(ckpt_path, model, criterion, device)
+
+    # ── 2. Apply LoRA ───────────────────────────────────────────────
+    log.info("Applying LoRA to backbone...")
+    model.apply_lora()
+    model.to(device) # Ensure new LoRA layers are on the target device
 
     # ── Verify QA Head Freeze State ─────────────────────────────
     if config.get("freeze_qa_head", False):
@@ -348,17 +344,17 @@ def run_stage2(config: dict):
     trainable_backbone = [p for p in model.backbone.parameters() if p.requires_grad]
     if config.get("freeze_qa_head", False):
         optimizer = AdamW([
-            {"params": trainable_backbone,                 "lr": config["stage2_head_lr"]},
-            {"params": [model.layer_weights],              "lr": config["stage2_head_lr"]},
-        ], weight_decay=config["weight_decay"])
-        log.info("Optimizer: LoRA + layer_weights trainable (QA head frozen)")
+            {"params": trainable_backbone,           "lr": config["stage2_head_lr"], "weight_decay": config["weight_decay"]},
+            {"params": [model.layer_weights],        "lr": config["stage2_head_lr"], "weight_decay": 0.0},
+        ])
+        log.info("Optimizer: LoRA (with decay) + layer_weights (no decay). QA head frozen.")
     else:
         optimizer = AdamW([
-            {"params": trainable_backbone,                 "lr": config["stage2_head_lr"]},
-            {"params": [model.layer_weights],              "lr": config["stage2_head_lr"]},
-            {"params": list(criterion.parameters()),       "lr": config["stage2_head_lr"]},
-        ], weight_decay=config["weight_decay"])
-        log.info("Optimizer: LoRA + layer_weights + QA head trainable")
+            {"params": trainable_backbone,           "lr": config["stage2_head_lr"], "weight_decay": config["weight_decay"]},
+            {"params": [model.layer_weights],        "lr": config["stage2_head_lr"], "weight_decay": 0.0},
+            {"params": list(criterion.parameters()), "lr": config["stage2_head_lr"], "weight_decay": 0.0},
+        ])
+        log.info("Optimizer: LoRA (with decay) + layer_weights (no decay) + QA head (no decay).")
 
     # ── Scheduler ────────────────────────────────────────────────
     steps_per_epoch = len(train_loader)
@@ -468,7 +464,8 @@ def run_stage2(config: dict):
             losses["total"].backward()
 
             # Clip gradients (exclude non-trainable parameters to be clean)
-            trainable_params = [p for p in [model.layer_weights] + list(criterion.parameters()) if p.requires_grad]
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            trainable_params += [p for p in criterion.parameters() if p.requires_grad]
             torch.nn.utils.clip_grad_norm_(trainable_params, config["max_grad_norm"])
 
             optimizer.step()
