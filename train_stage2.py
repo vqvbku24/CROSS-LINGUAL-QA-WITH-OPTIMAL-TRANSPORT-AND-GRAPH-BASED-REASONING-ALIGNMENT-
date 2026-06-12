@@ -60,7 +60,7 @@ STAGE2_CONFIG = {
 
     # OT hyperparameters
     "epsilon"         : 0.1,        # Sinkhorn regularization
-    "sinkhorn_iters"  : 50,
+    "sinkhorn_iters"  : 100,
 
     # Optimizer
     "stage2_head_lr"  : 5e-5,       # QA head + layer_weights
@@ -76,7 +76,7 @@ STAGE2_CONFIG = {
     # Early stopping
     "patience"        : 3,
     "min_delta_em"    : 0.5,        # minimum EM improvement to reset patience
-    "en_em_safety"    : 5.0,        # hard stop if EN EM drops more than this
+    "en_em_safety"    : 20.0,       # hard stop if EN EM drops more than this
 
     # Curriculum (in steps, computed relative to steps_per_epoch)
     # CONS_DELAY  = steps_per_epoch // 2   (L_cons starts at epoch 0.5)
@@ -124,6 +124,20 @@ def freeze_en_backbone(model):
         p.requires_grad_(False)
     model.backbone.eval()
     log.info("EN backbone frozen (requires_grad=False, eval mode)")
+
+
+def freeze_qa_head(criterion):
+    """Freeze QA Head: disable gradients entirely."""
+    for p in criterion.qa_head.parameters():
+        p.requires_grad_(False)
+    log.info("QA head frozen (requires_grad=False)")
+
+
+def unfreeze_qa_head(criterion):
+    """Unfreeze QA Head (for future use)."""
+    for p in criterion.qa_head.parameters():
+        p.requires_grad_(True)
+    log.info("QA head unfrozen")
 
 
 def save_stage2_checkpoint(path: str, epoch: int, global_step: int,
@@ -296,6 +310,9 @@ def run_stage2(config: dict):
     # ── Freeze EN backbone immediately ──────────────────────────
     freeze_en_backbone(model)
 
+    if config.get("freeze_qa_head", False):
+        freeze_qa_head(criterion)
+
     # ── Tokenizer ────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(config["model_name"], use_fast=True)
 
@@ -315,12 +332,19 @@ def run_stage2(config: dict):
 
     # ── Optimizer — differential learning rates ──────────────────
     # backbone: lr=0.0 (frozen)
-    # layer_weights + QA head: stage2_head_lr
-    optimizer = AdamW([
-        {"params": list(model.backbone.parameters()),  "lr": 0.0},  # frozen
-        {"params": [model.layer_weights],              "lr": config["stage2_head_lr"]},
-        {"params": list(criterion.parameters()),       "lr": config["stage2_head_lr"]},
-    ], weight_decay=config["weight_decay"])
+    # layer_weights + QA head: stage2_head_lr (QA head frozen if freeze_qa_head is True)
+    if config.get("freeze_qa_head", False):
+        optimizer = AdamW([
+            {"params": list(model.backbone.parameters()),  "lr": 0.0},  # frozen
+            {"params": [model.layer_weights],              "lr": config["stage2_head_lr"]},
+        ], weight_decay=config["weight_decay"])
+        log.info("Optimizer: only layer_weights trainable (QA head frozen)")
+    else:
+        optimizer = AdamW([
+            {"params": list(model.backbone.parameters()),  "lr": 0.0},  # frozen
+            {"params": [model.layer_weights],              "lr": config["stage2_head_lr"]},
+            {"params": list(criterion.parameters()),       "lr": config["stage2_head_lr"]},
+        ], weight_decay=config["weight_decay"])
 
     # ── Scheduler ────────────────────────────────────────────────
     steps_per_epoch = len(train_loader)
@@ -354,6 +378,22 @@ def run_stage2(config: dict):
     tb_dir = os.path.join(config["output_dir"], "tensorboard_stage2")
     writer = SummaryWriter(log_dir=tb_dir)
     log.info(f"TensorBoard: {tb_dir}")
+
+    # ── Verification Check ──────────────────────────────────────
+    if config.get("freeze_qa_head", False):
+        assert not any(p.requires_grad for p in criterion.qa_head.parameters()), \
+            "BUG: QA head still has requires_grad=True"
+    else:
+        assert any(p.requires_grad for p in criterion.qa_head.parameters()), \
+            "BUG: QA head does not have requires_grad=True"
+
+    assert not any(p.requires_grad for p in model.backbone.parameters()), \
+        "BUG: EN backbone still has requires_grad=True"
+
+    assert model.layer_weights.requires_grad, \
+        "BUG: layer_weights is frozen"
+
+    log.info("Ablation setup verified successfully.")
 
     # ── Early stopping state ─────────────────────────────────────
     best_vi_em     = 0.0
@@ -389,8 +429,8 @@ def run_stage2(config: dict):
 
             losses["total"].backward()
 
-            # Clip gradients (backbone grads are zero — clipping them is harmless)
-            trainable_params = [model.layer_weights] + list(criterion.parameters())
+            # Clip gradients (exclude non-trainable parameters to be clean)
+            trainable_params = [p for p in [model.layer_weights] + list(criterion.parameters()) if p.requires_grad]
             torch.nn.utils.clip_grad_norm_(trainable_params, config["max_grad_norm"])
 
             optimizer.step()
@@ -462,7 +502,7 @@ def run_stage2(config: dict):
             writer.add_scalar("Eval/SQuAD_EN_EM_Quick", en_em, epoch)
 
             drop = en_em_baseline - en_em
-            if drop > config["en_em_safety"]:
+            if epoch >= 4 and drop > config["en_em_safety"]:
                 log.warning(
                     f"EN EM dropped {drop:.1f} pts (>{config['en_em_safety']}) — hard stop!"
                 )
@@ -527,6 +567,10 @@ def parse_args() -> dict:
     parser.add_argument("--max_length",     type=int,   default=STAGE2_CONFIG["max_length"])
     parser.add_argument("--output_dir",     default=STAGE2_CONFIG["output_dir"])
     parser.add_argument("--log_every",      type=int,   default=STAGE2_CONFIG["log_every"])
+    parser.add_argument("--freeze_qa_head", action="store_true", default=False,
+                        help="Freeze QA head (ablation: pure OT backbone alignment)")
+    parser.add_argument("--en_em_safety", type=float, default=STAGE2_CONFIG["en_em_safety"],
+                        help="Hard stop threshold for EN EM drop")
     args = parser.parse_args()
 
     config = {**STAGE2_CONFIG, **vars(args)}

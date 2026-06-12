@@ -688,7 +688,7 @@ def sinkhorn_masked(
     en_mask: torch.Tensor,    # BoolTensor (B, L_en) — True = real token
     vi_mask: torch.Tensor,    # BoolTensor (B, L_vi) — True = real token
     epsilon: float = 0.1,
-    n_iters: int = 50,
+    n_iters: int = 100,
     mu_override: torch.Tensor | None = None,
 ) -> tuple[list[torch.Tensor], torch.Tensor]:
     """
@@ -764,10 +764,10 @@ def sinkhorn_masked(
         gamma_b = torch.exp(log_u[:, None] + log_K + log_v[None, :])  # [n_en, n_vi]
         
         with torch.no_grad():
-            row_sum = gamma_b.sum(dim=1)   # should be ~1/n_en for all rows
-            col_sum = gamma_b.sum(dim=0)   # should be ~1/n_vi for all cols
-            row_err = (row_sum - 1.0/n_en).abs().max().item()
-            col_err = (col_sum - 1.0/n_vi).abs().max().item()
+            row_sum = gamma_b.sum(dim=1)   # should be ~mu
+            col_sum = gamma_b.sum(dim=0)   # should be ~nu
+            row_err = (row_sum - mu).abs().max().item()
+            col_err = (col_sum - nu).abs().max().item()
             if row_err > 1e-3 or col_err > 1e-3:
                 print(f"  [Sinkhorn NOT converged] row_err={row_err:.6f} col_err={col_err:.6f}")
             else:

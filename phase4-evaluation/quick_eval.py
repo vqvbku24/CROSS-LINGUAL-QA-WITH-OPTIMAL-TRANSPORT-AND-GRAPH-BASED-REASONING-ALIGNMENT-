@@ -183,3 +183,122 @@ def quick_em_xquad_vi(
 
     return (correct / total * 100) if total > 0 else 0.0
 
+
+if __name__ == "__main__":
+    import argparse
+    from phase2_model.model_core import CrossLingualOTModel
+    from phase3_loss.losses import OTAlignmentLoss
+    from transformers import AutoTokenizer
+
+    parser = argparse.ArgumentParser(description="Quick Evaluation Runner")
+    parser.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint")
+    parser.add_argument("--eval_file", type=str, required=True, help="Path to evaluation SQuAD JSON file")
+    parser.add_argument("--n_samples", type=int, default=180, help="Number of samples to evaluate")
+    parser.add_argument("--model_name", type=str, default="xlm-roberta-base", help="Model name")
+    parser.add_argument("--max_length", type=int, default=384, help="Max length")
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+
+    # Initialize model and criterion
+    model = CrossLingualOTModel(model_name=args.model_name).to(device)
+    criterion = OTAlignmentLoss(hidden_size=model.backbone.hidden_size).to(device)
+
+    print(f"Loading checkpoint from: {args.ckpt}")
+    if not os.path.exists(args.ckpt):
+        # Fallback helper: check if maybe it's in checkpoint/best.pt
+        alt_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "checkpoint", "best.pt")
+        if os.path.exists(alt_path):
+            print(f"Checkpoint {args.ckpt} not found. Falling back to {alt_path}")
+            args.ckpt = alt_path
+        else:
+            raise FileNotFoundError(f"Checkpoint not found: {args.ckpt}")
+
+    ckpt = torch.load(args.ckpt, map_location=device)
+    
+    # Check if checkpoint has dict keys or is direct state dict
+    if "model_state" in ckpt:
+        model.load_state_dict(ckpt["model_state"], strict=False)
+        if "criterion_state" in ckpt and ckpt["criterion_state"] is not None:
+            criterion.load_state_dict(ckpt["criterion_state"], strict=False)
+    else:
+        model.load_state_dict(ckpt, strict=False)
+    print("Checkpoint loaded.")
+
+    print(f"Loading data from {args.eval_file}...")
+    data = load_squad_data(args.eval_file)
+    if args.n_samples > 0:
+        data = data[:args.n_samples]
+    print(f"Loaded {len(data)} samples for evaluation.")
+
+    # Evaluate exact match
+    model.eval()
+    criterion.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for i, item in enumerate(data):
+            question = item["question"]
+            context = item["context"]
+            ground_truths = item["answer"].get("text", [])
+
+            # Tokenize
+            input_ids, attn_mask, _, _, q_end = process_qa_sample(
+                question=question,
+                context=context,
+                answer=None,
+                tokenizer=tokenizer,
+                max_length=args.max_length,
+                doc_stride=128,
+            )
+            input_ids = input_ids.unsqueeze(0).to(device)
+            attn_mask = attn_mask.unsqueeze(0).to(device)
+            q_end_val = q_end.item()
+
+            # Forward backbone
+            out = model.backbone(input_ids, attn_mask)
+            target_layers = [6, 7, 8, 9]
+            stacked = torch.stack([out.hidden_states[l] for l in target_layers], dim=0)
+            weights = torch.softmax(model.layer_weights, dim=0).view(4, 1, 1, 1)
+            hidden = (stacked * weights).sum(dim=0)
+
+            # Question embeddings
+            q_emb = hidden[:, :q_end_val + 1, :]
+            q_mask = torch.zeros(1, q_end_val + 1, dtype=torch.bool, device=device)
+
+            # Predict logits
+            start_logits, end_logits, _ = criterion.qa_head(hidden, q_emb, q_mask)
+
+            # Decode span
+            MAX_ANSWER_LEN = 30
+            start_idx = start_logits[0].argmax().item()
+            end_logits_masked = end_logits[0].clone()
+            end_logits_masked[:start_idx] = float('-inf')
+            end_logits_masked[start_idx + MAX_ANSWER_LEN:] = float('-inf')
+            end_idx = end_logits_masked.argmax().item()
+
+            pred_ids = input_ids[0][start_idx: end_idx + 1]
+            pred_span = tokenizer.decode(pred_ids, skip_special_tokens=True).strip()
+
+            is_correct = _exact_match_score(pred_span, ground_truths)
+            if is_correct:
+                correct += 1
+            total += 1
+
+            if (i + 1) % 20 == 0 or (i + 1) == len(data):
+                print(f"Processed {i+1}/{len(data)} | Current EM: {correct/total*100:.2f}%")
+
+    final_em = (correct / total * 100) if total > 0 else 0.0
+    print(f"\n========================================")
+    print(f"Evaluation Complete!")
+    print(f"File: {args.eval_file}")
+    print(f"Checkpoint: {args.ckpt}")
+    print(f"Samples: {total}")
+    print(f"Exact Match (EM): {final_em:.2f}%")
+    print(f"========================================")
+
