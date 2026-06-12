@@ -257,7 +257,7 @@ def create_xquad_dataloaders(
         val_pairs    : raw val pair dicts (for string-level EM eval)
     """
     xquad_vi_path = os.path.join(root_dir, "dataset", "xquad.vi.json")
-    xquad_en_path = os.path.join(root_dir, "dataset", "Squad2.0", "dev-v2.0.json")
+    xquad_en_path = os.path.join(root_dir, "dataset", "xquad.en.json")
 
     if not os.path.exists(xquad_vi_path):
         raise FileNotFoundError(f"XQuAD VI not found: {xquad_vi_path}")

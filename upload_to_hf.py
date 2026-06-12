@@ -11,13 +11,11 @@ def main():
         return
     
     api = HfApi(token=token)
-    repo_id = "vinhhippo/OT_2"
+    repo_id = "vinhvo1205/Sinkhorn_2_stages"
     
     # Các thư mục chứa checkpoint cần upload
     folders_to_upload = [
-        "checkpoints_no_cons", 
-        "checkpoints_no_span", 
-        "checkpoints_baseline"
+        "checkpoints"
     ]
     
     print(f"Bắt đầu đồng bộ các checkpoints lên repo: {repo_id}")

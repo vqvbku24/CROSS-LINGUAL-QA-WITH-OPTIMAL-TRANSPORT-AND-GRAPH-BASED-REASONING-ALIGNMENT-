@@ -59,8 +59,8 @@ STAGE2_CONFIG = {
     "lambda_cons"     : 0.5,
 
     # OT hyperparameters
-    "epsilon"         : 0.1,        # Sinkhorn regularization
-    "sinkhorn_iters"  : 100,
+    "epsilon"         : 0.5,        # Sinkhorn regularization
+    "sinkhorn_iters"  : 300,
 
     # Optimizer
     "stage2_head_lr"  : 5e-5,       # QA head + layer_weights
@@ -225,6 +225,7 @@ def stage2_step(
     gamma_list, L_ot = sinkhorn_masked(
         h_en, h_vi, en_mask, vi_mask,
         epsilon=epsilon, n_iters=n_iters,
+        mu_override=p_en_start,
     )
 
     # ── 4. Span loss (KL pseudo-label) ──────────────────────────
@@ -243,10 +244,21 @@ def stage2_step(
     # ── 7. Debug metrics ────────────────────────────────────────
     with torch.no_grad():
         g_entropy = gamma_entropy(gamma_list)
-        if g_entropy > 6.0:
-            log.warning(f"  [Gamma] High entropy={g_entropy:.2f} — transport plan approaching uniform")
-        elif g_entropy < 0.5:
-            log.warning(f"  [Gamma] Low entropy={g_entropy:.2f} — transport plan may be collapsed")
+        
+        # Sửa thành — threshold động theo H_max của batch
+        import math
+        # Tính n_en, n_vi trung bình của batch
+        avg_n_en = en_mask.sum(dim=1).float().mean().item()
+        avg_n_vi = vi_mask.sum(dim=1).float().mean().item()
+        h_max = math.log(max(avg_n_en * avg_n_vi, 1.0)) # Add max() to avoid log(0)
+        h_ratio = g_entropy / h_max if h_max > 0 else 0
+
+        if h_ratio > 0.90:
+            log.warning(f"  [Gamma] entropy ratio={h_ratio:.2f} (H={g_entropy:.2f}/H_max={h_max:.2f}) — near uniform")
+        elif h_ratio < 0.30:
+            log.warning(f"  [Gamma] entropy ratio={h_ratio:.2f} — may be collapsed")
+        else:
+            log.info(f"  [Gamma] entropy ratio={h_ratio:.2f} H={g_entropy:.2f} — healthy")
 
     losses["gamma_entropy"] = g_entropy
     return losses

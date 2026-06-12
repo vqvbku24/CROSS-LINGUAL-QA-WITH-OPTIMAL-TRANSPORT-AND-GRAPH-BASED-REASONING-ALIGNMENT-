@@ -158,9 +158,11 @@ def run_stage1(config):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", "--epoch", dest="epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--mode", type=str, default="train")
+    parser.add_argument("--hf_repo_id", type=str, default="")
     args = parser.parse_args()
 
     config = {
@@ -171,6 +173,8 @@ if __name__ == "__main__":
         "lr": args.lr,
         "head_lr": 8e-5,
         "weight_decay": 0.01,
-        "epochs": args.epochs
+        "epochs": args.epochs,
+        "mode": args.mode,
+        "hf_repo_id": args.hf_repo_id
     }
     run_stage1(config)

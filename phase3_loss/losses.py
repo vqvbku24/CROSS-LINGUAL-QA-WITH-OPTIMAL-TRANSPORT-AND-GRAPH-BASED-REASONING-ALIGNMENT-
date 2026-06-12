@@ -689,6 +689,7 @@ def sinkhorn_masked(
     vi_mask: torch.Tensor,    # BoolTensor (B, L_vi) — True = real token
     epsilon: float = 0.1,
     n_iters: int = 50,
+    mu_override: torch.Tensor | None = None,
 ) -> tuple[list[torch.Tensor], torch.Tensor]:
     """
     Per-sample log-domain Sinkhorn on non-PAD tokens only.
@@ -704,6 +705,7 @@ def sinkhorn_masked(
         vi_mask : (B, L_vi)    — True for real tokens
         epsilon : entropic regularization
         n_iters : Sinkhorn iterations
+        mu_override: (B, L_en) softmax probabilities to replace uniform mu
 
     Returns:
         gamma_list : List[B] of Tensor[n_en_i, n_vi_i] — one per sample
@@ -737,8 +739,13 @@ def sinkhorn_masked(
         h_vi_n = F.normalize(h_vi_b, dim=-1)
         C = 1.0 - h_en_n @ h_vi_n.T    # [n_en, n_vi]
 
-        # Uniform marginals
-        mu = torch.full((n_en,), 1.0 / n_en, device=C.device, dtype=C.dtype)
+        # Marginals
+        if mu_override is not None:
+            mu = mu_override[b][en_idx]          # [n_en]
+            mu = mu / (mu.sum() + 1e-8)          # renormalize on real tokens
+        else:
+            mu = torch.full((n_en,), 1.0 / n_en, device=C.device, dtype=C.dtype)
+            
         nu = torch.full((n_vi,), 1.0 / n_vi, device=C.device, dtype=C.dtype)
 
         # Log-domain Sinkhorn (numerically stable)
@@ -751,6 +758,17 @@ def sinkhorn_masked(
             log_v = torch.log(nu) - torch.logsumexp(log_K + log_u[:, None], dim=0)
 
         gamma_b = torch.exp(log_u[:, None] + log_K + log_v[None, :])  # [n_en, n_vi]
+        
+        with torch.no_grad():
+            row_sum = gamma_b.sum(dim=1)   # should be ~1/n_en for all rows
+            col_sum = gamma_b.sum(dim=0)   # should be ~1/n_vi for all cols
+            row_err = (row_sum - 1.0/n_en).abs().max().item()
+            col_err = (col_sum - 1.0/n_vi).abs().max().item()
+            if row_err > 1e-3 or col_err > 1e-3:
+                print(f"  [Sinkhorn NOT converged] row_err={row_err:.6f} col_err={col_err:.6f}")
+            else:
+                print(f"  [Sinkhorn OK] row_err={row_err:.6f} col_err={col_err:.6f} H={-(gamma_b*(gamma_b.clamp(min=1e-10)).log()).sum().item():.2f}")
+
         gamma_list.append(gamma_b)
         costs.append((gamma_b * C).sum())
 
@@ -885,7 +903,7 @@ def gamma_entropy(gamma_list: list[torch.Tensor]) -> float:
     """
     entropies = []
     for gamma_b in gamma_list:
-        H = -(gamma_b * (gamma_b + 1e-10).log()).sum()
+        H = -(gamma_b * (gamma_b.clamp(min=1e-10)).log()).sum()
         entropies.append(H.item())
     return sum(entropies) / len(entropies) if entropies else 0.0
 
