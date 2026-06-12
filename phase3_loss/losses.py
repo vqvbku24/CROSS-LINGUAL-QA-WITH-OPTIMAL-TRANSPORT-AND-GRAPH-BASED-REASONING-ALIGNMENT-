@@ -741,8 +741,12 @@ def sinkhorn_masked(
 
         # Marginals
         if mu_override is not None:
-            mu = mu_override[b][en_idx]          # [n_en]
-            mu = mu / (mu.sum() + 1e-8)          # renormalize on real tokens
+            mu = mu_override[b].index_select(0, en_idx)          # [n_en]
+            # Guard: nếu tất cả = 0 (degenerate), fallback uniform
+            if mu.sum() < 1e-6:
+                mu = torch.full((n_en,), 1.0 / n_en, device=C.device, dtype=C.dtype)
+            else:
+                mu = mu / (mu.sum() + 1e-8)          # renormalize on real tokens
         else:
             mu = torch.full((n_en,), 1.0 / n_en, device=C.device, dtype=C.dtype)
             
@@ -771,6 +775,10 @@ def sinkhorn_masked(
 
         gamma_list.append(gamma_b)
         costs.append((gamma_b * C).sum())
+
+    if not costs:
+        device = h_en.device
+        return [], torch.tensor(0.0, device=device, requires_grad=True)
 
     swd_loss = torch.stack(costs).mean()
     return gamma_list, swd_loss

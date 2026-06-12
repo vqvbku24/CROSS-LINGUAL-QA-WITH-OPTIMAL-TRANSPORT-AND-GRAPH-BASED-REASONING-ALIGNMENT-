@@ -59,8 +59,8 @@ STAGE2_CONFIG = {
     "lambda_cons"     : 0.5,
 
     # OT hyperparameters
-    "epsilon"         : 0.5,        # Sinkhorn regularization
-    "sinkhorn_iters"  : 300,
+    "epsilon"         : 0.1,        # Sinkhorn regularization
+    "sinkhorn_iters"  : 50,
 
     # Optimizer
     "stage2_head_lr"  : 5e-5,       # QA head + layer_weights
