@@ -802,3 +802,289 @@ if __name__ == "__main__":
     print(f"[Sinkhorn] PAD row mass (should be ~0): {row_sums[0, 400:410].tolist()}")
     print(f"[Sinkhorn] Valid row mass (should be ~1/400): {row_sums[0, :5].tolist()}")
     print("\n[OK] All checks passed!")
+
+
+# ══════════════════════════════════════════════════════════════
+# STAGE 2 — Teacher-Student Sinkhorn Alignment Loss Functions
+# Added below; existing Stage 1 code above is NOT modified.
+# ══════════════════════════════════════════════════════════════
+
+
+def sinkhorn_masked(
+    h_en: torch.Tensor,       # (B, L_en, D)
+    h_vi: torch.Tensor,       # (B, L_vi, D)
+    en_mask: torch.Tensor,    # BoolTensor (B, L_en) — True = real token
+    vi_mask: torch.Tensor,    # BoolTensor (B, L_vi) — True = real token
+    epsilon: float = 0.1,
+    n_iters: int = 50,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """
+    Per-sample log-domain Sinkhorn on non-PAD tokens only.
+
+    Unlike the batched sinkhorn_log_domain above, this operates per-sample
+    on the actual valid tokens (masking out PAD entirely), which gives exact
+    uniform marginals without PAD pollution.
+
+    Args:
+        h_en    : (B, L_en, D) — EN hidden states (frozen backbone)
+        h_vi    : (B, L_vi, D) — VI hidden states (trainable)
+        en_mask : (B, L_en)    — True for real tokens
+        vi_mask : (B, L_vi)    — True for real tokens
+        epsilon : entropic regularization
+        n_iters : Sinkhorn iterations
+
+    Returns:
+        gamma_list : List[B] of Tensor[n_en_i, n_vi_i] — one per sample
+        swd_loss   : scalar — mean OT transport cost across batch (for L_ot)
+
+    Note: gamma_b is NOT detached here. L_ot needs gradient through cost.
+          Detach happens selectively in compute_cons_loss only.
+    """
+    B = h_en.size(0)
+    gamma_list = []
+    costs = []
+
+    for b in range(B):
+        en_idx = en_mask[b].nonzero(as_tuple=True)[0]
+        vi_idx = vi_mask[b].nonzero(as_tuple=True)[0]
+        h_en_b = h_en[b].index_select(0, en_idx)   # [n_en, D] — gradient-safe
+        h_vi_b = h_vi[b].index_select(0, vi_idx)   # [n_vi, D] — gradient-safe
+
+        n_en, n_vi = h_en_b.size(0), h_vi_b.size(0)
+
+        # Guard: skip degenerate sequences
+        if n_en == 0 or n_vi == 0:
+            device = h_en.device
+            dummy_gamma = torch.zeros(max(n_en, 1), max(n_vi, 1), device=device)
+            gamma_list.append(dummy_gamma)
+            costs.append(torch.tensor(0.0, device=device, requires_grad=True))
+            continue
+
+        # Cost matrix: cosine distance ∈ [0, 2]
+        h_en_n = F.normalize(h_en_b, dim=-1)
+        h_vi_n = F.normalize(h_vi_b, dim=-1)
+        C = 1.0 - h_en_n @ h_vi_n.T    # [n_en, n_vi]
+
+        # Uniform marginals
+        mu = torch.full((n_en,), 1.0 / n_en, device=C.device, dtype=C.dtype)
+        nu = torch.full((n_vi,), 1.0 / n_vi, device=C.device, dtype=C.dtype)
+
+        # Log-domain Sinkhorn (numerically stable)
+        log_K  = -C / epsilon                                        # [n_en, n_vi]
+        log_u  = torch.zeros(n_en, device=C.device, dtype=C.dtype)
+        log_v  = torch.zeros(n_vi, device=C.device, dtype=C.dtype)
+
+        for _ in range(n_iters):
+            log_u = torch.log(mu) - torch.logsumexp(log_K + log_v[None, :], dim=1)
+            log_v = torch.log(nu) - torch.logsumexp(log_K + log_u[:, None], dim=0)
+
+        gamma_b = torch.exp(log_u[:, None] + log_K + log_v[None, :])  # [n_en, n_vi]
+        gamma_list.append(gamma_b)
+        costs.append((gamma_b * C).sum())
+
+    swd_loss = torch.stack(costs).mean()
+    return gamma_list, swd_loss
+
+
+def compute_span_loss(
+    gamma_list: list[torch.Tensor],
+    p_en_start: torch.Tensor,     # (B, L_en) — softmax from frozen EN QA head
+    p_en_end: torch.Tensor,       # (B, L_en)
+    vi_logits_start: torch.Tensor, # (B, L_vi) — raw logits from trainable VI QA head
+    vi_logits_end: torch.Tensor,   # (B, L_vi)
+    en_mask: torch.Tensor,        # (B, L_en) — True = real token
+    vi_mask: torch.Tensor,        # (B, L_vi) — True = real token
+) -> torch.Tensor:
+    """
+    L_span = KL(pseudo_vi || vi_pred) — pseudo-labels derived from γᵀ @ p_en.
+
+    Pseudo-labels are detached (they are targets, not parameters).
+    Gradient flows only through vi_logits_*.
+
+    Args:
+        gamma_list      : List[B] of Tensor[n_en_i, n_vi_i]
+        p_en_start      : (B, L_en) — EN start probabilities (softmax, no grad)
+        p_en_end        : (B, L_en) — EN end probabilities (softmax, no grad)
+        vi_logits_start : (B, L_vi) — VI start raw logits
+        vi_logits_end   : (B, L_vi) — VI end raw logits
+        en_mask         : (B, L_en)
+        vi_mask         : (B, L_vi)
+
+    Returns:
+        scalar L_span
+    """
+    B = len(gamma_list)
+    kl_losses = []
+
+    for b in range(B):
+        gamma_b = gamma_list[b].detach()                      # [n_en, n_vi] — pseudo-label target, no gradient needed
+        n_en    = en_mask[b].sum().item()
+        n_vi    = vi_mask[b].sum().item()
+
+        if n_en == 0 or n_vi == 0:
+            continue
+
+        # Project EN probabilities → VI space
+        en_idx       = en_mask[b].nonzero(as_tuple=True)[0]
+        p_en_start_b = p_en_start[b].index_select(0, en_idx) # [n_en]
+        p_en_end_b   = p_en_end[b].index_select(0, en_idx)   # [n_en]
+
+        pseudo_start = gamma_b.T @ p_en_start_b              # [n_vi]
+        pseudo_end   = gamma_b.T @ p_en_end_b                # [n_vi]
+
+        # Normalize — γ rows ≈ 1/n_valid; projection may have small numerical drift
+        pseudo_start = pseudo_start / (pseudo_start.sum() + 1e-8)
+        pseudo_end   = pseudo_end   / (pseudo_end.sum()   + 1e-8)
+
+        # VI predictions on real tokens only
+        vi_idx         = vi_mask[b].nonzero(as_tuple=True)[0]
+        vi_log_p_start = F.log_softmax(vi_logits_start[b].index_select(0, vi_idx), dim=-1)
+        vi_log_p_end   = F.log_softmax(vi_logits_end[b].index_select(0, vi_idx),   dim=-1)
+
+        # KL(pseudo || vi_pred) — pseudo is the "true" distribution; detach = fixed target
+        kl_s = F.kl_div(vi_log_p_start, pseudo_start.detach(), reduction="sum")
+        kl_e = F.kl_div(vi_log_p_end,   pseudo_end.detach(),   reduction="sum")
+        kl_losses.append((kl_s + kl_e) / 2.0)
+
+    if not kl_losses:
+        device = vi_logits_start.device
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    return torch.stack(kl_losses).mean()
+
+
+def compute_cons_loss(
+    gamma_list: list[torch.Tensor],
+    h_en: torch.Tensor,    # (B, L_en, D) — frozen EN hidden states
+    h_vi: torch.Tensor,    # (B, L_vi, D) — trainable VI hidden states
+    en_mask: torch.Tensor, # (B, L_en) — True = real token
+    vi_mask: torch.Tensor, # (B, L_vi) — True = real token
+) -> torch.Tensor:
+    """
+    L_cons = MSE(h_vi, (γᵀ @ h_en).detach())
+
+    Feature-space consistency: prevents VI hidden states from drifting
+    away from EN space. γ acts as soft alignment.
+
+    The target is explicitly detached:
+      - EN backbone is frozen, so gradient through h_en is dropped anyway.
+      - Explicit detach makes intent clear and prevents silent no-ops.
+
+    Returns:
+        scalar L_cons
+    """
+    B = len(gamma_list)
+    mse_losses = []
+
+    for b in range(B):
+        gamma_b = gamma_list[b]               # [n_en, n_vi]
+        en_idx  = en_mask[b].nonzero(as_tuple=True)[0]
+        vi_idx  = vi_mask[b].nonzero(as_tuple=True)[0]
+        h_en_b  = h_en[b].index_select(0, en_idx)   # [n_en, D]
+        h_vi_b  = h_vi[b].index_select(0, vi_idx)   # [n_vi, D] — gradient-safe
+
+        if h_en_b.size(0) == 0 or h_vi_b.size(0) == 0:
+            continue
+
+        # Target: EN features projected to VI positions via γ (DETACHED — must)
+        target = (gamma_b.T @ h_en_b).detach()   # [n_vi, D]
+
+        mse_losses.append(F.mse_loss(h_vi_b, target))
+
+    if not mse_losses:
+        device = h_vi.device
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    return torch.stack(mse_losses).mean()
+
+
+def gamma_entropy(gamma_list: list[torch.Tensor]) -> float:
+    """
+    Returns mean entropy of transport plans across batch.
+
+    Healthy range: 2.0 – 4.0 (depends on sequence length).
+    Alert if: entropy > 6.0 (approaching uniform) or < 0.5 (collapsed).
+
+    Args:
+        gamma_list: List[B] of Tensor[n_en_i, n_vi_i]
+
+    Returns:
+        float — mean entropy
+    """
+    entropies = []
+    for gamma_b in gamma_list:
+        H = -(gamma_b * (gamma_b + 1e-10).log()).sum()
+        entropies.append(H.item())
+    return sum(entropies) / len(entropies) if entropies else 0.0
+
+
+class Stage2Loss(nn.Module):
+    """
+    Stage 2 combined loss: L_ot + L_span + w_cons * L_cons
+
+    Reuses the QA head from Stage 1 (weights loaded from Stage 1 checkpoint).
+    The qa_head is passed in at construction time — it is NOT re-instantiated here.
+    This allows Stage 2 to start from the EN-trained QA head and adapt it to VI.
+
+    Usage in training loop:
+        gamma_list, L_ot = sinkhorn_masked(h_en, h_vi, en_mask, vi_mask, ε, K)
+        L_span           = compute_span_loss(gamma_list, p_en_start, p_en_end,
+                                             vi_logits_start, vi_logits_end,
+                                             en_mask, vi_mask)
+        L_cons           = compute_cons_loss(gamma_list, h_en, h_vi, en_mask, vi_mask)
+        L_total          = self.forward(L_ot, L_span, L_cons, global_step)
+    """
+
+    def __init__(
+        self,
+        lambda_ot: float   = 1.0,
+        lambda_span: float = 1.0,
+        lambda_cons: float = 0.5,
+        cons_delay: int    = 0,   # global step when L_cons warmup starts
+        cons_warmup: int   = 1,   # steps over which L_cons ramps to full weight
+    ):
+        """
+        Args:
+            lambda_ot    : weight for L_ot (transport cost)
+            lambda_span  : weight for L_span (pseudo-label KL)
+            lambda_cons  : weight for L_cons (feature consistency MSE)
+            cons_delay   : global step at which L_cons warmup begins
+            cons_warmup  : number of steps for L_cons to ramp from 0 → lambda_cons
+        """
+        super().__init__()
+        self.lambda_ot    = lambda_ot
+        self.lambda_span  = lambda_span
+        self.lambda_cons  = lambda_cons
+        self.cons_delay   = cons_delay
+        self.cons_warmup  = cons_warmup
+
+    def forward(
+        self,
+        L_ot: torch.Tensor,
+        L_span: torch.Tensor,
+        L_cons: torch.Tensor,
+        global_step: int,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Combine loss components with curriculum weighting.
+
+        Returns:
+            dict with "total", "ot", "span", "cons", "cons_weight"
+        """
+        w_cons = max(0.0, min(1.0,
+            (global_step - self.cons_delay) / max(self.cons_warmup, 1)
+        ))
+
+        L_total = (
+            self.lambda_ot   * L_ot
+            + self.lambda_span * L_span
+            + self.lambda_cons * w_cons * L_cons
+        )
+
+        return {
+            "total":        L_total,
+            "ot":           L_ot.detach(),
+            "span":         L_span.detach(),
+            "cons":         L_cons.detach(),
+            "cons_weight":  torch.tensor(w_cons),
+        }

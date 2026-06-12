@@ -43,7 +43,7 @@ class CrossLingualOTModel(nn.Module):
     # Forward
     # ──────────────────────────────────────────────────────────
 
-    def forward(self, batch: dict) -> dict:
+    def forward(self, batch: dict, branch: str = "both") -> dict:
         """
         Args:
             batch keys:
@@ -51,23 +51,41 @@ class CrossLingualOTModel(nn.Module):
                 vi_input_ids, vi_attention_mask : (B, L)
                 en_start_position, en_end_position : (B,) — answer span (EN only)
                 en_question_end, vi_question_end   : (B,) — index of first [SEP]
+            branch: "both" (default, Stage 1 behavior), "en", or "vi"
+                "en"  — only process en_input_ids/en_attention_mask
+                        returns {"hidden": h_en, "en_pad_mask": ..., "en_seq_len": ...}
+                "vi"  — only process vi_input_ids/vi_attention_mask
+                        returns {"hidden": h_vi, "vi_pad_mask": ..., "vi_seq_len": ...}
+                "both" — full Stage 1 behavior (unchanged)
 
         Returns:
-            dict with:
-                en_hidden    : (B, T_en, H)    — XLM-R weighted hidden states for EN
-                vi_hidden    : (B, T_vi, H)    — XLM-R weighted hidden states for VI
-                cost_matrix  : (B, T_en, T_vi) — cosine distance with PAD masking
-                en_pad_mask  : (B, T_en)       — True where EN token is PAD
-                vi_pad_mask  : (B, T_vi)       — True where VI token is PAD
-                en_seq_len   : int             — effective EN length T_en (≤ 512)
-                vi_seq_len   : int             — effective VI length T_vi (≤ 512)
-
-        Dynamic Truncation:
-            T_en = max non-PAD token count across batch for EN (= attention_mask.sum.max)
-            T_vi = same for VI
-            Reduces Sinkhorn cost from (B,512,512) → (B,T_en,T_vi). For typical QA
-            sequences (~200-350 tokens) this saves ~50-75% of OT compute.
+            branch="both": dict with en_hidden, vi_hidden, cost_matrix, en_pad_mask, vi_pad_mask
+            branch="en":   dict with hidden, en_pad_mask, en_seq_len
+            branch="vi":   dict with hidden, vi_pad_mask, vi_seq_len
         """
+        if branch == "en":
+            out = self.backbone(batch["en_input_ids"], batch["en_attention_mask"])
+            target_layers = [6, 7, 8, 9]
+            stacked = torch.stack([out.hidden_states[i] for i in target_layers], dim=0)
+            weights = torch.softmax(self.layer_weights, dim=0).view(4, 1, 1, 1)
+            H = (stacked * weights).sum(dim=0)
+            seq_len = int(batch["en_attention_mask"].sum(dim=1).max().item())
+            H = H[:, :seq_len, :]
+            pad_mask = (batch["en_attention_mask"][:, :seq_len] == 0)
+            return {"hidden": H, "en_pad_mask": pad_mask, "en_seq_len": seq_len}
+
+        if branch == "vi":
+            out = self.backbone(batch["vi_input_ids"], batch["vi_attention_mask"])
+            target_layers = [6, 7, 8, 9]
+            stacked = torch.stack([out.hidden_states[i] for i in target_layers], dim=0)
+            weights = torch.softmax(self.layer_weights, dim=0).view(4, 1, 1, 1)
+            H = (stacked * weights).sum(dim=0)
+            seq_len = int(batch["vi_attention_mask"].sum(dim=1).max().item())
+            H = H[:, :seq_len, :]
+            pad_mask = (batch["vi_attention_mask"][:, :seq_len] == 0)
+            return {"hidden": H, "vi_pad_mask": pad_mask, "vi_seq_len": seq_len}
+
+        # ── branch="both" — Stage 1 behavior (unchanged) ────────────────
         # ── 1. Shared Backbone ─────────────────────────────────────
         out_en = self.backbone(batch["en_input_ids"], batch["en_attention_mask"])
         out_vi = self.backbone(batch["vi_input_ids"], batch["vi_attention_mask"])
