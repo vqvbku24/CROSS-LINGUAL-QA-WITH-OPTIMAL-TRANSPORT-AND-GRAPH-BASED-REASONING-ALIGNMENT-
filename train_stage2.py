@@ -89,7 +89,9 @@ STAGE2_CONFIG = {
     # Paths
     "root_dir"        : os.path.dirname(os.path.abspath(__file__)),
     "output_dir"      : os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoint_stage2"),
+    "hf_repo_id"      : "",
 }
+
 
 
 # ──────────────────────────────────────────────────────────────
@@ -553,6 +555,31 @@ def run_stage2(config: dict):
                 config, vi_em, best_vi_em, patience_count,
             )
 
+            # Upload to Hugging Face
+            if config.get("hf_repo_id"):
+                try:
+                    from huggingface_hub import HfApi
+                    api = HfApi(token=os.environ.get("HF_TOKEN"))
+                    output_basename = os.path.basename(os.path.normpath(config["output_dir"])) or "checkpoint_stage2"
+                    log.info(f"   Uploading epoch checkpoint to Hugging Face ({config['hf_repo_id']})...")
+                    api.upload_file(
+                        path_or_fileobj=ckpt_out,
+                        path_in_repo=f"{output_basename}/stage2_epoch_{epoch:03d}.pt",
+                        repo_id=config["hf_repo_id"],
+                        repo_type="model"
+                    )
+                    if writer is not None:
+                        api.upload_folder(
+                            folder_path=tb_dir,
+                            path_in_repo=f"logs/{output_basename}_tensorboard",
+                            repo_id=config["hf_repo_id"],
+                            repo_type="model"
+                        )
+                    log.info("   ✅ Epoch checkpoint & TensorBoard logs uploaded successfully!")
+                except Exception as e:
+                    log.error(f"   Upload epoch checkpoint error (local file still safe): {e}")
+
+
         # ── Early stopping ────────────────────────────────────────
         if epoch >= 4:
             if vi_em > best_vi_em + config["min_delta_em"]:
@@ -565,6 +592,24 @@ def run_stage2(config: dict):
                     config, vi_em, best_vi_em, patience_count,
                 )
                 log.info(f"  ★ New best VI EM={vi_em:.2f}% — saved {best_path}")
+
+                # Upload best checkpoint to Hugging Face
+                if config.get("hf_repo_id"):
+                    try:
+                        from huggingface_hub import HfApi
+                        api = HfApi(token=os.environ.get("HF_TOKEN"))
+                        output_basename = os.path.basename(os.path.normpath(config["output_dir"])) or "checkpoint_stage2"
+                        log.info(f"   Uploading best checkpoint to Hugging Face...")
+                        api.upload_file(
+                            path_or_fileobj=best_path,
+                            path_in_repo=f"{output_basename}/stage2_best.pt",
+                            repo_id=config["hf_repo_id"],
+                            repo_type="model"
+                        )
+                        log.info("   ✅ Best checkpoint uploaded successfully!")
+                    except Exception as e:
+                        log.error(f"   Upload best checkpoint error: {e}")
+
             else:
                 patience_count += 1
                 log.info(
@@ -612,7 +657,10 @@ def parse_args() -> dict:
                         help="Path to Stage 2 checkpoint to resume training from")
     parser.add_argument("--en_em_safety", type=float, default=STAGE2_CONFIG["en_em_safety"],
                         help="Hard stop threshold for EN EM drop")
+    parser.add_argument("--hf_repo_id",    type=str,   default=STAGE2_CONFIG["hf_repo_id"],
+                        help="HuggingFace repo ID for auto backup of checkpoints/logs")
     args = parser.parse_args()
+
 
     config = {**STAGE2_CONFIG, **vars(args)}
     return config
