@@ -226,8 +226,6 @@ def stage2_step(
             en_start_logits, en_end_logits, _ = criterion.qa_head(
                 h_en, en_q_emb, en_q_mask
             )
-            p_en_start = F.softmax(en_start_logits, dim=-1)  # (B, T_en)
-            p_en_end   = F.softmax(en_end_logits,   dim=-1)  # (B, T_en)
 
     # ── 2. VI branch — with gradient ────────────────────────────
     vi_out = model(batch, branch="vi")
@@ -249,7 +247,7 @@ def stage2_step(
 
     # ── 4. Span loss (KL pseudo-label) ──────────────────────────
     L_span = compute_span_loss(
-        gamma_list, p_en_start, p_en_end,
+        gamma_list, en_start_logits, en_end_logits,
         vi_start_logits, vi_end_logits,
         en_mask, vi_mask,
     )

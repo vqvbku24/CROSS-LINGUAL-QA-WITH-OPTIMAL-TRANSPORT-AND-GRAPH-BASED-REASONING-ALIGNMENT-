@@ -769,9 +769,9 @@ def sinkhorn_masked(
             row_err = (row_sum - mu).abs().max().item()
             col_err = (col_sum - nu).abs().max().item()
             if row_err > 1e-3 or col_err > 1e-3:
-                print(f"  [Sinkhorn NOT converged] row_err={row_err:.6f} col_err={col_err:.6f}")
-            else:
-                print(f"  [Sinkhorn OK] row_err={row_err:.6f} col_err={col_err:.6f} H={-(gamma_b*(gamma_b.clamp(min=1e-10)).log()).sum().item():.2f}")
+                pass # log.warning(f"  [Sinkhorn NOT converged] row_err={row_err:.6f} col_err={col_err:.6f}")
+            # else:
+            #     print(f"  [Sinkhorn OK] row_err={row_err:.6f} col_err={col_err:.6f} H={-(gamma_b*(gamma_b.clamp(min=1e-10)).log()).sum().item():.2f}")
 
         gamma_list.append(gamma_b)
         costs.append((gamma_b * C).sum())
@@ -786,8 +786,8 @@ def sinkhorn_masked(
 
 def compute_span_loss(
     gamma_list: list[torch.Tensor],
-    p_en_start: torch.Tensor,     # (B, L_en) — softmax from frozen EN QA head
-    p_en_end: torch.Tensor,       # (B, L_en)
+    en_logits_start: torch.Tensor,     # (B, L_en) — frozen EN QA head
+    en_logits_end: torch.Tensor,       # (B, L_en)
     vi_logits_start: torch.Tensor, # (B, L_vi) — raw logits from trainable VI QA head
     vi_logits_end: torch.Tensor,   # (B, L_vi)
     en_mask: torch.Tensor,        # (B, L_en) — True = real token
@@ -824,8 +824,10 @@ def compute_span_loss(
 
         # Project EN probabilities → VI space
         en_idx       = en_mask[b].nonzero(as_tuple=True)[0]
-        p_en_start_b = p_en_start[b].index_select(0, en_idx) # [n_en]
-        p_en_end_b   = p_en_end[b].index_select(0, en_idx)   # [n_en]
+        
+        # Calculate softmax ONLY on valid EN tokens to avoid probability mass leaking to PAD tokens
+        p_en_start_b = F.softmax(en_logits_start[b].index_select(0, en_idx), dim=-1) # [n_en]
+        p_en_end_b   = F.softmax(en_logits_end[b].index_select(0, en_idx), dim=-1)   # [n_en]
 
         pseudo_start = gamma_b.T @ p_en_start_b              # [n_vi]
         pseudo_end   = gamma_b.T @ p_en_end_b                # [n_vi]
@@ -885,7 +887,9 @@ def compute_cons_loss(
             continue
 
         # Target: EN features projected to VI positions via γ (DETACHED — must)
-        target = (gamma_b.T @ h_en_b).detach()   # [n_vi, D]
+        # We must divide by the column sum of gamma to properly normalize the barycentric projection
+        col_sum = gamma_b.sum(dim=0).unsqueeze(1).clamp(min=1e-8)
+        target = ((gamma_b.T @ h_en_b) / col_sum).detach()   # [n_vi, D]
 
         mse_losses.append(F.mse_loss(h_vi_b, target))
 
