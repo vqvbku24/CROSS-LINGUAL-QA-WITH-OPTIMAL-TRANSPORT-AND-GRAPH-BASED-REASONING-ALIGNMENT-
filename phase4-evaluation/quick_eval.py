@@ -64,6 +64,11 @@ def quick_em(model, criterion, tokenizer, dev_file, n_samples=200, device="cuda"
             start_logits[0].masked_fill_(padding_mask, float('-inf'))
             end_logits[0].masked_fill_(padding_mask, float('-inf'))
 
+            # Mask out question tokens (từ index 0 đến q_end_val)
+            question_mask = torch.arange(start_logits.size(1), device=device) <= q_end_val
+            start_logits[0].masked_fill_(question_mask, float('-inf'))
+            end_logits[0].masked_fill_(question_mask, float('-inf'))
+
             # Mask end positions: only allow [start_idx, start_idx + MAX_ANSWER_LEN]
             MAX_ANSWER_LEN = 30
             start_idx = start_logits[0].argmax().item()
@@ -191,6 +196,11 @@ def quick_em_xquad_vi(
             start_logits[0].masked_fill_(padding_mask, float("-inf"))
             end_logits[0].masked_fill_(padding_mask, float("-inf"))
 
+            # Mask out question tokens (từ index 0 đến q_end_val)
+            question_mask = torch.arange(start_logits.size(1), device=device) <= q_end_val
+            start_logits[0].masked_fill_(question_mask, float('-inf'))
+            end_logits[0].masked_fill_(question_mask, float('-inf'))
+
             # Constrain end to [start, start + max_answer_len]
             start_idx = start_logits[0].argmax().item()
             end_logits_masked = end_logits[0].clone()
@@ -303,6 +313,11 @@ if __name__ == "__main__":
             padding_mask = (attn_mask[0] == 0)
             start_logits[0].masked_fill_(padding_mask, float('-inf'))
             end_logits[0].masked_fill_(padding_mask, float('-inf'))
+
+            # Mask out question tokens (từ index 0 đến q_end_val)
+            question_mask = torch.arange(start_logits.size(1), device=device) <= q_end_val
+            start_logits[0].masked_fill_(question_mask, float('-inf'))
+            end_logits[0].masked_fill_(question_mask, float('-inf'))
 
             # Decode span
             MAX_ANSWER_LEN = 30

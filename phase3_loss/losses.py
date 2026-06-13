@@ -758,8 +758,9 @@ def sinkhorn_masked(
         log_v  = torch.zeros(n_vi, device=C.device, dtype=C.dtype)
 
         for _ in range(n_iters):
-            log_u = torch.log(mu) - torch.logsumexp(log_K + log_v[None, :], dim=1)
-            log_v = torch.log(nu) - torch.logsumexp(log_K + log_u[:, None], dim=0)
+            # Clamp mu and nu to prevent log(0) -> -inf
+            log_u = torch.log(mu.clamp(min=1e-8)) - torch.logsumexp(log_K + log_v[None, :], dim=1)
+            log_v = torch.log(nu.clamp(min=1e-8)) - torch.logsumexp(log_K + log_u[:, None], dim=0)
 
         gamma_b = torch.exp(log_u[:, None] + log_K + log_v[None, :])  # [n_en, n_vi]
         

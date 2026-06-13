@@ -1,33 +1,42 @@
-**Nhiệm vụ:**
-Hãy viết cho tôi một module Python tên là `squad_parallel_loader.py` dùng để tạo PyTorch `Dataset` và `DataLoader` phục vụ cho việc huấn luyện mô hình học sâu với dữ liệu song song (Parallel Data) Anh - Việt.
+### BUGFIX_SPEC.md: Khắc phục lỗi rò rỉ Question và crash Sinkhorn
 
-**Nguồn dữ liệu:**
-1. Tập tiếng Anh: SQuaD2.0
-2. Tập tiếng Việt: `AIForge/vietnamese-squad`
+#### 1. Bug 1.1: Rò rỉ Logits vào Question Tokens
 
-**Yêu cầu cốt lõi về Logic Dóng hàng (Alignment Logic):**
-Tập tiếng Việt là bản dịch của tập tiếng Anh, nhưng để đảm bảo an toàn tuyệt đối, KHÔNG được map theo thứ tự dòng (zip). Bắt buộc phải dóng hàng (align) dựa trên cột `id`:
-- Biến tập tiếng Anh thành một Dictionary với key là `id` để tra cứu với độ phức tạp O(1).
-- Duyệt qua tập tiếng Việt, lấy `id` đi tra cứu trong Dictionary tiếng Anh. Nếu khớp, đưa cặp (English_item, Vietnamese_item) này vào danh sách dữ liệu song song.
+* **File ảnh hưởng:** `quick_eval.py`
+* **Hàm cần sửa:** `quick_em` và `quick_em_xquad_vi`
+* **Vấn đề:** Model hiện tại chỉ mask các padding tokens (`attn_mask == 0`), dẫn đến việc QA head có thể trích xuất nhầm các token nằm trong câu hỏi thay vì context (vi phạm nguyên tắc extractive QA).
+* **Giải pháp:** Bổ sung `question_mask` dựa trên `q_end_val` để ép logits của vùng câu hỏi về $-\infty$.
+* **Chi tiết triển khai:**
+Chèn đoạn code sau ngay bên dưới logic `padding_mask`:
+```python
+# Mask out padding tokens
+padding_mask = (attn_mask[0] == 0)
+start_logits[0].masked_fill_(padding_mask, float('-inf'))
+end_logits[0].masked_fill_(padding_mask, float('-inf'))
 
-**Yêu cầu xử lý trong hàm `__getitem__`:**
-Đối với mỗi cặp song song lấy được, thực hiện các bước sau:
-1. Lấy ra `question` và `context` của cả bản EN và VI (Lưu ý dùng `.get()` để phòng hờ trường hợp tên cột bị viết hoa chữ cái đầu như `Question` hay `Context`).
-2. Tokenize nhánh EN (Question + Context) bằng biến `self.tokenizer` được truyền vào từ class. Yêu cầu: `truncation=True`, `padding="max_length"`, `return_tensors="pt"`.
-3. Tokenize nhánh VI tương tự như trên.
-4. **Đặc biệt quan trọng:** Tìm vị trí index của token `[SEP]` (sử dụng `self.tokenizer.sep_token_id`) đầu tiên xuất hiện trong chuỗi `input_ids`. Mục đích là để phân tách ranh giới giữa câu hỏi và đoạn văn bản. Lưu index này vào các biến `en_question_end` và `vi_question_end`. Nếu không tìm thấy, trả về 0.
+# [NEW] Mask out question tokens (từ index 0 đến q_end_val)
+question_mask = torch.arange(start_logits.size(1), device=device) <= q_end_val
+start_logits[0].masked_fill_(question_mask, float('-inf'))
+end_logits[0].masked_fill_(question_mask, float('-inf'))
 
-**Định dạng Output của `__getitem__`:**
-Hàm phải trả về một dictionary chính xác với các keys sau (tất cả là 1D tensor sau khi bỏ đi chiều batch đầu tiên):
-- `"en_input_ids"`
-- `"en_attention_mask"`
-- `"en_question_end"`
-- `"vi_input_ids"`
-- `"vi_attention_mask"`
-- `"vi_question_end"`
+```
 
-**Yêu cầu về DataLoader:**
-Viết thêm một hàm `create_squad_parallel_dataloaders(tokenizer, batch_size=32, max_length=384)` trả về `train_loader` và đối tượng `dataset`. DataLoader BẮT BUỘC phải có `shuffle=True`, `num_workers=4` và `pin_memory=True`.
 
-**Log & Debug:**
-Sử dụng thư viện `logging` (mức INFO) để in ra các bước đang chạy (ví dụ: đang tải dữ liệu, đang map ID, và kết quả cuối cùng tìm được bao nhiêu cặp song song). Code cần gọn gàng, có comment giải thích rõ ràng.
+
+#### 2. Bug 1.2: Rủi ro $\log(0)$ sinh ra $-\infty$ trong Sinkhorn Log-domain
+
+* **File ảnh hưởng:** `losses.py`
+* **Hàm cần sửa:** `sinkhorn_masked`
+* **Vấn đề:** Trong trường hợp `mu_override` được kích hoạt và chứa các giá trị tiệm cận hoặc bằng 0, phép toán `torch.log(mu)` sẽ trả về $-\infty$. Điều này gây ra lỗi `NaN` ở các bước tính toán `logsumexp` tiếp theo, làm sụp đổ toàn bộ gradient của batch.
+* **Giải pháp:** Thêm hàm `.clamp(min=1e-8)` vào `mu` (tương tự như đã làm với `nu` nếu cần thiết) để đảm bảo an toàn số học.
+* **Chi tiết triển khai:**
+Sửa đổi dòng tính `log_u` (khoảng dòng 761):
+```python
+# [OLD]
+# log_u = torch.log(mu) - torch.logsumexp(log_K + log_v[None, :], dim=1)
+
+# [NEW] Clamp mu để tránh log(0) -> -inf
+log_u = torch.log(mu.clamp(min=1e-8)) - torch.logsumexp(log_K + log_v[None, :], dim=1)
+
+# Giữ nguyên log_v hoặc kẹp thêm nu cho đồng bộ tính an toàn
+log_v = torch.log(nu.clamp(min=1e-8)) - torch.logsumexp(log_K + log_u[:, None], dim=0)
