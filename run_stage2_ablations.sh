@@ -33,14 +33,8 @@ python3 -u "$BASE/train_stage2.py" $COMMON_ARGS \
     --freeze_qa_head \
     --output_dir "$BASE/checkpoints/run_ot_only" 2>&1 | tee "$BASE/run_stage2_ot_only.log"
 
-# ── 3. No Consistency Loss (λ_cons = 0.0) ──
-echo "=== Run 3: NO CONSISTENCY LOSS ==="
-python3 -u "$BASE/train_stage2.py" $COMMON_ARGS \
-    --lambda_cons 0.0 \
-    --output_dir "$BASE/checkpoints/run_no_cons" 2>&1 | tee "$BASE/run_stage2_no_cons.log"
-
-# ── 4. No Span Loss (λ_span = 0.0) ──
-echo "=== Run 4: NO SPAN LOSS ==="
+# ── 3. No Span Loss (λ_span = 0.0) ──
+echo "=== Run 3: NO SPAN LOSS ==="
 python3 -u "$BASE/train_stage2.py" $COMMON_ARGS \
     --lambda_span 0.0 \
     --output_dir "$BASE/checkpoints/run_no_span" 2>&1 | tee "$BASE/run_stage2_no_span.log"

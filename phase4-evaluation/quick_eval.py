@@ -235,7 +235,7 @@ if __name__ == "__main__":
 
     # Initialize model and criterion
     model = CrossLingualOTModel(model_name=args.model_name).to(device)
-    criterion = OTAlignmentLoss(hidden_size=model.backbone.hidden_size).to(device)
+    criterion = OTAlignmentLoss(hidden_size=model.hidden_size).to(device)
 
     print(f"Loading checkpoint from: {args.ckpt}")
     if not os.path.exists(args.ckpt):

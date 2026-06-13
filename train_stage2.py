@@ -55,11 +55,11 @@ STAGE2_CONFIG = {
 
     # Loss weights
     "lambda_ot"       : 1.0,
-    "lambda_span"     : 1.0,
-    "lambda_cons"     : 0.5,
+    "lambda_reg"      : 10.0,   # EN consistency regularisation (paper: 50, start lower for encoder)
+    "lambda_span"     : 0.0,    # Disabled — gamma too uniform for reliable pseudo-labels
 
     # OT hyperparameters
-    "epsilon"         : 0.05,       # Sinkhorn regularization
+    "epsilon"         : 0.1,    # Restored to paper default (0.05 hurts XSQuAD per ablation)
     "sinkhorn_iters"  : 100,
 
     # Optimizer
@@ -79,8 +79,6 @@ STAGE2_CONFIG = {
     "en_em_safety"    : 20.0,       # hard stop if EN EM drops more than this
 
     # Curriculum (in steps, computed relative to steps_per_epoch)
-    # CONS_DELAY  = steps_per_epoch // 2   (L_cons starts at epoch 0.5)
-    # CONS_WARMUP = steps_per_epoch        (ramps over 1 full epoch)
 
     # Logging
     "log_every"       : 50,
@@ -198,39 +196,46 @@ def stage2_step(
     device: torch.device,
 ) -> dict:
     """
-    One Stage 2 training step with two forward passes:
-      1. EN branch (no_grad) → h_en, p_en_start, p_en_end
-      2. VI branch (with grad) → h_vi, vi_logits_*
+    One Stage 2 training step with THREE forward passes (per paper):
+      1. EN branch — LoRA OFF, no_grad  → h_en_frz  (frozen anchor)
+      2. EN branch — LoRA ON,  with_grad → h_en_lora (for L_Reg)
+      3. VI branch — LoRA ON,  with_grad → h_vi
 
-    Then: sinkhorn_masked → compute_span_loss + compute_cons_loss → Stage2Loss.
+    Loss = λ_ot * L_ot + λ_reg * L_reg
+    L_reg prevents LoRA shared weights from drifting EN representations.
 
     Returns:
         dict with all loss tensors and debug info
     """
     from phase3_loss.losses import (
-        sinkhorn_masked, compute_span_loss, compute_cons_loss, gamma_entropy,
-        _extract_question_embeddings,
+        sinkhorn_masked, compute_span_loss,
+        compute_reg_loss, gamma_entropy, _extract_question_embeddings,
     )
 
-    # ── 1. EN branch — no gradient ──────────────────────────────
+    # ── 1. EN branch — LoRA OFF, no gradient (frozen anchor) ────
     with torch.no_grad():
         with model.backbone.disable_adapter():
-            en_out = model(batch, branch="en")
-            h_en      = en_out["hidden"]       # (B, T_en, H)
-            en_mask   = ~en_out["en_pad_mask"] # True = real token
-    
-            # QA head on EN to get soft pseudo-label distributions
+            en_frz_out = model(batch, branch="en")
+            h_en_frz   = en_frz_out["hidden"]        # (B, T_en, H) — detached anchor
+            en_mask    = ~en_frz_out["en_pad_mask"]  # (B, T_en) True = real token
+
+            # QA head on frozen EN → pseudo-label logits (for L_span if ever used)
             en_q_emb, en_q_mask = _extract_question_embeddings(
-                h_en, batch["en_question_end"]
+                h_en_frz, batch["en_question_end"]
             )
             en_start_logits, en_end_logits, _ = criterion.qa_head(
-                h_en, en_q_emb, en_q_mask
+                h_en_frz, en_q_emb, en_q_mask
             )
 
-    # ── 2. VI branch — with gradient ────────────────────────────
-    vi_out = model(batch, branch="vi")
+    # ── 2. EN branch — LoRA ON, with gradient (for L_Reg) ───────
+    # NOTE: LoRA is ON here — gradient flows through LoRA weights via L_Reg
+    en_lora_out = model(batch, branch="en")
+    h_en_lora   = en_lora_out["hidden"]   # (B, T_en, H) — has gradient
+
+    # ── 3. VI branch — LoRA ON, with gradient ───────────────────
+    vi_out    = model(batch, branch="vi")
     h_vi      = vi_out["hidden"]           # (B, T_vi, H)
-    vi_mask   = ~vi_out["vi_pad_mask"]     # True = real token
+    vi_mask   = ~vi_out["vi_pad_mask"]     # (B, T_vi) True = real token
 
     vi_q_emb, vi_q_mask = _extract_question_embeddings(
         h_vi, batch["vi_question_end"]
@@ -239,39 +244,39 @@ def stage2_step(
         h_vi, vi_q_emb, vi_q_mask
     )
 
-    # ── 3. Sinkhorn OT ──────────────────────────────────────────
+    # ── 4. Sinkhorn OT (uses frozen h_en_frz as anchor) ─────────
     gamma_list, L_ot = sinkhorn_masked(
-        h_en, h_vi, en_mask, vi_mask,
+        h_en_frz, h_vi, en_mask, vi_mask,
         epsilon=epsilon, n_iters=n_iters,
     )
 
-    # ── 4. Span loss (KL pseudo-label) ──────────────────────────
+    # ── 5. EN Consistency Regularisation (KEY NEW LOSS) ─────────
+    L_reg = compute_reg_loss(h_en_lora, h_en_frz, en_mask)
+
+    # ── 6. Span loss (disabled by default, kept for ablation) ────
     L_span = compute_span_loss(
         gamma_list, en_start_logits, en_end_logits,
         vi_start_logits, vi_end_logits,
         en_mask, vi_mask,
     )
 
-    # ── 5. Consistency loss (feature MSE) ───────────────────────
-    L_cons = compute_cons_loss(gamma_list, h_en, h_vi, en_mask, vi_mask)
+    # ── 7. Combine losses ────────────────────────────────────────
+    losses = stage2_loss(L_ot, L_reg, L_span, epoch)
 
-    # ── 6. Combine losses with curriculum ───────────────────────
-    losses = stage2_loss(L_ot, L_span, L_cons, epoch)
-
-    # ── 7. Debug metrics ────────────────────────────────────────
+    # ── 8. Debug metrics ─────────────────────────────────────────
     with torch.no_grad():
         g_entropy = gamma_entropy(gamma_list)
-        
-        # Sửa thành — threshold động theo H_max của batch
         import math
-        # Tính n_en, n_vi trung bình của batch
         avg_n_en = en_mask.sum(dim=1).float().mean().item()
         avg_n_vi = vi_mask.sum(dim=1).float().mean().item()
-        h_max = math.log(max(avg_n_en * avg_n_vi, 1.0)) # Add max() to avoid log(0)
-        h_ratio = g_entropy / h_max if h_max > 0 else 0
+        h_max    = math.log(max(avg_n_en * avg_n_vi, 1.0))
+        h_ratio  = g_entropy / h_max if h_max > 0 else 0
 
         if h_ratio > 0.90:
-            log.warning(f"  [Gamma] entropy ratio={h_ratio:.2f} (H={g_entropy:.2f}/H_max={h_max:.2f}) — near uniform")
+            log.warning(
+                f"  [Gamma] entropy ratio={h_ratio:.2f} "
+                f"(H={g_entropy:.2f}/H_max={h_max:.2f}) — near uniform"
+            )
         elif h_ratio < 0.30:
             log.warning(f"  [Gamma] entropy ratio={h_ratio:.2f} — may be collapsed")
         else:
@@ -368,12 +373,12 @@ def run_stage2(config: dict):
 
     stage2_loss = Stage2Loss(
         lambda_ot   = config["lambda_ot"],
+        lambda_reg  = config["lambda_reg"],
         lambda_span = config["lambda_span"],
-        lambda_cons = config["lambda_cons"],
     ).to(device)
 
     log.info(
-        f"Curriculum: Epoch-based (OT -> OT+Cons -> OT+Cons+Span)"
+        f"Stage 2 Loss config: lambda_ot={config['lambda_ot']}, lambda_reg={config['lambda_reg']}"
     )
 
     # ── TensorBoard ─────────────────────────────────────────────
@@ -443,7 +448,7 @@ def run_stage2(config: dict):
         log.info(f"{'━'*60}")
         log.info(f"Epoch {epoch}/{config['max_epochs']}")
 
-        epoch_losses = {"total": 0.0, "ot": 0.0, "span": 0.0, "cons": 0.0}
+        epoch_losses = {"total": 0.0, "ot": 0.0, "reg": 0.0, "span": 0.0}
         step_count   = 0
 
         for batch in train_loader:
@@ -471,7 +476,7 @@ def run_stage2(config: dict):
             global_step += 1
             step_count  += 1
 
-            for k in ("total", "ot", "span", "cons"):
+            for k in ("total", "ot", "reg", "span"):
                 v = losses.get(k)
                 if isinstance(v, torch.Tensor):
                     epoch_losses[k] += v.item()
@@ -480,26 +485,24 @@ def run_stage2(config: dict):
 
             # ── Per-step TensorBoard logging ─────────────────────
             if global_step % config["log_every"] == 0:
-                w_cons = losses.get("cons_weight", torch.tensor(0.0))
-                w_cons_val = w_cons.item() if isinstance(w_cons, torch.Tensor) else w_cons
                 g_ent  = losses.get("gamma_entropy", 0.0)
+                span_w = losses.get("span_weight", torch.tensor(0.0)).item()
 
                 log.info(
                     f"  Step {global_step} | "
                     f"total={losses['total'].item():.4f} | "
                     f"ot={losses['ot'].item():.4f} | "
-                    f"span={losses['span'].item():.4f} | "
-                    f"cons={losses['cons'].item():.4f} | "
-                    f"w_cons={w_cons_val:.3f} | "
+                    f"reg={losses['reg'].item():.4f} | "
+                    f"span={losses['span'].item():.4f} (w={span_w:.2f}) | "
                     f"γ_H={g_ent:.2f}"
                 )
 
-                writer.add_scalar("Loss/Stage2_Total", losses["total"].item(), global_step)
-                writer.add_scalar("Loss/OT",           losses["ot"].item(),    global_step)
-                writer.add_scalar("Loss/Span",         losses["span"].item(),  global_step)
-                writer.add_scalar("Loss/Cons",         losses["cons"].item(),  global_step)
-                writer.add_scalar("Lambda/Cons_Weight", w_cons_val,            global_step)
-                writer.add_scalar("Debug/Gamma_Entropy", g_ent,                global_step)
+                writer.add_scalar("Loss/Stage2_Total",  losses["total"].item(), global_step)
+                writer.add_scalar("Loss/OT",            losses["ot"].item(),    global_step)
+                writer.add_scalar("Loss/Reg",           losses["reg"].item(),   global_step)
+                writer.add_scalar("Loss/Span",          losses["span"].item(),  global_step)
+                writer.add_scalar("Lambda/Span_Weight", span_w,                 global_step)
+                writer.add_scalar("Debug/Gamma_Entropy", g_ent,                 global_step)
                 writer.add_scalar("Learning_Rate/Head",
                                   optimizer.param_groups[1]["lr"],             global_step)
 
@@ -507,7 +510,7 @@ def run_stage2(config: dict):
         avg = {k: v / max(step_count, 1) for k, v in epoch_losses.items()}
         log.info(
             f"Epoch {epoch} avg | total={avg['total']:.4f} | "
-            f"ot={avg['ot']:.4f} | span={avg['span']:.4f} | cons={avg['cons']:.4f}"
+            f"ot={avg['ot']:.4f} | reg={avg['reg']:.4f} | span={avg['span']:.4f}"
         )
 
         # ── Evaluation ───────────────────────────────────────────
@@ -638,8 +641,8 @@ def parse_args() -> dict:
     parser.add_argument("--max_epochs",     type=int,   default=STAGE2_CONFIG["max_epochs"])
     parser.add_argument("--stage2_head_lr", type=float, default=STAGE2_CONFIG["stage2_head_lr"])
     parser.add_argument("--lambda_ot",      type=float, default=STAGE2_CONFIG["lambda_ot"])
+    parser.add_argument("--lambda_reg",     type=float, default=STAGE2_CONFIG["lambda_reg"])
     parser.add_argument("--lambda_span",    type=float, default=STAGE2_CONFIG["lambda_span"])
-    parser.add_argument("--lambda_cons",    type=float, default=STAGE2_CONFIG["lambda_cons"])
     parser.add_argument("--epsilon",        type=float, default=STAGE2_CONFIG["epsilon"])
     parser.add_argument("--sinkhorn_iters", type=int,   default=STAGE2_CONFIG["sinkhorn_iters"])
     parser.add_argument("--patience",       type=int,   default=STAGE2_CONFIG["patience"])

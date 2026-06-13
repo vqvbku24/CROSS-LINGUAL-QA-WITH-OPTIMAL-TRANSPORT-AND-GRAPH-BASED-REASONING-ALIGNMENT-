@@ -902,6 +902,42 @@ def compute_cons_loss(
     return torch.stack(mse_losses).mean()
 
 
+def compute_reg_loss(
+    h_en_lora: torch.Tensor,   # (B, T_en, D) — EN hidden states WITH LoRA (has grad)
+    h_en_frz: torch.Tensor,    # (B, T_en, D) — EN hidden states WITHOUT LoRA (no grad)
+    en_mask: torch.Tensor,     # (B, T_en) — True = real token
+) -> torch.Tensor:
+    """
+    L_Reg = mean per-token L2 deviation between trainable and frozen EN branches.
+
+    Prevents LoRA shared weights from distorting EN representations while
+    training on VI. Gradient flows through h_en_lora only (h_en_frz is detached).
+
+    Per-token squared L2 distance, averaged over valid (non-PAD) tokens and batch.
+
+    Args:
+        h_en_lora : (B, T_en, D) — EN forward pass WITH LoRA adapters active
+        h_en_frz  : (B, T_en, D) — EN forward pass with LoRA disabled (frozen anchor)
+        en_mask   : (B, T_en) bool — True for real tokens, False for PAD
+
+    Returns:
+        scalar L_Reg
+    """
+    # Align sequence lengths (dynamic truncation may differ between the two passes)
+    T = min(h_en_lora.size(1), h_en_frz.size(1))
+    h_en_lora = h_en_lora[:, :T, :]
+    h_en_frz  = h_en_frz[:, :T, :].detach()   # target is fixed — must detach
+    mask      = en_mask[:, :T]                  # (B, T)
+
+    # Per-token squared L2: (B, T)
+    sq_diff = ((h_en_lora - h_en_frz) ** 2).sum(dim=-1)  # (B, T)
+
+    # Mask PAD tokens and average over valid positions
+    sq_diff = sq_diff * mask.float()
+    n_valid = mask.float().sum().clamp(min=1.0)
+    return sq_diff.sum() / n_valid
+
+
 def gamma_entropy(gamma_list: list[torch.Tensor]) -> float:
     """
     Returns mean entropy of transport plans across batch.
@@ -924,72 +960,75 @@ def gamma_entropy(gamma_list: list[torch.Tensor]) -> float:
 
 class Stage2Loss(nn.Module):
     """
-    Stage 2 combined loss: L_ot + L_span + w_cons * L_cons
+    Stage 2 combined loss: L_ot + L_reg + L_span
 
     Reuses the QA head from Stage 1 (weights loaded from Stage 1 checkpoint).
     The qa_head is passed in at construction time — it is NOT re-instantiated here.
     This allows Stage 2 to start from the EN-trained QA head and adapt it to VI.
 
     Usage in training loop:
-        gamma_list, L_ot = sinkhorn_masked(h_en, h_vi, en_mask, vi_mask, ε, K)
-        L_span           = compute_span_loss(gamma_list, p_en_start, p_en_end,
-                                             vi_logits_start, vi_logits_end,
+        gamma_list, L_ot = sinkhorn_masked(h_en_frz, h_vi, en_mask, vi_mask, ε, K)
+        L_reg            = compute_reg_loss(h_en_lora, h_en_frz, en_mask)
+        L_span           = compute_span_loss(gamma_list, en_start_logits, en_end_logits,
+                                             vi_start_logits, vi_end_logits,
                                              en_mask, vi_mask)
-        L_cons           = compute_cons_loss(gamma_list, h_en, h_vi, en_mask, vi_mask)
-        L_total          = self.forward(L_ot, L_span, L_cons, global_step)
+        L_total          = self.forward(L_ot, L_reg, L_span, epoch)
     """
 
     def __init__(
         self,
         lambda_ot: float   = 1.0,
-        lambda_span: float = 1.0,
-        lambda_cons: float = 0.5,
+        lambda_reg: float  = 10.0,
+        lambda_span: float = 0.0,
     ):
         """
         Args:
-            lambda_ot    : weight for L_ot (transport cost)
-            lambda_span  : weight for L_span (pseudo-label KL)
-            lambda_cons  : weight for L_cons (feature consistency MSE)
+            lambda_ot    : weight for L_ot (transport cost). Default 1.0.
+            lambda_reg   : weight for L_reg (EN consistency). Default 10.0.
+            lambda_span  : weight for L_span. Default 0.0 (disabled — gamma too uniform).
         """
         super().__init__()
         self.lambda_ot    = lambda_ot
+        self.lambda_reg   = lambda_reg
         self.lambda_span  = lambda_span
-        self.lambda_cons  = lambda_cons
 
     def forward(
         self,
         L_ot: torch.Tensor,
+        L_reg: torch.Tensor,
         L_span: torch.Tensor,
-        L_cons: torch.Tensor,
         epoch: int,
     ) -> dict[str, torch.Tensor]:
         """
-        Combine loss components with epoch-based curriculum weighting.
+        Combine loss components.
+
+        L_reg is active from epoch 1 (always on — EN anchor must be protected
+        from the very first gradient step).
+        L_span is disabled by default (lambda=0.0).
 
         Returns:
-            dict with "total", "ot", "span", "cons", "cons_weight", "span_weight"
+            dict with "total", "ot", "reg", "span", "span_weight"
         """
-        if epoch == 1:
-            w_cons = 0.0
+        # curriculum for w_span: starts at epoch 3, ramps up over epochs 4 and 5
+        if epoch < 3:
             w_span = 0.0
-        elif epoch in [2, 3]:
-            w_cons = 1.0
-            w_span = 0.0
+        elif epoch == 3:
+            w_span = 0.33
+        elif epoch == 4:
+            w_span = 0.66
         else:
-            w_cons = 1.0
             w_span = 1.0
 
         L_total = (
-            self.lambda_ot * L_ot
+            self.lambda_ot   * L_ot
+            + self.lambda_reg  * L_reg
             + self.lambda_span * w_span * L_span
-            + self.lambda_cons * w_cons * L_cons
         )
 
         return {
-            "total":        L_total,
-            "ot":           L_ot.detach(),
-            "span":         (L_span.detach() * w_span),
-            "cons":         (L_cons.detach() * w_cons),
-            "cons_weight":  torch.tensor(float(w_cons)),
-            "span_weight":  torch.tensor(float(w_span)),
+            "total":       L_total,
+            "ot":          L_ot.detach(),
+            "reg":         L_reg.detach(),
+            "span":        (L_span.detach() * w_span),
+            "span_weight": torch.tensor(float(w_span)),
         }
