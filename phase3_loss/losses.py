@@ -774,7 +774,7 @@ def sinkhorn_masked(
             #     print(f"  [Sinkhorn OK] row_err={row_err:.6f} col_err={col_err:.6f} H={-(gamma_b*(gamma_b.clamp(min=1e-10)).log()).sum().item():.2f}")
 
         gamma_list.append(gamma_b)
-        costs.append((gamma_b * C).sum())
+        costs.append((gamma_b.detach() * C).sum())
 
     if not costs:
         device = h_en.device
@@ -829,10 +829,12 @@ def compute_span_loss(
         p_en_start_b = F.softmax(en_logits_start[b].index_select(0, en_idx), dim=-1) # [n_en]
         p_en_end_b   = F.softmax(en_logits_end[b].index_select(0, en_idx), dim=-1)   # [n_en]
 
-        pseudo_start = gamma_b.T @ p_en_start_b              # [n_vi]
-        pseudo_end   = gamma_b.T @ p_en_end_b                # [n_vi]
+        # Normalize column-wise to fix barycentric blur
+        col_sum = gamma_b.sum(dim=0).clamp(min=1e-8)
+        pseudo_start = (gamma_b.T @ p_en_start_b) / col_sum
+        pseudo_end   = (gamma_b.T @ p_en_end_b)   / col_sum
 
-        # Normalize — γ rows ≈ 1/n_valid; projection may have small numerical drift
+        # Additional probability normalization just to ensure sum=1
         pseudo_start = pseudo_start / (pseudo_start.sum() + 1e-8)
         pseudo_end   = pseudo_end   / (pseudo_end.sum()   + 1e-8)
 

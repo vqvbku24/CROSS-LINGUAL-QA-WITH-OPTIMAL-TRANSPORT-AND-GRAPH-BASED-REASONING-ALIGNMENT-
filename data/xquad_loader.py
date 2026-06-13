@@ -218,6 +218,7 @@ def xquad_collate_fn(batch: list[dict]) -> dict:
         "en_start_positions": torch.stack([b["en_start_positions"] for b in batch]),
         "en_end_positions":   torch.stack([b["en_end_positions"]   for b in batch]),
         "en_question_end":    torch.stack([b["en_question_end"]    for b in batch]),
+        "en_is_answerable":   torch.ones(len(batch), dtype=torch.long), # XQuAD is 100% answerable
         "vi_input_ids":       vi_ids,
         "vi_attention_mask":  vi_mask,
         "vi_question_end":    torch.stack([b["vi_question_end"]    for b in batch]),

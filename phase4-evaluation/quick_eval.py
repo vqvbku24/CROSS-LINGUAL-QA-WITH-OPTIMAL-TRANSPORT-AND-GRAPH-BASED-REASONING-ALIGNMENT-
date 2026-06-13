@@ -46,19 +46,28 @@ def quick_em(model, criterion, tokenizer, dev_file, n_samples=200, device="cuda"
             q_end_val = q_end.item()
 
             # Get hidden states from backbone (no GAT, no subsampling)
-            out = model.backbone(input_ids, attn_mask)
+            if hasattr(model.backbone, "disable_adapter"):
+                with model.backbone.disable_adapter():
+                    out = model.backbone(input_ids, attn_mask)
+            else:
+                out = model.backbone(input_ids, attn_mask)
             target_layers = [6, 7, 8, 9]
             stacked = torch.stack([out.hidden_states[i] for i in target_layers], dim=0)  # (4, 1, L, H)
             weights = torch.softmax(model.layer_weights, dim=0).view(4, 1, 1, 1)
             hidden = (stacked * weights).sum(dim=0)   # (1, L, H)
 
-            # Extract question embeddings for cross-attention
-            q_emb = hidden[:, :q_end_val + 1, :]     # (1, L_q, H)
-            q_mask = torch.zeros(1, q_end_val + 1, dtype=torch.bool, device=device)
+            # Extract question embeddings for cross-attention (exclude [SEP])
+            q_emb = hidden[:, :q_end_val, :]     # (1, L_q, H)
+            q_mask = torch.zeros(1, q_end_val, dtype=torch.bool, device=device)
 
             # QA head: context=full sequence, question=q tokens
             start_logits, end_logits, has_ans_logit = criterion.qa_head(hidden, q_emb, q_mask)
             
+            # Mask out padding tokens
+            padding_mask = (attn_mask[0] == 0)
+            start_logits[0].masked_fill_(padding_mask, float('-inf'))
+            end_logits[0].masked_fill_(padding_mask, float('-inf'))
+
             # Mask end positions: only allow [start_idx, start_idx + MAX_ANSWER_LEN]
             MAX_ANSWER_LEN = 30
             start_idx = start_logits[0].argmax().item()
@@ -69,8 +78,23 @@ def quick_em(model, criterion, tokenizer, dev_file, n_samples=200, device="cuda"
 
             pred_answerable = has_ans_logit.item() > 0
 
-            if pred_answerable == is_answerable:
-                correct += 1
+            # Decode span if predicted answerable
+            if not pred_answerable:
+                pred_span = ""
+            else:
+                pred_ids = input_ids[0][start_idx: end_idx + 1]
+                pred_span = tokenizer.decode(pred_ids, skip_special_tokens=True).strip()
+
+            ground_truths = item["answer"].get("text", [])
+            
+            if not is_answerable:
+                # For unanswerable questions, correct if predicted span is empty
+                if pred_span == "":
+                    correct += 1
+            else:
+                # For answerable questions, check Exact Match
+                if _exact_match_score(pred_span, ground_truths):
+                    correct += 1
 
     return correct / len(data) * 100
 
@@ -159,12 +183,17 @@ def quick_em_xquad_vi(
             weights = torch.softmax(model.layer_weights, dim=0).view(4, 1, 1, 1)
             hidden = (stacked * weights).sum(dim=0)   # (1, L, H)
 
-            # Question embeddings for cross-attention
-            q_emb  = hidden[:, :q_end_val + 1, :]    # (1, L_q, H)
-            q_mask = torch.zeros(1, q_end_val + 1, dtype=torch.bool, device=device)
+            # Question embeddings for cross-attention (exclude [SEP])
+            q_emb  = hidden[:, :q_end_val, :]    # (1, L_q, H)
+            q_mask = torch.zeros(1, q_end_val, dtype=torch.bool, device=device)
 
             # QA head: predict start/end logits
             start_logits, end_logits, _ = criterion.qa_head(hidden, q_emb, q_mask)
+
+            # Mask out padding tokens
+            padding_mask = (attn_mask[0] == 0)
+            start_logits[0].masked_fill_(padding_mask, float("-inf"))
+            end_logits[0].masked_fill_(padding_mask, float("-inf"))
 
             # Constrain end to [start, start + max_answer_len]
             start_idx = start_logits[0].argmax().item()
@@ -261,18 +290,27 @@ if __name__ == "__main__":
             q_end_val = q_end.item()
 
             # Forward backbone
-            out = model.backbone(input_ids, attn_mask)
+            if hasattr(model.backbone, "disable_adapter"):
+                with model.backbone.disable_adapter():
+                    out = model.backbone(input_ids, attn_mask)
+            else:
+                out = model.backbone(input_ids, attn_mask)
             target_layers = [6, 7, 8, 9]
             stacked = torch.stack([out.hidden_states[l] for l in target_layers], dim=0)
             weights = torch.softmax(model.layer_weights, dim=0).view(4, 1, 1, 1)
             hidden = (stacked * weights).sum(dim=0)
 
-            # Question embeddings
-            q_emb = hidden[:, :q_end_val + 1, :]
-            q_mask = torch.zeros(1, q_end_val + 1, dtype=torch.bool, device=device)
+            # Question embeddings (exclude [SEP])
+            q_emb = hidden[:, :q_end_val, :]
+            q_mask = torch.zeros(1, q_end_val, dtype=torch.bool, device=device)
 
             # Predict logits
             start_logits, end_logits, _ = criterion.qa_head(hidden, q_emb, q_mask)
+
+            # Mask out padding tokens
+            padding_mask = (attn_mask[0] == 0)
+            start_logits[0].masked_fill_(padding_mask, float('-inf'))
+            end_logits[0].masked_fill_(padding_mask, float('-inf'))
 
             # Decode span
             MAX_ANSWER_LEN = 30

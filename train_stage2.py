@@ -59,7 +59,7 @@ STAGE2_CONFIG = {
     "lambda_cons"     : 0.5,
 
     # OT hyperparameters
-    "epsilon"         : 0.1,        # Sinkhorn regularization
+    "epsilon"         : 0.05,       # Sinkhorn regularization
     "sinkhorn_iters"  : 100,
 
     # Optimizer
