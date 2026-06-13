@@ -55,11 +55,11 @@ STAGE2_CONFIG = {
 
     # Loss weights
     "lambda_ot"       : 1.0,
-    "lambda_reg"      : 10.0,   # EN consistency regularisation (paper: 50, start lower for encoder)
+    "lambda_reg"      : 50.0,   # EN consistency regularisation (paper: 50, start lower for encoder)
     "lambda_span"     : 0.0,    # Disabled — gamma too uniform for reliable pseudo-labels
 
     # OT hyperparameters
-    "epsilon"         : 0.1,    # Restored to paper default (0.05 hurts XSQuAD per ablation)
+    "epsilon"         : 0.05,    # Restored to paper default (0.05 hurts XSQuAD per ablation)
     "sinkhorn_iters"  : 100,
 
     # Optimizer
@@ -320,6 +320,15 @@ def run_stage2(config: dict):
     model.apply_lora()
     model.to(device) # Ensure new LoRA layers are on the target device
 
+    # Disable dropout to prevent representation drift from random masks
+    log.info("Disabling dropout in backbone, adapters & criterion to prevent L_reg variance...")
+    for m in model.modules():
+        if isinstance(m, torch.nn.Dropout):
+            m.p = 0.0
+    for m in criterion.modules():
+        if isinstance(m, torch.nn.Dropout):
+            m.p = 0.0
+
     # ── Verify QA Head Freeze State ─────────────────────────────
     if config.get("freeze_qa_head", False):
         freeze_qa_head(criterion)
@@ -331,15 +340,25 @@ def run_stage2(config: dict):
     if en_em_baseline is None:
         en_em_baseline = compute_en_em_baseline(model, criterion, tokenizer, config, device)
 
-    # ── XQuAD dataloaders ────────────────────────────────────────
+    # ── XQuAD dataloaders for Evaluation ────────────────────────
     from data.xquad_loader import create_xquad_dataloaders
-    train_loader, val_loader, val_pairs = create_xquad_dataloaders(
+    _, _, val_pairs = create_xquad_dataloaders(
         root_dir=config["root_dir"],
         tokenizer=tokenizer,
         batch_size=config["batch_size"],
         max_length=config["max_length"],
     )
-    log.info(f"XQuAD: {len(train_loader)} train batches | {len(val_pairs)} val pairs")
+
+    # ── Squad Parallel dataloaders ──────────────────────────────
+    from squad_parallel_loader import create_squad_parallel_dataloaders
+    train_loader, _ = create_squad_parallel_dataloaders(
+        tokenizer=tokenizer,
+        en_path=os.path.join(config["root_dir"], "dataset", "Squad2.0", "train-v2.0.json"),
+        vi_path=os.path.join(config["root_dir"], "dataset", "AIForge_vietnamese-squad", "train-00000-of-00001.parquet"),
+        batch_size=config["batch_size"],
+        max_length=config["max_length"],
+    )
+    log.info(f"Train (SQuAD Parallel): {len(train_loader)} batches | XQuAD Val: {len(val_pairs)} pairs")
 
     # ── Optimizer — differential learning rates ──────────────────
     # backbone: frozen except for LoRA parameters

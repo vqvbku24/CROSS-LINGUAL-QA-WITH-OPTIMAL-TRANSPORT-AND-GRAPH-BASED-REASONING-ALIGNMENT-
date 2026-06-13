@@ -930,7 +930,7 @@ def compute_reg_loss(
     mask      = en_mask[:, :T]                  # (B, T)
 
     # Per-token squared L2: (B, T)
-    sq_diff = ((h_en_lora - h_en_frz) ** 2).sum(dim=-1)  # (B, T)
+    sq_diff = ((h_en_lora - h_en_frz) ** 2).mean(dim=-1)  # (B, T)
 
     # Mask PAD tokens and average over valid positions
     sq_diff = sq_diff * mask.float()

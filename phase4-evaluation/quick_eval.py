@@ -46,11 +46,7 @@ def quick_em(model, criterion, tokenizer, dev_file, n_samples=200, device="cuda"
             q_end_val = q_end.item()
 
             # Get hidden states from backbone (no GAT, no subsampling)
-            if hasattr(model.backbone, "disable_adapter"):
-                with model.backbone.disable_adapter():
-                    out = model.backbone(input_ids, attn_mask)
-            else:
-                out = model.backbone(input_ids, attn_mask)
+            out = model.backbone(input_ids, attn_mask)
             target_layers = [6, 7, 8, 9]
             stacked = torch.stack([out.hidden_states[i] for i in target_layers], dim=0)  # (4, 1, L, H)
             weights = torch.softmax(model.layer_weights, dim=0).view(4, 1, 1, 1)
@@ -290,11 +286,7 @@ if __name__ == "__main__":
             q_end_val = q_end.item()
 
             # Forward backbone
-            if hasattr(model.backbone, "disable_adapter"):
-                with model.backbone.disable_adapter():
-                    out = model.backbone(input_ids, attn_mask)
-            else:
-                out = model.backbone(input_ids, attn_mask)
+            out = model.backbone(input_ids, attn_mask)
             target_layers = [6, 7, 8, 9]
             stacked = torch.stack([out.hidden_states[l] for l in target_layers], dim=0)
             weights = torch.softmax(model.layer_weights, dim=0).view(4, 1, 1, 1)
