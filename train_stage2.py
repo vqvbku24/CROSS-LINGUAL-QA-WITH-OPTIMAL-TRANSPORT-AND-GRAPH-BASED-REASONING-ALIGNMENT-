@@ -54,13 +54,14 @@ STAGE2_CONFIG = {
     "model_name"      : "xlm-roberta-base",
 
     # Loss weights
-    "lambda_ot"       : 5.0,
-    "lambda_reg"      : 35.0,   # EN consistency regularisation (paper: 50, start lower for encoder)
+    "lambda_ot"       : 10.0,
+    "lambda_reg"      : 50.0,   # EN consistency regularisation (paper: 50, start lower for encoder)
     "lambda_span"     : 0.0,    # Disabled — gamma too uniform for reliable pseudo-labels
-    "lambda_qa"       : 2.0,    # Supervised EN QA loss weight
+    "lambda_qa"       : 1.0,    # Supervised EN QA loss weight
 
     # OT hyperparameters
-    "epsilon"         : 0.07,   # Restored to paper default (0.05 hurts XSQuAD per ablation)
+    "epsilon"         : 0.1,   # Restored to paper default (0.05 hurts XSQuAD per ablation)
+    "epsilon_end"     : 0.03,
     "sinkhorn_iters"  : 150,
 
     # Optimizer
@@ -511,12 +512,15 @@ def run_stage2(config: dict):
 
             optimizer.zero_grad()
 
-            # Epsilon linear annealing (disabled)
-            # eps_start = config["epsilon_start"]
-            # eps_end   = config["epsilon_end"]
-            # ratio     = min(1.0, global_step / max(1, total_steps))
-            # current_epsilon = eps_start - ratio * (eps_start - eps_end)
-            current_epsilon = config["epsilon"]
+            # Epsilon scheduler: epoch 1 uses epsilon, epochs 2+ anneal from epsilon to epsilon_end
+            if epoch == 1:
+                current_epsilon = config["epsilon"]
+            else:
+                steps_in_epoch1 = steps_per_epoch
+                decay_steps = max(1, total_steps - steps_in_epoch1)
+                elapsed = max(0, global_step - steps_in_epoch1)
+                ratio = min(1.0, elapsed / decay_steps)
+                current_epsilon = config["epsilon"] - ratio * (config["epsilon"] - config["epsilon_end"])
 
             losses = stage2_step(
                 batch, model, criterion, stage2_loss,
@@ -724,6 +728,7 @@ def parse_args() -> dict:
     parser.add_argument("--lambda_span",    type=float, default=STAGE2_CONFIG["lambda_span"])
     parser.add_argument("--lambda_qa",      type=float, default=STAGE2_CONFIG["lambda_qa"])
     parser.add_argument("--epsilon",        type=float, default=STAGE2_CONFIG["epsilon"])
+    parser.add_argument("--epsilon_end",    type=float, default=STAGE2_CONFIG["epsilon_end"])
     parser.add_argument("--sinkhorn_iters", type=int,   default=STAGE2_CONFIG["sinkhorn_iters"])
     parser.add_argument("--patience",       type=int,   default=STAGE2_CONFIG["patience"])
     parser.add_argument("--max_length",     type=int,   default=STAGE2_CONFIG["max_length"])
