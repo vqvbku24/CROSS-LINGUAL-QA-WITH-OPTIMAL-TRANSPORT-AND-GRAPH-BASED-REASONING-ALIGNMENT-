@@ -499,7 +499,11 @@ def run_stage2(config: dict):
         log.info(f"{'━'*60}")
         log.info(f"Epoch {epoch}/{config['max_epochs']}")
 
-        epoch_losses = {"total": 0.0, "ot": 0.0, "reg": 0.0, "span": 0.0, "qa": 0.0, "has_ans": 0.0}
+        epoch_losses = {
+            "total": 0.0, "ot": 0.0, "reg": 0.0, "span": 0.0, "qa": 0.0, "has_ans": 0.0,
+            "raw_ot_loss": 0.0, "raw_reg_loss": 0.0, "raw_qa_loss": 0.0,
+            "weighted_ot": 0.0, "weighted_reg": 0.0, "weighted_qa": 0.0
+        }
         step_count   = 0
 
         for batch in train_loader:
@@ -527,7 +531,7 @@ def run_stage2(config: dict):
             global_step += 1
             step_count  += 1
 
-            for k in ("total", "ot", "reg", "span", "qa", "has_ans"):
+            for k in ("total", "ot", "reg", "span", "qa", "has_ans", "raw_ot_loss", "raw_reg_loss", "raw_qa_loss", "weighted_ot", "weighted_reg", "weighted_qa"):
                 v = losses.get(k)
                 if isinstance(v, torch.Tensor):
                     epoch_losses[k] += v.item()
@@ -542,11 +546,12 @@ def run_stage2(config: dict):
                 log.info(
                     f"  Step {global_step} | "
                     f"total={losses['total'].item():.4f} | "
-                    f"ot={losses['ot'].item():.4f} | "
-                    f"reg={losses['reg'].item():.4f} | "
-                    f"span={losses['span'].item():.4f} (w={span_w:.2f}) | "
-                    f"qa={losses['qa'].item():.4f} | "
-                    f"has_ans={losses['has_ans'].item():.4f} | "
+                    f"raw_ot={losses['raw_ot_loss'].item():.4f} | "
+                    f"raw_reg={losses['raw_reg_loss'].item():.4f} | "
+                    f"raw_qa={losses['raw_qa_loss'].item():.4f} | "
+                    f"w_ot={losses['weighted_ot'].item():.4f} | "
+                    f"w_reg={losses['weighted_reg'].item():.4f} | "
+                    f"w_qa={losses['weighted_qa'].item():.4f} | "
                     f"γ_H={g_ent:.2f}"
                 )
 
@@ -556,6 +561,15 @@ def run_stage2(config: dict):
                 writer.add_scalar("Loss/Span",          losses["span"].item(),  global_step)
                 writer.add_scalar("Loss/QA",            losses["qa"].item(),    global_step)
                 writer.add_scalar("Loss/HasAns",        losses["has_ans"].item(), global_step)
+                
+                # Raw and Weighted losses
+                writer.add_scalar("Loss/Raw_OT",        losses["raw_ot_loss"].item(), global_step)
+                writer.add_scalar("Loss/Raw_Reg",       losses["raw_reg_loss"].item(), global_step)
+                writer.add_scalar("Loss/Raw_QA",        losses["raw_qa_loss"].item(), global_step)
+                writer.add_scalar("Loss/Weighted_OT",   losses["weighted_ot"].item(), global_step)
+                writer.add_scalar("Loss/Weighted_Reg",  losses["weighted_reg"].item(), global_step)
+                writer.add_scalar("Loss/Weighted_QA",   losses["weighted_qa"].item(), global_step)
+                
                 writer.add_scalar("Lambda/Span_Weight", span_w,                 global_step)
                 writer.add_scalar("Debug/Gamma_Entropy", g_ent,                 global_step)
                 writer.add_scalar("Learning_Rate/Head",
@@ -565,8 +579,8 @@ def run_stage2(config: dict):
         avg = {k: v / max(step_count, 1) for k, v in epoch_losses.items()}
         log.info(
             f"Epoch {epoch} avg | total={avg['total']:.4f} | "
-            f"ot={avg['ot']:.4f} | reg={avg['reg']:.4f} | span={avg['span']:.4f} | "
-            f"qa={avg['qa']:.4f} | has_ans={avg['has_ans']:.4f}"
+            f"raw_ot={avg['raw_ot_loss']:.4f} | raw_reg={avg['raw_reg_loss']:.4f} | raw_qa={avg['raw_qa_loss']:.4f} | "
+            f"w_ot={avg['weighted_ot']:.4f} | w_reg={avg['weighted_reg']:.4f} | w_qa={avg['weighted_qa']:.4f}"
         )
 
         # ── Evaluation ───────────────────────────────────────────

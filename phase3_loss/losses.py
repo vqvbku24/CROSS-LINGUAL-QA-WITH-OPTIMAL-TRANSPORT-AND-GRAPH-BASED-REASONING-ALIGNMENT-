@@ -1040,4 +1040,13 @@ class Stage2Loss(nn.Module):
             "span_weight": torch.tensor(float(w_span)),
             "qa":          L_qa.detach(),
             "has_ans":     L_has_ans.detach(),
+            
+            # Raw and weighted losses for logging
+            "raw_ot_loss":  L_ot.detach(),
+            "raw_reg_loss": L_reg.detach(),
+            "raw_qa_loss":  (L_qa + L_has_ans).detach(),
+            
+            "weighted_ot":  (self.lambda_ot * L_ot).detach(),
+            "weighted_reg": (self.lambda_reg * L_reg).detach(),
+            "weighted_qa":  (self.lambda_qa * (L_qa + L_has_ans)).detach(),
         }
