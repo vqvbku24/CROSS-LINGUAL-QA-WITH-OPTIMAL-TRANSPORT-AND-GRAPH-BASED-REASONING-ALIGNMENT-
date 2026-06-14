@@ -961,7 +961,7 @@ def gamma_entropy(gamma_list: list[torch.Tensor]) -> float:
 
 class Stage2Loss(nn.Module):
     """
-    Stage 2 combined loss: L_ot + L_reg + L_span
+    Stage 2 combined loss: L_ot + L_reg + L_span + L_qa
 
     Reuses the QA head from Stage 1 (weights loaded from Stage 1 checkpoint).
     The qa_head is passed in at construction time — it is NOT re-instantiated here.
@@ -973,7 +973,7 @@ class Stage2Loss(nn.Module):
         L_span           = compute_span_loss(gamma_list, en_start_logits, en_end_logits,
                                              vi_start_logits, vi_end_logits,
                                              en_mask, vi_mask)
-        L_total          = self.forward(L_ot, L_reg, L_span, epoch)
+        L_total          = self.forward(L_ot, L_reg, L_span, L_qa, L_has_ans, epoch)
     """
 
     def __init__(
@@ -981,23 +981,28 @@ class Stage2Loss(nn.Module):
         lambda_ot: float   = 1.0,
         lambda_reg: float  = 10.0,
         lambda_span: float = 0.0,
+        lambda_qa: float   = 1.0,
     ):
         """
         Args:
             lambda_ot    : weight for L_ot (transport cost). Default 1.0.
             lambda_reg   : weight for L_reg (EN consistency). Default 10.0.
             lambda_span  : weight for L_span. Default 0.0 (disabled — gamma too uniform).
+            lambda_qa    : weight for L_qa and L_has_ans (supervised EN QA loss). Default 1.0.
         """
         super().__init__()
         self.lambda_ot    = lambda_ot
         self.lambda_reg   = lambda_reg
         self.lambda_span  = lambda_span
+        self.lambda_qa    = lambda_qa
 
     def forward(
         self,
         L_ot: torch.Tensor,
         L_reg: torch.Tensor,
         L_span: torch.Tensor,
+        L_qa: torch.Tensor,
+        L_has_ans: torch.Tensor,
         epoch: int,
     ) -> dict[str, torch.Tensor]:
         """
@@ -1008,7 +1013,7 @@ class Stage2Loss(nn.Module):
         L_span is disabled by default (lambda=0.0).
 
         Returns:
-            dict with "total", "ot", "reg", "span", "span_weight"
+            dict with "total", "ot", "reg", "span", "span_weight", "qa", "has_ans"
         """
         # curriculum for w_span: starts at epoch 3, ramps up over epochs 4 and 5
         if epoch < 3:
@@ -1024,6 +1029,7 @@ class Stage2Loss(nn.Module):
             self.lambda_ot   * L_ot
             + self.lambda_reg  * L_reg
             + self.lambda_span * w_span * L_span
+            + self.lambda_qa   * (L_qa + L_has_ans)
         )
 
         return {
@@ -1032,4 +1038,6 @@ class Stage2Loss(nn.Module):
             "reg":         L_reg.detach(),
             "span":        (L_span.detach() * w_span),
             "span_weight": torch.tensor(float(w_span)),
+            "qa":          L_qa.detach(),
+            "has_ans":     L_has_ans.detach(),
         }

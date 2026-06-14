@@ -36,16 +36,20 @@ class SquadParallelDataset(Dataset):
         vi_question = vi_item.get('question') or vi_item.get('Question', '')
         vi_context = vi_item.get('context') or vi_item.get('Context', '')
 
-        # 2. Tokenize nhánh EN (Question + Context)
-        # Bật truncation và padding lên max_length, trả về Pytorch tensor
-        en_encoding = self.tokenizer(
-            text=en_question,
-            text_pair=en_context,
-            truncation=True,
-            padding="max_length",
+        # 2. Tokenize nhánh EN (Question + Context) qua process_qa_sample
+        from phase1_dataloader.process_qa_sample import process_qa_sample
+        en_answer = en_item.get('answer')
+        is_answerable = en_answer is not None and len(en_answer.get("answer_start", [])) > 0
+        
+        en_input_ids, en_attention_mask, en_start_position, en_end_position, en_question_end = process_qa_sample(
+            question=en_question,
+            context=en_context,
+            answer=en_answer if is_answerable else None,
+            tokenizer=self.tokenizer,
             max_length=self.max_length,
-            return_tensors="pt"
+            doc_stride=128
         )
+        en_is_answerable = torch.tensor(1 if is_answerable else 0, dtype=torch.long)
         
         # 3. Tokenize nhánh VI tương tự như trên
         vi_encoding = self.tokenizer(
@@ -57,13 +61,10 @@ class SquadParallelDataset(Dataset):
             return_tensors="pt"
         )
 
-        # Loại bỏ chiều batch đầu tiên (1, seq_len) -> (seq_len,)
-        en_input_ids = en_encoding["input_ids"].squeeze(0)
-        en_attention_mask = en_encoding["attention_mask"].squeeze(0)
         vi_input_ids = vi_encoding["input_ids"].squeeze(0)
         vi_attention_mask = vi_encoding["attention_mask"].squeeze(0)
 
-        # 4. Tìm vị trí index của token [SEP] đầu tiên xuất hiện trong chuỗi
+        # 4. Tìm vị trí index của token [SEP] đầu tiên xuất hiện trong chuỗi của nhánh VI
         sep_id = self.tokenizer.sep_token_id
         
         def find_sep_idx(input_ids, sep_token_id):
@@ -72,14 +73,16 @@ class SquadParallelDataset(Dataset):
                 return matches[0].item()
             return 0
 
-        en_question_end = find_sep_idx(en_input_ids, sep_id)
         vi_question_end = find_sep_idx(vi_input_ids, sep_id)
 
         # Định dạng Output của __getitem__
         return {
             "en_input_ids": en_input_ids,
             "en_attention_mask": en_attention_mask,
-            "en_question_end": torch.tensor(en_question_end, dtype=torch.long),
+            "en_start_position": en_start_position,
+            "en_end_position": en_end_position,
+            "en_is_answerable": en_is_answerable,
+            "en_question_end": en_question_end,
             "vi_input_ids": vi_input_ids,
             "vi_attention_mask": vi_attention_mask,
             "vi_question_end": torch.tensor(vi_question_end, dtype=torch.long)
@@ -98,10 +101,19 @@ def create_squad_parallel_dataloaders(tokenizer, en_path="dataset/Squad2.0/train
             for paragraph in article['paragraphs']:
                 context = paragraph['context']
                 for qa in paragraph['qas']:
+                    if qa.get("answers") and len(qa["answers"]) > 0:
+                        first = qa["answers"][0]
+                        answer_dict = {
+                            "text": [first["text"]],
+                            "answer_start": [int(first["answer_start"])],
+                        }
+                    else:
+                        answer_dict = {"text": [], "answer_start": []}
                     en_dict[qa['id']] = {
                         'id': qa['id'],
                         'question': qa['question'],
-                        'context': context
+                        'context': context,
+                        'answer': answer_dict
                     }
 
     # Bước 2: Tải dữ liệu tiếng Việt từ local parquet file

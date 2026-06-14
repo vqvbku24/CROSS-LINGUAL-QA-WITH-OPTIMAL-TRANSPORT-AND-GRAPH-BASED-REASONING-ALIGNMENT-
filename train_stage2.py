@@ -54,12 +54,13 @@ STAGE2_CONFIG = {
     "model_name"      : "xlm-roberta-base",
 
     # Loss weights
-    "lambda_ot"       : 1.0,
-    "lambda_reg"      : 50.0,   # EN consistency regularisation (paper: 50, start lower for encoder)
+    "lambda_ot"       : 10.0,
+    "lambda_reg"      : 25.0,   # EN consistency regularisation (paper: 50, start lower for encoder)
     "lambda_span"     : 0.0,    # Disabled — gamma too uniform for reliable pseudo-labels
+    "lambda_qa"       : 1.0,    # Supervised EN QA loss weight
 
     # OT hyperparameters
-    "epsilon"         : 0.05,    # Restored to paper default (0.05 hurts XSQuAD per ablation)
+    "epsilon"         : 0.1,    # Restored to paper default (0.05 hurts XSQuAD per ablation)
     "sinkhorn_iters"  : 100,
 
     # Optimizer
@@ -210,6 +211,7 @@ def stage2_step(
     from phase3_loss.losses import (
         sinkhorn_masked, compute_span_loss,
         compute_reg_loss, gamma_entropy, _extract_question_embeddings,
+        qa_loss,
     )
 
     # ── 1. EN branch — LoRA OFF, no gradient (frozen anchor) ────
@@ -227,10 +229,17 @@ def stage2_step(
                 h_en_frz, en_q_emb, en_q_mask
             )
 
-    # ── 2. EN branch — LoRA ON, with gradient (for L_Reg) ───────
-    # NOTE: LoRA is ON here — gradient flows through LoRA weights via L_Reg
+    # ── 2. EN branch — LoRA ON, with gradient (for L_Reg, L_qa, L_has_ans) ───
+    # NOTE: LoRA is ON here — gradient flows through LoRA weights via L_Reg, L_qa, L_has_ans
     en_lora_out = model(batch, branch="en")
     h_en_lora   = en_lora_out["hidden"]   # (B, T_en, H) — has gradient
+
+    en_q_emb_lora, en_q_mask_lora = _extract_question_embeddings(
+        h_en_lora, batch["en_question_end"]
+    )
+    en_lora_start_logits, en_lora_end_logits, en_lora_has_ans = criterion.qa_head(
+        h_en_lora, en_q_emb_lora, en_q_mask_lora
+    )
 
     # ── 3. VI branch — LoRA ON, with gradient ───────────────────
     vi_out    = model(batch, branch="vi")
@@ -253,6 +262,28 @@ def stage2_step(
     # ── 5. EN Consistency Regularisation (KEY NEW LOSS) ─────────
     L_reg = compute_reg_loss(h_en_lora, h_en_frz, en_mask)
 
+    # ── 5b. Supervised EN QA & HasAnswer Loss ───────────────────
+    en_seq_len = h_en_lora.size(1)
+    en_start = batch["en_start_position"].clamp(max=en_seq_len - 1)
+    en_end   = batch["en_end_position"].clamp(max=en_seq_len - 1)
+
+    answerable_mask = batch["en_is_answerable"].bool().to(device)
+    if answerable_mask.any():
+        L_qa, _, _ = qa_loss(
+            en_lora_start_logits[answerable_mask],
+            en_lora_end_logits[answerable_mask],
+            en_start[answerable_mask],
+            en_end[answerable_mask],
+        )
+    else:
+        L_qa = torch.tensor(0.0, device=device)
+
+    has_answer_label = batch["en_is_answerable"].float().to(device)
+    L_has_ans = F.binary_cross_entropy_with_logits(
+        en_lora_has_ans,
+        has_answer_label,
+    )
+
     # ── 6. Span loss (disabled by default, kept for ablation) ────
     L_span = compute_span_loss(
         gamma_list, en_start_logits, en_end_logits,
@@ -261,7 +292,7 @@ def stage2_step(
     )
 
     # ── 7. Combine losses ────────────────────────────────────────
-    losses = stage2_loss(L_ot, L_reg, L_span, epoch)
+    losses = stage2_loss(L_ot, L_reg, L_span, L_qa, L_has_ans, epoch)
 
     # ── 8. Debug metrics ─────────────────────────────────────────
     with torch.no_grad():
@@ -394,10 +425,11 @@ def run_stage2(config: dict):
         lambda_ot   = config["lambda_ot"],
         lambda_reg  = config["lambda_reg"],
         lambda_span = config["lambda_span"],
+        lambda_qa   = config["lambda_qa"],
     ).to(device)
 
     log.info(
-        f"Stage 2 Loss config: lambda_ot={config['lambda_ot']}, lambda_reg={config['lambda_reg']}"
+        f"Stage 2 Loss config: lambda_ot={config['lambda_ot']}, lambda_reg={config['lambda_reg']}, lambda_qa={config['lambda_qa']}"
     )
 
     # ── TensorBoard ─────────────────────────────────────────────
@@ -467,7 +499,7 @@ def run_stage2(config: dict):
         log.info(f"{'━'*60}")
         log.info(f"Epoch {epoch}/{config['max_epochs']}")
 
-        epoch_losses = {"total": 0.0, "ot": 0.0, "reg": 0.0, "span": 0.0}
+        epoch_losses = {"total": 0.0, "ot": 0.0, "reg": 0.0, "span": 0.0, "qa": 0.0, "has_ans": 0.0}
         step_count   = 0
 
         for batch in train_loader:
@@ -495,7 +527,7 @@ def run_stage2(config: dict):
             global_step += 1
             step_count  += 1
 
-            for k in ("total", "ot", "reg", "span"):
+            for k in ("total", "ot", "reg", "span", "qa", "has_ans"):
                 v = losses.get(k)
                 if isinstance(v, torch.Tensor):
                     epoch_losses[k] += v.item()
@@ -513,6 +545,8 @@ def run_stage2(config: dict):
                     f"ot={losses['ot'].item():.4f} | "
                     f"reg={losses['reg'].item():.4f} | "
                     f"span={losses['span'].item():.4f} (w={span_w:.2f}) | "
+                    f"qa={losses['qa'].item():.4f} | "
+                    f"has_ans={losses['has_ans'].item():.4f} | "
                     f"γ_H={g_ent:.2f}"
                 )
 
@@ -520,6 +554,8 @@ def run_stage2(config: dict):
                 writer.add_scalar("Loss/OT",            losses["ot"].item(),    global_step)
                 writer.add_scalar("Loss/Reg",           losses["reg"].item(),   global_step)
                 writer.add_scalar("Loss/Span",          losses["span"].item(),  global_step)
+                writer.add_scalar("Loss/QA",            losses["qa"].item(),    global_step)
+                writer.add_scalar("Loss/HasAns",        losses["has_ans"].item(), global_step)
                 writer.add_scalar("Lambda/Span_Weight", span_w,                 global_step)
                 writer.add_scalar("Debug/Gamma_Entropy", g_ent,                 global_step)
                 writer.add_scalar("Learning_Rate/Head",
@@ -529,7 +565,8 @@ def run_stage2(config: dict):
         avg = {k: v / max(step_count, 1) for k, v in epoch_losses.items()}
         log.info(
             f"Epoch {epoch} avg | total={avg['total']:.4f} | "
-            f"ot={avg['ot']:.4f} | reg={avg['reg']:.4f} | span={avg['span']:.4f}"
+            f"ot={avg['ot']:.4f} | reg={avg['reg']:.4f} | span={avg['span']:.4f} | "
+            f"qa={avg['qa']:.4f} | has_ans={avg['has_ans']:.4f}"
         )
 
         # ── Evaluation ───────────────────────────────────────────
@@ -662,6 +699,7 @@ def parse_args() -> dict:
     parser.add_argument("--lambda_ot",      type=float, default=STAGE2_CONFIG["lambda_ot"])
     parser.add_argument("--lambda_reg",     type=float, default=STAGE2_CONFIG["lambda_reg"])
     parser.add_argument("--lambda_span",    type=float, default=STAGE2_CONFIG["lambda_span"])
+    parser.add_argument("--lambda_qa",      type=float, default=STAGE2_CONFIG["lambda_qa"])
     parser.add_argument("--epsilon",        type=float, default=STAGE2_CONFIG["epsilon"])
     parser.add_argument("--sinkhorn_iters", type=int,   default=STAGE2_CONFIG["sinkhorn_iters"])
     parser.add_argument("--patience",       type=int,   default=STAGE2_CONFIG["patience"])
