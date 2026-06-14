@@ -54,14 +54,14 @@ STAGE2_CONFIG = {
     "model_name"      : "xlm-roberta-base",
 
     # Loss weights
-    "lambda_ot"       : 10.0,
-    "lambda_reg"      : 25.0,   # EN consistency regularisation (paper: 50, start lower for encoder)
+    "lambda_ot"       : 5.0,
+    "lambda_reg"      : 35.0,   # EN consistency regularisation (paper: 50, start lower for encoder)
     "lambda_span"     : 0.0,    # Disabled — gamma too uniform for reliable pseudo-labels
-    "lambda_qa"       : 1.0,    # Supervised EN QA loss weight
+    "lambda_qa"       : 2.0,    # Supervised EN QA loss weight
 
     # OT hyperparameters
-    "epsilon"         : 0.1,    # Restored to paper default (0.05 hurts XSQuAD per ablation)
-    "sinkhorn_iters"  : 100,
+    "epsilon"         : 0.07,   # Restored to paper default (0.05 hurts XSQuAD per ablation)
+    "sinkhorn_iters"  : 150,
 
     # Optimizer
     "stage2_head_lr"  : 5e-5,       # QA head + layer_weights
@@ -71,13 +71,13 @@ STAGE2_CONFIG = {
     # Training
     "batch_size"      : 32,
     "max_epochs"      : 10,
-    "max_grad_norm"   : 1.0,
+    "max_grad_norm"   : 1,
     "max_length"      : 384,
 
     # Early stopping
     "patience"        : 3,
     "min_delta_em"    : 0.5,        # minimum EM improvement to reset patience
-    "en_em_safety"    : 20.0,       # hard stop if EN EM drops more than this
+    "en_em_safety"    : 25.0,       # hard stop if EN EM drops more than this
 
     # Curriculum (in steps, computed relative to steps_per_epoch)
 
@@ -511,9 +511,16 @@ def run_stage2(config: dict):
 
             optimizer.zero_grad()
 
+            # Epsilon linear annealing (disabled)
+            # eps_start = config["epsilon_start"]
+            # eps_end   = config["epsilon_end"]
+            # ratio     = min(1.0, global_step / max(1, total_steps))
+            # current_epsilon = eps_start - ratio * (eps_start - eps_end)
+            current_epsilon = config["epsilon"]
+
             losses = stage2_step(
                 batch, model, criterion, stage2_loss,
-                epsilon=config["epsilon"],
+                epsilon=current_epsilon,
                 n_iters=config["sinkhorn_iters"],
                 epoch=epoch,
                 device=device,
@@ -552,6 +559,7 @@ def run_stage2(config: dict):
                     f"w_ot={losses['weighted_ot'].item():.4f} | "
                     f"w_reg={losses['weighted_reg'].item():.4f} | "
                     f"w_qa={losses['weighted_qa'].item():.4f} | "
+                    f"eps={current_epsilon:.4f} | "
                     f"γ_H={g_ent:.2f}"
                 )
 
@@ -574,6 +582,7 @@ def run_stage2(config: dict):
                 writer.add_scalar("Debug/Gamma_Entropy", g_ent,                 global_step)
                 writer.add_scalar("Learning_Rate/Head",
                                   optimizer.param_groups[1]["lr"],             global_step)
+                writer.add_scalar("Hyperparameters/Epsilon", current_epsilon, global_step)
 
         # ── End of epoch summary ─────────────────────────────────
         avg = {k: v / max(step_count, 1) for k, v in epoch_losses.items()}
