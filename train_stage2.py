@@ -60,9 +60,9 @@ STAGE2_CONFIG = {
     "lambda_qa"       : 0.3,    # Supervised EN QA loss weight
 
     # OT hyperparameters
-    "epsilon"         : 0.03,   # Restored to paper default (0.05 hurts XSQuAD per ablation)
-    "epsilon_end"     : 0.03,
-    "sinkhorn_iters"  : 100,
+    "epsilon"         : 0.01,   # Restored to paper default (0.05 hurts XSQuAD per ablation)
+    "epsilon_end"     : 0.01,
+    "sinkhorn_iters"  : 200,
 
     # Optimizer
     "stage2_head_lr"  : 5e-5,       # QA head + layer_weights
@@ -71,12 +71,12 @@ STAGE2_CONFIG = {
 
     # Training
     "batch_size"      : 32,
-    "max_epochs"      : 10,
+    "max_epochs"      : 3,
     "max_grad_norm"   : 1,
     "max_length"      : 384,
 
     # Early stopping
-    "patience"        : 3,
+    "patience"        : 2,
     "min_delta_em"    : 0.5,        # minimum EM improvement to reset patience
     "en_em_safety"    : 25.0,       # hard stop if EN EM drops more than this
 
