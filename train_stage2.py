@@ -142,7 +142,8 @@ def save_stage2_checkpoint(path: str, epoch: int, global_step: int,
                             config: dict, vi_em: float, best_vi_em: float,
                             patience_count: int):
     # Save only trainable parameters to save space (LoRA + layer_weights)
-    trainable_state_dict = {k: v for k, v in model.state_dict().items() if v.requires_grad}
+    trainable_keys = {n for n, p in model.named_parameters() if p.requires_grad}
+    trainable_state_dict = {k: v for k, v in model.state_dict().items() if k in trainable_keys}
 
     torch.save({
         "epoch"           : epoch,
@@ -211,7 +212,7 @@ def stage2_step(
     """
     from phase3_loss.losses import (
         sinkhorn_masked, compute_span_loss,
-        compute_reg_loss, gamma_entropy, _extract_question_embeddings,
+        gamma_entropy, _extract_question_embeddings,
         qa_loss,
     )
 
@@ -261,7 +262,12 @@ def stage2_step(
     )
 
     # ── 5. EN Consistency Regularisation (KEY NEW LOSS) ─────────
-    L_reg = compute_reg_loss(h_en_lora, h_en_frz, en_mask)
+    # Calculate cosine similarity along the hidden dimension (dim=-1)
+    cos_sim = torch.nn.functional.cosine_similarity(h_en_lora, h_en_frz, dim=-1) # (B, T_en)
+    
+    # Mask out PAD tokens so they don't dilute the regularisation
+    valid_tokens_count = en_mask.float().sum().clamp(min=1.0)
+    L_reg = 1.0 - (cos_sim * en_mask.float()).sum() / valid_tokens_count
 
     # ── 5b. Supervised EN QA & HasAnswer Loss ───────────────────
     en_seq_len = h_en_lora.size(1)
@@ -470,6 +476,11 @@ def run_stage2(config: dict):
             # Load states
             model.load_state_dict(ckpt["model_state"], strict=False)
             criterion.load_state_dict(ckpt["criterion_state"])
+            
+            # Re-apply QA head freeze if enabled in config
+            if config.get("freeze_qa_head", False):
+                freeze_qa_head(criterion)
+                
             optimizer.load_state_dict(ckpt["optimizer_state"])
             if ckpt.get("scheduler_state") and scheduler:
                 scheduler.load_state_dict(ckpt["scheduler_state"])
@@ -507,24 +518,23 @@ def run_stage2(config: dict):
         }
         step_count   = 0
 
-        for batch in train_loader:
+        for step, batch in enumerate(train_loader):
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
             optimizer.zero_grad()
 
-            # Epsilon scheduler: epoch 1 uses epsilon, epochs 2+ anneal from epsilon to epsilon_end
+            steps_per_epoch = len(train_loader)
             if epoch == 1:
-                current_epsilon = config["epsilon"]
+                # Linearly decay from 0.1 to 0.03 over the first epoch
+                decay_ratio = min(1.0, (step + 1) / steps_per_epoch)
+                current_eps = 0.1 - decay_ratio * (0.1 - 0.03)
             else:
-                steps_in_epoch1 = steps_per_epoch
-                decay_steps = max(1, total_steps - steps_in_epoch1)
-                elapsed = max(0, global_step - steps_in_epoch1)
-                ratio = min(1.0, elapsed / decay_steps)
-                current_epsilon = config["epsilon"] - ratio * (config["epsilon"] - config["epsilon_end"])
+                # Keep it sharp at 0.03 for all subsequent epochs
+                current_eps = 0.03
 
             losses = stage2_step(
                 batch, model, criterion, stage2_loss,
-                epsilon=current_epsilon,
+                epsilon=current_eps,
                 n_iters=config["sinkhorn_iters"],
                 epoch=epoch,
                 device=device,
@@ -560,10 +570,11 @@ def run_stage2(config: dict):
                     f"raw_ot={losses['raw_ot_loss'].item():.4f} | "
                     f"raw_reg={losses['raw_reg_loss'].item():.4f} | "
                     f"raw_qa={losses['raw_qa_loss'].item():.4f} | "
+                    f"has_ans={losses['has_ans'].item():.4f} | "
                     f"w_ot={losses['weighted_ot'].item():.4f} | "
                     f"w_reg={losses['weighted_reg'].item():.4f} | "
                     f"w_qa={losses['weighted_qa'].item():.4f} | "
-                    f"eps={current_epsilon:.4f} | "
+                    f"eps={current_eps:.4f} | "
                     f"γ_H={g_ent:.2f}"
                 )
 
@@ -586,7 +597,7 @@ def run_stage2(config: dict):
                 writer.add_scalar("Debug/Gamma_Entropy", g_ent,                 global_step)
                 writer.add_scalar("Learning_Rate/Head",
                                   optimizer.param_groups[1]["lr"],             global_step)
-                writer.add_scalar("Hyperparameters/Epsilon", current_epsilon, global_step)
+                writer.add_scalar("Hyperparameters/Epsilon", current_eps, global_step)
 
         # ── End of epoch summary ─────────────────────────────────
         avg = {k: v / max(step_count, 1) for k, v in epoch_losses.items()}
