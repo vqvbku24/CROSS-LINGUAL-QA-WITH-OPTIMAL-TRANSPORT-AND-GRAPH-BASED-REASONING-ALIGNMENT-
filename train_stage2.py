@@ -54,15 +54,15 @@ STAGE2_CONFIG = {
     "model_name"      : "xlm-roberta-base",
 
     # Loss weights
-    "lambda_ot"       : 10.0,
+    "lambda_ot"       : 0.5,
     "lambda_reg"      : 50.0,   # EN consistency regularisation (paper: 50, start lower for encoder)
-    "lambda_span"     : 0.0,    # Disabled — gamma too uniform for reliable pseudo-labels
-    "lambda_qa"       : 1.0,    # Supervised EN QA loss weight
+    "lambda_span"     : 1.0,    # Disabled — gamma too uniform for reliable pseudo-labels
+    "lambda_qa"       : 0.3,    # Supervised EN QA loss weight
 
     # OT hyperparameters
-    "epsilon"         : 0.1,   # Restored to paper default (0.05 hurts XSQuAD per ablation)
+    "epsilon"         : 0.03,   # Restored to paper default (0.05 hurts XSQuAD per ablation)
     "epsilon_end"     : 0.03,
-    "sinkhorn_iters"  : 150,
+    "sinkhorn_iters"  : 100,
 
     # Optimizer
     "stage2_head_lr"  : 5e-5,       # QA head + layer_weights
@@ -523,14 +523,15 @@ def run_stage2(config: dict):
 
             optimizer.zero_grad()
 
-            steps_per_epoch = len(train_loader)
-            if epoch == 1:
-                # Linearly decay from 0.1 to 0.03 over the first epoch
-                decay_ratio = min(1.0, (step + 1) / steps_per_epoch)
-                current_eps = 0.1 - decay_ratio * (0.1 - 0.03)
-            else:
-                # Keep it sharp at 0.03 for all subsequent epochs
-                current_eps = 0.03
+            # steps_per_epoch = len(train_loader)
+            # if epoch == 1:
+            #     # Linearly decay from 0.1 to 0.03 over the first epoch
+            #     decay_ratio = min(1.0, (step + 1) / steps_per_epoch)
+            #     current_eps = 0.1 - decay_ratio * (0.1 - 0.03)
+            # else:
+            #     # Keep it sharp at 0.03 for all subsequent epochs
+            #     current_eps = 0.03
+            current_eps = 0.03
 
             losses = stage2_step(
                 batch, model, criterion, stage2_loss,
