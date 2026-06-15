@@ -510,21 +510,17 @@ class OTAlignmentLoss(nn.Module):
         )
 
         # ══════════════════════════════════════════════════════
-        # 4. L_qa (supervised EN) — only answerable samples
+        # 4. L_qa (supervised EN) — on all samples (including unanswerable -> start/end=0)
         # ══════════════════════════════════════════════════════
         answerable_mask = batch["en_is_answerable"].bool().to(device)
 
-        if answerable_mask.any():
-            l_qa, l_qa_start, l_qa_end = qa_loss(
-                en_start_logits[answerable_mask],
-                en_end_logits[answerable_mask],
-                en_start[answerable_mask],
-                en_end[answerable_mask],
-            )
-        else:
-            l_qa       = torch.tensor(0.0, device=device)
-            l_qa_start = torch.tensor(0.0, device=device)
-            l_qa_end   = torch.tensor(0.0, device=device)
+        # Train on entire batch so model learns to predict index 0 ([CLS]) for unanswerable
+        l_qa, l_qa_start, l_qa_end = qa_loss(
+            en_start_logits,
+            en_end_logits,
+            en_start,
+            en_end,
+        )
 
         # ══════════════════════════════════════════════════════
         # 5. L_has_answer (BCE) — EN only, no pos_weight
@@ -1015,15 +1011,8 @@ class Stage2Loss(nn.Module):
         Returns:
             dict with "total", "ot", "reg", "span", "span_weight", "qa", "has_ans"
         """
-        # curriculum for w_span: starts at epoch 3, ramps up over epochs 4 and 5
-        if epoch < 3:
-            w_span = 0.0
-        elif epoch == 3:
-            w_span = 0.33
-        elif epoch == 4:
-            w_span = 0.66
-        else:
-            w_span = 1.0
+        # Span loss is enabled from the start (no annealing)
+        w_span = 1.0
 
         L_total = (
             self.lambda_ot   * L_ot
@@ -1045,8 +1034,10 @@ class Stage2Loss(nn.Module):
             "raw_ot_loss":  L_ot.detach(),
             "raw_reg_loss": L_reg.detach(),
             "raw_qa_loss":  (L_qa + L_has_ans).detach(),
+            "raw_span_loss": L_span.detach(),
             
             "weighted_ot":  (self.lambda_ot * L_ot).detach(),
             "weighted_reg": (self.lambda_reg * L_reg).detach(),
             "weighted_qa":  (self.lambda_qa * (L_qa + L_has_ans)).detach(),
+            "weighted_span": (self.lambda_span * w_span * L_span).detach(),
         }

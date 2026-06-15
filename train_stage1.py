@@ -59,7 +59,10 @@ def run_stage1(config):
     # Model (compute_cost_matrix=False for speed)
     model = CrossLingualOTModel(model_name=config["model_name"], compute_cost_matrix=False).to(device)
     
-    # Loss (all OT/span/cons turned off)
+    # Loss — OT/span/cons đều tắt (λ=0), chỉ L_qa + L_has_ans hoạt động.
+    # L_qa train trên toàn bộ batch (unanswerable -> start=0, end=0).
+    # L_has_ans train trên toàn bộ batch (BCE).
+    # → Model sẽ học cách predict [CLS] (index 0) cho unanswerable.
     criterion = OTAlignmentLoss(
         hidden_size=model.hidden_size,
         lambda_ot=0.0,
@@ -93,26 +96,32 @@ def run_stage1(config):
         for step, batch in enumerate(loader):
             batch = {k: v.to(device) for k, v in batch.items()}
             
-            # Use branch="en" to skip VI branch computation
+            # EN-only forward pass (branch="en" bỏ qua VI encoder hoàn toàn)
             outputs = model(batch, branch="en")
             
             B, L, H = outputs["hidden"].shape
-            # Dummy values for VI branch to prevent crashing in OTAlignmentLoss QA head
-            dummy_vi = torch.zeros(B, 2, H, device=device)
-            dummy_vi_mask = torch.zeros(B, 2, dtype=torch.bool, device=device)
+
+            # Dummy VI branch — Stage 1 chỉ train EN, không có VI data thật.
+            # Shape (B, 2, H): đủ để vi_question_end=1 không out-of-bounds.
+            # dummy_vi_mask = toàn True (PAD) để SWD/Sinkhorn bỏ qua VI tokens.
+            dummy_vi      = torch.zeros(B, 2, H, device=device)
+            dummy_vi_mask = torch.ones(B, 2, dtype=torch.bool, device=device)
             batch["vi_question_end"] = torch.ones(B, dtype=torch.long, device=device)
-            
+
             model_outputs = {
-                "en_hidden": outputs["hidden"],
-                "vi_hidden": dummy_vi,
-                "en_pad_mask": outputs["en_pad_mask"],
-                "vi_pad_mask": dummy_vi_mask,
-                "cost_matrix": torch.zeros(B, 2, 2, device=device)
+                "en_hidden"   : outputs["hidden"],
+                "vi_hidden"   : dummy_vi,
+                "en_pad_mask" : outputs["en_pad_mask"],
+                "vi_pad_mask" : dummy_vi_mask,
+                "cost_matrix" : torch.zeros(B, 2, 2, device=device),
             }
-            
+
+            # L_qa train trên toàn bộ batch (kể cả unanswerable)       ✓
+            # losses["has_ans"] = BCE   trên toàn batch            ✓
+            # losses["ot"]      = 0.0   vì lambda_ot=0.0           ✓
+            # losses["total"]   = L_qa + L_has_ans                 ✓
             losses = criterion(model_outputs, batch)
             
-            # Stage 1 Loss = L_qa + L_has_ans only
             loss = losses["total"]
             loss.backward()
             
@@ -125,7 +134,14 @@ def run_stage1(config):
             epoch_loss += loss.item()
             
             if step % 50 == 0:
-                log.info(f"Epoch {epoch} Step {step}/{len(loader)} | Loss: {loss.item():.4f} (QA: {losses['qa'].item():.4f}, Ans: {losses['has_ans'].item():.4f})")
+                ans_count = batch["en_is_answerable"].sum().item()
+                log.info(
+                    f"Epoch {epoch} Step {step}/{len(loader)} | "
+                    f"Loss: {loss.item():.4f} "
+                    f"(QA: {losses['qa'].item():.4f}, "
+                    f"HasAns: {losses['has_ans'].item():.4f}, "
+                    f"answerable: {ans_count}/{B})"
+                )
                 
         log.info(f"━━ Epoch {epoch} Avg Loss: {epoch_loss/len(loader):.4f} ━━")
         

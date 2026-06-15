@@ -66,6 +66,8 @@ def quick_em(model, criterion, tokenizer, dev_file, n_samples=200, device="cuda"
 
             # Mask out question tokens (từ index 0 đến q_end_val)
             question_mask = torch.arange(start_logits.size(1), device=device) <= q_end_val
+            # UNMASK index 0 ([CLS] token) so the model can predict "unanswerable"
+            question_mask[0] = False 
             start_logits[0].masked_fill_(question_mask, float('-inf'))
             end_logits[0].masked_fill_(question_mask, float('-inf'))
 
@@ -198,6 +200,8 @@ def quick_em_xquad_vi(
 
             # Mask out question tokens (từ index 0 đến q_end_val)
             question_mask = torch.arange(start_logits.size(1), device=device) <= q_end_val
+            # UNMASK index 0 ([CLS] token) so the model can predict "unanswerable"
+            question_mask[0] = False 
             start_logits[0].masked_fill_(question_mask, float('-inf'))
             end_logits[0].masked_fill_(question_mask, float('-inf'))
 
@@ -226,7 +230,8 @@ if __name__ == "__main__":
     from transformers import AutoTokenizer
 
     parser = argparse.ArgumentParser(description="Quick Evaluation Runner")
-    parser.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint")
+    parser.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint (Stage 1 or Stage 2)")
+    parser.add_argument("--stage1_ckpt", type=str, default=None, help="Path to Stage 1 base checkpoint (Required if --ckpt is a Stage 2 LoRA checkpoint)")
     parser.add_argument("--eval_file", type=str, required=True, help="Path to evaluation SQuAD JSON file")
     parser.add_argument("--n_samples", type=int, default=180, help="Number of samples to evaluate")
     parser.add_argument("--model_name", type=str, default="xlm-roberta-base", help="Model name")
@@ -253,10 +258,27 @@ if __name__ == "__main__":
         else:
             raise FileNotFoundError(f"Checkpoint not found: {args.ckpt}")
 
+    # If stage1_ckpt is provided, load it first, then apply LoRA, then load the Stage 2 ckpt
+    if args.stage1_ckpt:
+        print(f"Loading Stage 1 base from: {args.stage1_ckpt}")
+        ckpt_stage1 = torch.load(args.stage1_ckpt, map_location=device)
+        if "model_state" in ckpt_stage1:
+            model.load_state_dict(ckpt_stage1["model_state"], strict=False)
+            if "criterion_state" in ckpt_stage1 and ckpt_stage1["criterion_state"] is not None:
+                criterion.load_state_dict(ckpt_stage1["criterion_state"], strict=False)
+        else:
+            model.load_state_dict(ckpt_stage1, strict=False)
+        
+        print("Applying LoRA to model...")
+        model.apply_lora()
+        model.to(device)
+
+    # Load the main checkpoint (either Stage 1 or Stage 2 LoRA)
     ckpt = torch.load(args.ckpt, map_location=device)
     
     # Check if checkpoint has dict keys or is direct state dict
     if "model_state" in ckpt:
+        # Load model_state. strict=False allows loading LoRA weights smoothly
         model.load_state_dict(ckpt["model_state"], strict=False)
         if "criterion_state" in ckpt and ckpt["criterion_state"] is not None:
             criterion.load_state_dict(ckpt["criterion_state"], strict=False)
@@ -307,7 +329,7 @@ if __name__ == "__main__":
             q_mask = torch.zeros(1, q_end_val, dtype=torch.bool, device=device)
 
             # Predict logits
-            start_logits, end_logits, _ = criterion.qa_head(hidden, q_emb, q_mask)
+            start_logits, end_logits, has_ans_logit = criterion.qa_head(hidden, q_emb, q_mask)
 
             # Mask out padding tokens
             padding_mask = (attn_mask[0] == 0)
@@ -316,6 +338,8 @@ if __name__ == "__main__":
 
             # Mask out question tokens (từ index 0 đến q_end_val)
             question_mask = torch.arange(start_logits.size(1), device=device) <= q_end_val
+            # UNMASK index 0 ([CLS] token) so the model can predict "unanswerable"
+            question_mask[0] = False 
             start_logits[0].masked_fill_(question_mask, float('-inf'))
             end_logits[0].masked_fill_(question_mask, float('-inf'))
 
@@ -330,7 +354,14 @@ if __name__ == "__main__":
             pred_ids = input_ids[0][start_idx: end_idx + 1]
             pred_span = tokenizer.decode(pred_ids, skip_special_tokens=True).strip()
 
-            is_correct = _exact_match_score(pred_span, ground_truths)
+            is_answerable_pred = has_ans_logit.item() > 0
+            if len(ground_truths) == 0:
+                is_correct = not is_answerable_pred
+            else:
+                if not is_answerable_pred:
+                    is_correct = False
+                else:
+                    is_correct = _exact_match_score(pred_span, ground_truths)
             if is_correct:
                 correct += 1
             total += 1
