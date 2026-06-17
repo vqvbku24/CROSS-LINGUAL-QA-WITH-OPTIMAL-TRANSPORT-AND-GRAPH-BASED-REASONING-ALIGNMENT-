@@ -60,9 +60,9 @@ STAGE2_CONFIG = {
     "lambda_qa"       : 0.3,    # Supervised EN QA loss weight
 
     # OT hyperparameters
-    "epsilon"         : 0.01,   # Restored to paper default (0.05 hurts XSQuAD per ablation)
-    "epsilon_end"     : 0.01,
-    "sinkhorn_iters"  : 200,
+    "epsilon"         : 0.03,   # Restored to paper default (0.05 hurts XSQuAD per ablation)
+    "epsilon_end"     : 0.03,
+    "sinkhorn_iters"  : 100,
 
     # Optimizer
     "stage2_head_lr"  : 5e-5,       # QA head + layer_weights
@@ -71,7 +71,7 @@ STAGE2_CONFIG = {
 
     # Training
     "batch_size"      : 32,
-    "max_epochs"      : 3,
+    "max_epochs"      : 1,
     "max_grad_norm"   : 1,
     "max_length"      : 384,
 
@@ -179,8 +179,8 @@ def compute_en_em_baseline(model, criterion, tokenizer, config: dict, device: to
         log.warning(f"SQuAD dev not found at {dev_file} — EN EM safety check disabled")
         return float("inf")  # disable safety check
 
-    em = mod.quick_em(model, criterion, tokenizer, dev_file, n_samples=200, device=device)
-    log.info(f"Stage 1 EN EM baseline (200 samples): {em:.2f}%")
+    em, f1 = mod.quick_em_f1(model, criterion, tokenizer, dev_file, n_samples=200, device=device)
+    log.info(f"Stage 1 EN EM baseline (200 samples): {em:.2f}%, F1: {f1:.2f}%")
     return em
 
 
@@ -194,6 +194,7 @@ def stage2_step(
     criterion,
     stage2_loss,
     epsilon: float,
+    alpha: float,
     n_iters: int,
     epoch: int,
     device: torch.device,
@@ -222,6 +223,10 @@ def stage2_step(
             en_frz_out = model(batch, branch="en")
             h_en_frz   = en_frz_out["hidden"]        # (B, T_en, H) — detached anchor
             en_mask    = ~en_frz_out["en_pad_mask"]  # (B, T_en) True = real token
+
+            # Add VI frozen pass for teacher gamma
+            vi_frz_out = model(batch, branch="vi")
+            h_vi_frz   = vi_frz_out["hidden"]        # (B, T_vi, H) — detached teacher
 
             # QA head on frozen EN → pseudo-label logits (for L_span if ever used)
             en_q_emb, en_q_mask = _extract_question_embeddings(
@@ -255,11 +260,45 @@ def stage2_step(
         h_vi, vi_q_emb, vi_q_mask
     )
 
-    # ── 4. Sinkhorn OT (uses frozen h_en_frz as anchor) ─────────
-    gamma_list, L_ot = sinkhorn_masked(
+    # ── 4. Sinkhorn OT (EMA Teacher-Student) ─────────
+    # a) Teacher OT (frozen EN vs frozen VI)
+    gamma_teacher, _ = sinkhorn_masked(
+        h_en_frz, h_vi_frz, en_mask, vi_mask,
+        epsilon=epsilon, n_iters=n_iters,
+    )
+
+    # b) Student OT (frozen EN vs trainable VI)
+    gamma_student, _ = sinkhorn_masked(
         h_en_frz, h_vi, en_mask, vi_mask,
         epsilon=epsilon, n_iters=n_iters,
     )
+
+    # c) Mix transport plans and compute cost
+    L_ot_list = []
+    gamma_list = []
+    for i in range(len(gamma_teacher)):
+        g_t = gamma_teacher[i]
+        g_s = gamma_student[i]
+        
+        # EMA combination
+        g_mix = alpha * g_t + (1.0 - alpha) * g_s
+        gamma_list.append(g_mix)
+
+        # Recompute student cost matrix (frozen EN vs trainable VI) to backpropagate
+        h_en_b = h_en_frz[i][en_mask[i]]
+        h_vi_b = h_vi[i][vi_mask[i]]
+        if h_en_b.size(0) == 0 or h_vi_b.size(0) == 0:
+            L_ot_list.append(torch.tensor(0.0, device=device, requires_grad=True))
+            continue
+            
+        h_en_n = F.normalize(h_en_b, dim=-1)
+        h_vi_n = F.normalize(h_vi_b, dim=-1)
+        C_student = 1.0 - h_en_n @ h_vi_n.T  # (n_en, n_vi)
+
+        # OT Transport loss (gradient flows through C_student)
+        L_ot_list.append((g_mix.detach() * C_student).sum())
+
+    L_ot = torch.stack(L_ot_list).mean() if L_ot_list else torch.tensor(0.0, device=device, requires_grad=True)
 
     # ── 5. EN Consistency Regularisation (KEY NEW LOSS) ─────────
     # Calculate cosine similarity along the hidden dimension (dim=-1)
@@ -534,11 +573,16 @@ def run_stage2(config: dict):
             # else:
             #     # Keep it sharp at 0.03 for all subsequent epochs
             #     current_eps = 0.03
-            current_eps = 0.03
+            current_eps = 0.01
+
+            # Calculate alpha smoothly based on global_step
+            # alpha(e) = 1.0 - 0.3 * (step / total_steps)
+            current_alpha = 1.0 - 0.3 * (global_step / max(1, total_steps))
 
             losses = stage2_step(
                 batch, model, criterion, stage2_loss,
                 epsilon=current_eps,
+                alpha=current_alpha,
                 n_iters=config["sinkhorn_iters"],
                 epoch=epoch,
                 device=device,
@@ -581,6 +625,7 @@ def run_stage2(config: dict):
                     f"w_span={losses.get('weighted_span', torch.tensor(0.0)).item():.4f} | "
                     f"w_qa={losses['weighted_qa'].item():.4f} | "
                     f"eps={current_eps:.4f} | "
+                    f"alpha={current_alpha:.4f} | "
                     f"γ_H={g_ent:.2f}"
                 )
 
@@ -606,6 +651,7 @@ def run_stage2(config: dict):
                 writer.add_scalar("Learning_Rate/Head",
                                   optimizer.param_groups[1]["lr"],             global_step)
                 writer.add_scalar("Hyperparameters/Epsilon", current_eps, global_step)
+                writer.add_scalar("Hyperparameters/Alpha", current_alpha, global_step)
 
         # ── End of epoch summary ─────────────────────────────────
         avg = {k: v / max(step_count, 1) for k, v in epoch_losses.items()}
@@ -623,21 +669,23 @@ def run_stage2(config: dict):
         spec.loader.exec_module(quick_eval_mod)
 
         # VI EM on XQuAD val
-        vi_em = quick_eval_mod.quick_em_xquad_vi(
+        vi_em, vi_f1 = quick_eval_mod.quick_em_f1_xquad_vi(
             model, criterion, tokenizer, val_pairs, device,
             max_length=config["max_length"],
         )
-        log.info(f"Epoch {epoch} XQuAD VI EM: {vi_em:.2f}%")
+        log.info(f"Epoch {epoch} XQuAD VI EM: {vi_em:.2f}%, F1: {vi_f1:.2f}%")
         writer.add_scalar("Eval/XQuAD_VI_EM", vi_em, epoch)
+        writer.add_scalar("Eval/XQuAD_VI_F1", vi_f1, epoch)
 
         # EN EM regression check (200 SQuAD samples)
         dev_file = os.path.join(config["root_dir"], "dataset", "Squad2.0", "dev-v2.0.json")
         if os.path.exists(dev_file):
-            en_em = quick_eval_mod.quick_em(
+            en_em, en_f1 = quick_eval_mod.quick_em_f1(
                 model, criterion, tokenizer, dev_file, n_samples=200, device=device,
             )
-            log.info(f"Epoch {epoch} SQuAD EN EM (200): {en_em:.2f}% (baseline={en_em_baseline:.2f}%)")
+            log.info(f"Epoch {epoch} SQuAD EN EM (200): {en_em:.2f}% (baseline={en_em_baseline:.2f}%), F1: {en_f1:.2f}%")
             writer.add_scalar("Eval/SQuAD_EN_EM_Quick", en_em, epoch)
+            writer.add_scalar("Eval/SQuAD_EN_F1_Quick", en_f1, epoch)
 
             drop = en_em_baseline - en_em
             if epoch >= 4 and drop > config["en_em_safety"]:
