@@ -573,11 +573,13 @@ def run_stage2(config: dict):
             # else:
             #     # Keep it sharp at 0.03 for all subsequent epochs
             #     current_eps = 0.03
-            current_eps = 0.01
+            current_eps = 0.03
 
             # Calculate alpha smoothly based on global_step
             # alpha(e) = 1.0 - 0.3 * (step / total_steps)
-            current_alpha = 1.0 - 0.3 * (global_step / max(1, total_steps))
+
+            # current_alpha = 1.0 - 0.3 * (global_step / max(1, total_steps))
+            current_alpha = 1.0
 
             losses = stage2_step(
                 batch, model, criterion, stage2_loss,
