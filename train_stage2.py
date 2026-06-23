@@ -71,7 +71,7 @@ STAGE2_CONFIG = {
 
     # Training
     "batch_size"      : 32,
-    "max_epochs"      : 1,
+    "max_epochs"      : 6,
     "max_grad_norm"   : 1,
     "max_length"      : 384,
 
@@ -535,9 +535,9 @@ def run_stage2(config: dict):
             
             # Restore RNG state
             if "rng_state_cpu" in ckpt:
-                torch.set_rng_state(ckpt["rng_state_cpu"])
+                torch.set_rng_state(ckpt["rng_state_cpu"].cpu())
             if "rng_state_cuda" in ckpt and torch.cuda.is_available() and ckpt["rng_state_cuda"] is not None:
-                torch.cuda.set_rng_state(ckpt["rng_state_cuda"])
+                torch.cuda.set_rng_state(ckpt["rng_state_cuda"].cpu())
                 
             log.info(f"  Resumed at Epoch {start_epoch}, Global Step {global_step}, Best VI EM: {best_vi_em:.2f}%")
         else:
