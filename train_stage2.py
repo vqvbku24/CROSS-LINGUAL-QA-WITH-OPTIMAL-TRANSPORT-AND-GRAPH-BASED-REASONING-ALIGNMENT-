@@ -50,13 +50,15 @@ log = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────
 
 STAGE2_CONFIG = {
-    "stage1_ckpt"     : "checkpoint/best.pt",
+    "stage1_ckpt"     : "checkpoints/stage1_squad_best.pt",
     "model_name"      : "xlm-roberta-base",
 
     # Loss weights
     "lambda_ot"       : 0.5,
     "lambda_reg"      : 50.0,   # EN consistency regularisation (paper: 50, start lower for encoder)
-    "lambda_span"     : 1.0,    # Disabled — gamma too uniform for reliable pseudo-labels
+    "lambda_span"     : 1.0,    # Span Loss
+    "lambda_margin"   : 1.0,    # Margin Loss (Decision boundary)
+    "anneal_margin"   : False,  # Dynamic margin schedule
     "lambda_qa"       : 0.3,    # Supervised EN QA loss weight
 
     # OT hyperparameters
@@ -212,9 +214,9 @@ def stage2_step(
         dict with all loss tensors and debug info
     """
     from phase3_loss.losses import (
-        sinkhorn_masked, compute_span_loss,
+        sinkhorn_masked, compute_span_loss, compute_pure_margin_loss,
         gamma_entropy, _extract_question_embeddings,
-        qa_loss,
+        qa_loss, compute_reg_loss,
     )
 
     # ── 1. EN branch — LoRA OFF, no gradient (frozen anchor) ────
@@ -301,12 +303,7 @@ def stage2_step(
     L_ot = torch.stack(L_ot_list).mean() if L_ot_list else torch.tensor(0.0, device=device, requires_grad=True)
 
     # ── 5. EN Consistency Regularisation (KEY NEW LOSS) ─────────
-    # Calculate cosine similarity along the hidden dimension (dim=-1)
-    cos_sim = torch.nn.functional.cosine_similarity(h_en_lora, h_en_frz, dim=-1) # (B, T_en)
-    
-    # Mask out PAD tokens so they don't dilute the regularisation
-    valid_tokens_count = en_mask.float().sum().clamp(min=1.0)
-    L_reg = 1.0 - (cos_sim * en_mask.float()).sum() / valid_tokens_count
+    L_reg = compute_reg_loss(h_en_lora, h_en_frz, en_mask)
 
     # ── 5b. Supervised EN QA & HasAnswer Loss ───────────────────
     en_seq_len = h_en_lora.size(1)
@@ -340,8 +337,18 @@ def stage2_step(
         en_mask, vi_mask,
     )
 
+    # ── 6b. Task-Space Boundary Preserving Loss (Margin Ranking) ──────────────
+    L_margin = compute_pure_margin_loss(
+        en_start, en_end,
+        en_start_logits, en_end_logits,
+        vi_start_logits, vi_end_logits,
+        en_mask, vi_mask,
+        answerable_mask,
+        device,
+    )
+
     # ── 7. Combine losses ────────────────────────────────────────
-    losses = stage2_loss(L_ot, L_reg, L_span, L_qa, L_has_ans, epoch)
+    losses = stage2_loss(L_ot, L_reg, L_span, L_margin, L_qa, L_has_ans, epoch)
 
     # ── 8. Debug metrics ─────────────────────────────────────────
     with torch.no_grad():
@@ -365,6 +372,23 @@ def stage2_step(
     losses["gamma_entropy"] = g_entropy
     return losses
 
+
+def get_annealed_margin(epoch: int, step: int, steps_per_epoch: int, max_epochs: int) -> float:
+    if epoch == 1:
+        return 0.3
+    elif epoch == 2:
+        ratio = (step + 1) / steps_per_epoch
+        return 0.3 + 0.2 * ratio
+    elif epoch == 3:
+        return 0.5
+    else:
+        # epoch >= 4
+        if max_epochs <= 3:
+            return 0.5
+        total_decay_steps = (max_epochs - 3) * steps_per_epoch
+        current_decay_step = (epoch - 4) * steps_per_epoch + step
+        ratio = (current_decay_step + 1) / total_decay_steps
+        return 0.5 - 0.3 * ratio
 
 # ──────────────────────────────────────────────────────────────
 # Main Training Loop
@@ -471,14 +495,15 @@ def run_stage2(config: dict):
     log.info(f"Scheduler: linear warmup {warmup_steps}/{total_steps} steps")
 
     stage2_loss = Stage2Loss(
-        lambda_ot   = config["lambda_ot"],
-        lambda_reg  = config["lambda_reg"],
-        lambda_span = config["lambda_span"],
-        lambda_qa   = config["lambda_qa"],
+        lambda_ot     = config["lambda_ot"],
+        lambda_reg    = config["lambda_reg"],
+        lambda_span   = config["lambda_span"],
+        lambda_margin = config["lambda_margin"],
+        lambda_qa     = config["lambda_qa"],
     ).to(device)
 
     log.info(
-        f"Stage 2 Loss config: lambda_ot={config['lambda_ot']}, lambda_reg={config['lambda_reg']}, lambda_qa={config['lambda_qa']}"
+        f"Stage 2 Loss config: lambda_ot={config['lambda_ot']}, lambda_reg={config['lambda_reg']}, lambda_qa={config['lambda_qa']}, lambda_margin={config['lambda_margin']}, anneal_margin={config.get('anneal_margin', False)}"
     )
 
     # ── TensorBoard ─────────────────────────────────────────────
@@ -554,9 +579,9 @@ def run_stage2(config: dict):
         log.info(f"Epoch {epoch}/{config['max_epochs']}")
 
         epoch_losses = {
-            "total": 0.0, "ot": 0.0, "reg": 0.0, "span": 0.0, "qa": 0.0, "has_ans": 0.0,
-            "raw_ot_loss": 0.0, "raw_reg_loss": 0.0, "raw_qa_loss": 0.0, "raw_span_loss": 0.0,
-            "weighted_ot": 0.0, "weighted_reg": 0.0, "weighted_qa": 0.0, "weighted_span": 0.0
+            "total": 0.0, "ot": 0.0, "reg": 0.0, "span": 0.0, "margin": 0.0, "qa": 0.0, "has_ans": 0.0,
+            "raw_ot_loss": 0.0, "raw_reg_loss": 0.0, "raw_qa_loss": 0.0, "raw_span_loss": 0.0, "raw_margin_loss": 0.0,
+            "weighted_ot": 0.0, "weighted_reg": 0.0, "weighted_qa": 0.0, "weighted_span": 0.0, "weighted_margin": 0.0
         }
         step_count   = 0
 
@@ -581,6 +606,12 @@ def run_stage2(config: dict):
             # current_alpha = 1.0 - 0.3 * (global_step / max(1, total_steps))
             current_alpha = 1.0
 
+            if config.get("anneal_margin"):
+                current_margin = get_annealed_margin(epoch, step, steps_per_epoch, config["max_epochs"])
+                stage2_loss.lambda_margin = current_margin
+            else:
+                current_margin = config["lambda_margin"]
+
             losses = stage2_step(
                 batch, model, criterion, stage2_loss,
                 epsilon=current_eps,
@@ -602,7 +633,9 @@ def run_stage2(config: dict):
             global_step += 1
             step_count  += 1
 
-            for k in ("total", "ot", "reg", "span", "qa", "has_ans", "raw_ot_loss", "raw_reg_loss", "raw_qa_loss", "raw_span_loss", "weighted_ot", "weighted_reg", "weighted_qa", "weighted_span"):
+            for k in ("total", "ot", "reg", "span", "margin", "qa", "has_ans", 
+                      "raw_ot_loss", "raw_reg_loss", "raw_qa_loss", "raw_span_loss", "raw_margin_loss",
+                      "weighted_ot", "weighted_reg", "weighted_qa", "weighted_span", "weighted_margin"):
                 v = losses.get(k)
                 if isinstance(v, torch.Tensor):
                     epoch_losses[k] += v.item()
@@ -620,14 +653,17 @@ def run_stage2(config: dict):
                     f"raw_ot={losses['raw_ot_loss'].item():.4f} | "
                     f"raw_reg={losses['raw_reg_loss'].item():.4f} | "
                     f"raw_span={losses.get('raw_span_loss', torch.tensor(0.0)).item():.4f} | "
+                    f"raw_margin={losses.get('raw_margin_loss', torch.tensor(0.0)).item():.4f} | "
                     f"raw_qa={losses['raw_qa_loss'].item():.4f} | "
                     f"has_ans={losses['has_ans'].item():.4f} | "
                     f"w_ot={losses['weighted_ot'].item():.4f} | "
                     f"w_reg={losses['weighted_reg'].item():.4f} | "
                     f"w_span={losses.get('weighted_span', torch.tensor(0.0)).item():.4f} | "
+                    f"w_margin={losses.get('weighted_margin', torch.tensor(0.0)).item():.4f} | "
                     f"w_qa={losses['weighted_qa'].item():.4f} | "
                     f"eps={current_eps:.4f} | "
                     f"alpha={current_alpha:.4f} | "
+                    f"λ_margin={current_margin:.4f} | "
                     f"γ_H={g_ent:.2f}"
                 )
 
@@ -635,6 +671,7 @@ def run_stage2(config: dict):
                 writer.add_scalar("Loss/OT",            losses["ot"].item(),    global_step)
                 writer.add_scalar("Loss/Reg",           losses["reg"].item(),   global_step)
                 writer.add_scalar("Loss/Span",          losses["span"].item(),  global_step)
+                writer.add_scalar("Loss/Margin",        losses["margin"].item(),global_step)
                 writer.add_scalar("Loss/QA",            losses["qa"].item(),    global_step)
                 writer.add_scalar("Loss/HasAns",        losses["has_ans"].item(), global_step)
                 
@@ -643,10 +680,12 @@ def run_stage2(config: dict):
                 writer.add_scalar("Loss/Raw_Reg",       losses["raw_reg_loss"].item(), global_step)
                 writer.add_scalar("Loss/Raw_QA",        losses["raw_qa_loss"].item(), global_step)
                 writer.add_scalar("Loss/Raw_Span",      losses.get("raw_span_loss", torch.tensor(0.0)).item(), global_step)
+                writer.add_scalar("Loss/Raw_Margin",    losses.get("raw_margin_loss", torch.tensor(0.0)).item(), global_step)
                 writer.add_scalar("Loss/Weighted_OT",   losses["weighted_ot"].item(), global_step)
                 writer.add_scalar("Loss/Weighted_Reg",  losses["weighted_reg"].item(), global_step)
                 writer.add_scalar("Loss/Weighted_QA",   losses["weighted_qa"].item(), global_step)
                 writer.add_scalar("Loss/Weighted_Span", losses.get("weighted_span", torch.tensor(0.0)).item(), global_step)
+                writer.add_scalar("Loss/Weighted_Margin", losses.get("weighted_margin", torch.tensor(0.0)).item(), global_step)
                 
                 writer.add_scalar("Lambda/Span_Weight", span_w,                 global_step)
                 writer.add_scalar("Debug/Gamma_Entropy", g_ent,                 global_step)
@@ -654,13 +693,14 @@ def run_stage2(config: dict):
                                   optimizer.param_groups[1]["lr"],             global_step)
                 writer.add_scalar("Hyperparameters/Epsilon", current_eps, global_step)
                 writer.add_scalar("Hyperparameters/Alpha", current_alpha, global_step)
+                writer.add_scalar("Hyperparameters/Lambda_Margin", current_margin, global_step)
 
         # ── End of epoch summary ─────────────────────────────────
         avg = {k: v / max(step_count, 1) for k, v in epoch_losses.items()}
         log.info(
             f"Epoch {epoch} avg | total={avg['total']:.4f} | "
-            f"raw_ot={avg['raw_ot_loss']:.4f} | raw_reg={avg['raw_reg_loss']:.4f} | raw_span={avg.get('raw_span_loss', 0.0):.4f} | raw_qa={avg['raw_qa_loss']:.4f} | "
-            f"w_ot={avg['weighted_ot']:.4f} | w_reg={avg['weighted_reg']:.4f} | w_span={avg.get('weighted_span', 0.0):.4f} | w_qa={avg['weighted_qa']:.4f}"
+            f"raw_ot={avg['raw_ot_loss']:.4f} | raw_reg={avg['raw_reg_loss']:.4f} | raw_span={avg.get('raw_span_loss', 0.0):.4f} | raw_margin={avg.get('raw_margin_loss', 0.0):.4f} | raw_qa={avg['raw_qa_loss']:.4f} | "
+            f"w_ot={avg['weighted_ot']:.4f} | w_reg={avg['weighted_reg']:.4f} | w_span={avg.get('weighted_span', 0.0):.4f} | w_margin={avg.get('weighted_margin', 0.0):.4f} | w_qa={avg['weighted_qa']:.4f}"
         )
 
         # ── Evaluation ───────────────────────────────────────────
@@ -795,6 +835,9 @@ def parse_args() -> dict:
     parser.add_argument("--lambda_ot",      type=float, default=STAGE2_CONFIG["lambda_ot"])
     parser.add_argument("--lambda_reg",     type=float, default=STAGE2_CONFIG["lambda_reg"])
     parser.add_argument("--lambda_span",    type=float, default=STAGE2_CONFIG["lambda_span"])
+    parser.add_argument("--lambda_margin",  type=float, default=STAGE2_CONFIG["lambda_margin"])
+    parser.add_argument("--anneal_margin",  action="store_true", default=STAGE2_CONFIG.get("anneal_margin", False),
+                        help="Enable margin annealing schedule (0.3 -> 0.5 -> 0.2)")
     parser.add_argument("--lambda_qa",      type=float, default=STAGE2_CONFIG["lambda_qa"])
     parser.add_argument("--epsilon",        type=float, default=STAGE2_CONFIG["epsilon"])
     parser.add_argument("--epsilon_end",    type=float, default=STAGE2_CONFIG["epsilon_end"])

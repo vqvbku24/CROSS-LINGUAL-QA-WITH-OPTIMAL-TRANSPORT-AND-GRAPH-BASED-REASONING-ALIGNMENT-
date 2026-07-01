@@ -955,21 +955,104 @@ def gamma_entropy(gamma_list: list[torch.Tensor]) -> float:
     return sum(entropies) / len(entropies) if entropies else 0.0
 
 
+def compute_pure_margin_loss(
+    en_start_pos,         # (B,) int — EN answer start in truncated sequence
+    en_end_pos,           # (B,) int — EN answer end in truncated sequence
+    en_start_logits,      # (B, T_en) — EN QA start logits (frozen/teacher)
+    en_end_logits,        # (B, T_en) — EN QA end logits
+    vi_start_logits,      # (B, T_vi) — VI QA start logits (has gradient)
+    vi_end_logits,        # (B, T_vi) — VI QA end logits (has gradient)
+    en_mask,              # (B, T_en) bool — True = real EN token
+    vi_mask,              # (B, T_vi) bool — True = real VI token
+    answerable_mask,      # (B,) bool — True = answerable sample
+    device,
+) -> torch.Tensor:
+    """
+    Task-Space Boundary Preserving Loss (Pure Margin Ranking Loss).
+    
+    Không nhìn hidden state, không nhìn semantic (gamma).
+    Chỉ nhìn Answer Logit vs Hardest Negative Logit để giữ decision boundary.
+    
+    For each answerable sample:
+    1. Find EN Gold Answer token and EN Hardest Negative token -> EN Margin.
+    2. On VI, purely take the Top-1 logit as 'Answer' and Top-2 logit as 'Hardest Negative' -> VI Margin.
+    3. Loss = max(0, EN_Margin - VI Margin) -> Force VI to be at least as confident as EN.
+    """
+    losses = []
+
+    for b in range(len(en_start_pos)):
+        if not answerable_mask[b]:
+            continue
+
+        en_idx = en_mask[b].nonzero(as_tuple=True)[0]
+        vi_idx = vi_mask[b].nonzero(as_tuple=True)[0]
+        
+        if len(vi_idx) < 2:
+            continue
+
+        en_s_full = en_start_pos[b].item()
+        en_e_full = en_end_pos[b].item()
+
+        # Find valid local indices for EN start/end
+        en_s_matches = (en_idx == en_s_full).nonzero(as_tuple=True)[0]
+        en_e_matches = (en_idx == en_e_full).nonzero(as_tuple=True)[0]
+        if len(en_s_matches) == 0 or len(en_e_matches) == 0:
+            continue
+        en_s_local = en_s_matches[0].item()
+        en_e_local = en_e_matches[0].item()
+
+        s_en = en_start_logits[b, en_idx]
+        e_en = en_end_logits[b, en_idx]
+        s_vi = vi_start_logits[b, vi_idx]
+        e_vi = vi_end_logits[b, vi_idx]
+
+        # --- START MARGIN ---
+        # 1. EN Hardest Negative
+        mask_neg_s = torch.ones_like(s_en, dtype=torch.bool)
+        mask_neg_s[en_s_local] = False
+        neg_s_en_local = s_en.masked_fill(~mask_neg_s, -1e9).argmax()
+
+        # 2. EN Margin (clamped to min=0 just in case EN is wrong)
+        margin_s_en = torch.clamp(s_en[en_s_local] - s_en[neg_s_en_local], min=0.0).detach()
+
+        # 3. VI Margin (Self-Prediction)
+        # We don't map from EN. We just want the model to be confident in whatever it predicts.
+        top2_s_vi = torch.topk(s_vi, 2).values
+        margin_s_vi = top2_s_vi[0] - top2_s_vi[1]
+
+        # 4. Hinge Loss
+        loss_s = F.relu(margin_s_en - margin_s_vi)
+
+        # --- END MARGIN ---
+        # 1. EN Hardest Negative
+        mask_neg_e = torch.ones_like(e_en, dtype=torch.bool)
+        mask_neg_e[en_e_local] = False
+        neg_e_en_local = e_en.masked_fill(~mask_neg_e, -1e9).argmax()
+
+        # 2. EN Margin
+        margin_e_en = torch.clamp(e_en[en_e_local] - e_en[neg_e_en_local], min=0.0).detach()
+
+        # 3. VI Margin (Self-Prediction)
+        top2_e_vi = torch.topk(e_vi, 2).values
+        margin_e_vi = top2_e_vi[0] - top2_e_vi[1]
+
+        # 4. Hinge Loss
+        loss_e = F.relu(margin_e_en - margin_e_vi)
+
+        losses.append((loss_s + loss_e) / 2)
+
+    if not losses:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    return torch.stack(losses).mean()
+
+
 class Stage2Loss(nn.Module):
     """
-    Stage 2 combined loss: L_ot + L_reg + L_span + L_qa
+    Stage 2 combined loss: L_ot + L_reg + L_span + L_margin + L_qa
 
     Reuses the QA head from Stage 1 (weights loaded from Stage 1 checkpoint).
     The qa_head is passed in at construction time — it is NOT re-instantiated here.
     This allows Stage 2 to start from the EN-trained QA head and adapt it to VI.
-
-    Usage in training loop:
-        gamma_list, L_ot = sinkhorn_masked(h_en_frz, h_vi, en_mask, vi_mask, ε, K)
-        L_reg            = compute_reg_loss(h_en_lora, h_en_frz, en_mask)
-        L_span           = compute_span_loss(gamma_list, en_start_logits, en_end_logits,
-                                             vi_start_logits, vi_end_logits,
-                                             en_mask, vi_mask)
-        L_total          = self.forward(L_ot, L_reg, L_span, L_qa, L_has_ans, epoch)
     """
 
     def __init__(
@@ -977,6 +1060,7 @@ class Stage2Loss(nn.Module):
         lambda_ot: float   = 1.0,
         lambda_reg: float  = 10.0,
         lambda_span: float = 0.0,
+        lambda_margin: float = 0.0,
         lambda_qa: float   = 1.0,
     ):
         """
@@ -984,12 +1068,14 @@ class Stage2Loss(nn.Module):
             lambda_ot    : weight for L_ot (transport cost). Default 1.0.
             lambda_reg   : weight for L_reg (EN consistency). Default 10.0.
             lambda_span  : weight for L_span. Default 0.0 (disabled — gamma too uniform).
+            lambda_margin: weight for L_margin (Margin boundary preservation). Default 0.0.
             lambda_qa    : weight for L_qa and L_has_ans (supervised EN QA loss). Default 1.0.
         """
         super().__init__()
         self.lambda_ot    = lambda_ot
         self.lambda_reg   = lambda_reg
         self.lambda_span  = lambda_span
+        self.lambda_margin= lambda_margin
         self.lambda_qa    = lambda_qa
 
     def forward(
@@ -997,19 +1083,13 @@ class Stage2Loss(nn.Module):
         L_ot: torch.Tensor,
         L_reg: torch.Tensor,
         L_span: torch.Tensor,
+        L_margin: torch.Tensor,
         L_qa: torch.Tensor,
         L_has_ans: torch.Tensor,
         epoch: int,
     ) -> dict[str, torch.Tensor]:
         """
         Combine loss components.
-
-        L_reg is active from epoch 1 (always on — EN anchor must be protected
-        from the very first gradient step).
-        L_span is disabled by default (lambda=0.0).
-
-        Returns:
-            dict with "total", "ot", "reg", "span", "span_weight", "qa", "has_ans"
         """
         # Span loss is enabled from the start (no annealing)
         w_span = 1.0
@@ -1018,6 +1098,7 @@ class Stage2Loss(nn.Module):
             self.lambda_ot   * L_ot
             + self.lambda_reg  * L_reg
             + self.lambda_span * w_span * L_span
+            + self.lambda_margin * L_margin
             + self.lambda_qa   * (L_qa + L_has_ans)
         )
 
@@ -1026,6 +1107,7 @@ class Stage2Loss(nn.Module):
             "ot":          L_ot.detach(),
             "reg":         L_reg.detach(),
             "span":        (L_span.detach() * w_span),
+            "margin":      L_margin.detach(),
             "span_weight": torch.tensor(float(w_span)),
             "qa":          L_qa.detach(),
             "has_ans":     L_has_ans.detach(),
@@ -1035,9 +1117,11 @@ class Stage2Loss(nn.Module):
             "raw_reg_loss": L_reg.detach(),
             "raw_qa_loss":  (L_qa + L_has_ans).detach(),
             "raw_span_loss": L_span.detach(),
+            "raw_margin_loss": L_margin.detach(),
             
             "weighted_ot":  (self.lambda_ot * L_ot).detach(),
             "weighted_reg": (self.lambda_reg * L_reg).detach(),
             "weighted_qa":  (self.lambda_qa * (L_qa + L_has_ans)).detach(),
             "weighted_span": (self.lambda_span * w_span * L_span).detach(),
+            "weighted_margin": (self.lambda_margin * L_margin).detach(),
         }

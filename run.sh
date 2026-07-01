@@ -25,15 +25,34 @@ nvidia-smi
 
 source $BASE/venv/bin/activate
 
-echo "Starting training with batch_size=32, K=96..."
+echo "Starting Stage 2 training..."
 
-python3 -u $BASE/main.py \
-    --mode train \
-    --epochs 10 \
+# Chọn một trong các cấu hình loss dưới đây bằng cách uncomment/comment các trọng số:
+#
+# 1) L = L_QA + L_OT + L_Span + L_Margin + L_Reg  (OT + Margin + Span) -> mặc định
+# 2) L = L_QA + L_Span + L_Margin + L_Reg         (Chỉ Margin, xem Margin có thay thế OT được không): đặt --lambda_ot 0.0
+# 3) L = L_QA + L_OT + L_Span + L_Reg             (OT cũ không có Margin): đặt --lambda_margin 0.0
+
+python3 -u $BASE/train_stage2.py \
+    --stage1_ckpt $BASE/checkpoint/best.pt \
+    --max_epochs 10 \
     --batch_size 32 \
-    --K 96 \
+    --lambda_ot 0.5 \
+    --lambda_span 1.0 \
+    --lambda_margin 0.5 \
+    --lambda_qa 0.3 \
+    --lambda_reg 50.0 \
     --hf_repo_id "vinhvo1205/CrossLingual-OT-QA" \
-    --root_dir $BASE
+    --output_dir $BASE/checkpoint_stage2
+
+python3 -u $BASE/train_stage2.py \
+    --stage1_ckpt $BASE/checkpoint/best.pt \
+    --max_epochs 10 \
+    --batch_size 32 \
+    --lambda_ot 0.5 \
+    --lambda_span 1.0 \
+    --anneal_margin \
+    --output_dir $BASE/checkpoint_stage2_anneal_margin
 
 echo "=== Training finished at $(date) ==="
 nvidia-smi
