@@ -1,31 +1,45 @@
 #!/bin/bash
-#SBATCH --job-name=train_ot_qa
-#SBATCH -p kisski-h100
-#SBATCH --mem=148G              
-#SBATCH -c 8
-#SBATCH -G H100:1
-#SBATCH --gpus-per-task=1       # Thêm cái này cho rõ ràng
-#SBATCH --gpu-bind=closest      # Tối ưu băng GPU
-#SBATCH -t 48:00:00
-#SBATCH --output=slurm-%x-%j.out
-#SBATCH --error=slurm-%x-%j.err
-#SBATCH --mail-type=ALL
-#SBATCH --constraint=inet
+#SBATCH --job-name=ot_contrastive
+#SBATCH --partition=convergence
+#SBATCH --gres=gpu:a100_3g.40gb:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=3-00:00:00
+#SBATCH --output=logs/%x_%j.out
 
-BASE=/projects/extern/kisski/kisski-imm/dir.project/CROSS-LINGUAL-QA-WITH-OPTIMAL-TRANSPORT-AND-GRAPH-BASED-REASONING-ALIGNMENT-
+set -e
+
+echo "Running on $(hostname)"
+echo "Working dir: $PWD"
+
+# Đảm bảo working directory đúng với nơi submit job
+cd $SLURM_SUBMIT_DIR
+BASE=$PWD
+
+# Load module và activate conda environment một cách an toàn
+module load python/anaconda3
+eval "$(conda shell.bash hook)"
+conda activate qa
+
+# Kiểm tra môi trường
+python --version
+which python
 
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
-export HF_HOME=$BASE/.cache/huggingface
-export HF_TOKEN=$(cat $BASE/.hf_token)
 
-# Optional: Log GPU ngay khi job bắt đầu
+# Nếu có file lưu token HuggingFace
+if [ -f "$BASE/.hf_token" ]; then
+    export HF_TOKEN=$(cat $BASE/.hf_token)
+fi
+
+# Tạo thư mục logs nếu chưa có
+mkdir -p logs
+
 echo "=== Job started at $(date) ==="
-nvidia-smi
+echo "GPU info:"
+nvidia-smi || true
 
-source $BASE/venv/bin/activate
-
-echo "Starting Stage 2 training..."
+echo "Starting Stage 2 Training"
 
 # Chọn một trong các cấu hình loss dưới đây bằng cách uncomment/comment các trọng số:
 #
