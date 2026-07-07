@@ -13,6 +13,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from phase1_dataloader.process_qa_sample import load_squad_data, process_qa_sample
 from phase2_model.model_core import CrossLingualOTModel
 from phase3_loss.losses import OTAlignmentLoss
+from gpu_utils import auto_select_free_gpus, get_model
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO, datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ class SquadDatasetStage1(Dataset):
         }
 
 def run_stage1(config):
+    auto_select_free_gpus()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Starting Stage 1 on {device}")
     
@@ -58,21 +60,23 @@ def run_stage1(config):
     
     # Model (compute_cost_matrix=False for speed)
     model = CrossLingualOTModel(model_name=config["model_name"], compute_cost_matrix=False).to(device)
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
     
     # Loss — OT/span/cons đều tắt (λ=0), chỉ L_qa + L_has_ans hoạt động.
     # L_qa train trên toàn bộ batch (unanswerable -> start=0, end=0).
     # L_has_ans train trên toàn bộ batch (BCE).
     # → Model sẽ học cách predict [CLS] (index 0) cho unanswerable.
     criterion = OTAlignmentLoss(
-        hidden_size=model.hidden_size,
+        hidden_size=get_model(model).hidden_size,
         lambda_ot=0.0,
         lambda_span=0.0,
         lambda_cons=0.0,
     ).to(device)
     
     optimizer = AdamW([
-        {"params": model.backbone.parameters(), "lr": config["lr"]},
-        {"params": [model.layer_weights], "lr": config["head_lr"]},
+        {"params": get_model(model).backbone.parameters(), "lr": config["lr"]},
+        {"params": [get_model(model).layer_weights], "lr": config["head_lr"]},
         {"params": criterion.parameters(), "lr": config["head_lr"]},
     ], weight_decay=config["weight_decay"])
     
@@ -166,7 +170,7 @@ def run_stage1(config):
             save_path = os.path.join(config["root_dir"], "checkpoints", "stage1_squad_best.pt")
             torch.save({
                 "epoch": epoch,
-                "model_state": model.state_dict(),
+                "model_state": get_model(model).state_dict(),
                 "criterion_state": criterion.state_dict(),
                 "em": em,
             }, save_path)

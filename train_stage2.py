@@ -32,7 +32,9 @@ except ImportError:
     pass
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from gpu_utils import auto_select_free_gpus, get_model
 from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
@@ -112,7 +114,7 @@ def load_stage1_checkpoint(ckpt_path: str, model, criterion, device: torch.devic
     ckpt = torch.load(ckpt_path, map_location=device)
 
     # Khôi phục keys map 1-1, bỏ logic peft replace vì model chưa bọc LoRA
-    model.load_state_dict(ckpt["model_state"], strict=False)
+    get_model(model).load_state_dict(ckpt["model_state"], strict=False)
     criterion.load_state_dict(ckpt["criterion_state"])
     log.info("  Stage 1 weights loaded (model base + criterion/QA head)")
 
@@ -144,8 +146,9 @@ def save_stage2_checkpoint(path: str, epoch: int, global_step: int,
                             config: dict, vi_em: float, best_vi_em: float,
                             patience_count: int):
     # Save only trainable parameters to save space (LoRA + layer_weights)
-    trainable_keys = {n for n, p in model.named_parameters() if p.requires_grad}
-    trainable_state_dict = {k: v for k, v in model.state_dict().items() if k in trainable_keys}
+    base_model = get_model(model)
+    trainable_keys = {n for n, p in base_model.named_parameters() if p.requires_grad}
+    trainable_state_dict = {k: v for k, v in base_model.state_dict().items() if k in trainable_keys}
 
     torch.save({
         "epoch"           : epoch,
@@ -395,6 +398,7 @@ def get_annealed_margin(epoch: int, step: int, steps_per_epoch: int, max_epochs:
 # ──────────────────────────────────────────────────────────────
 
 def run_stage2(config: dict):
+    auto_select_free_gpus()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Device: {device}")
     log.info("=" * 60)
@@ -409,7 +413,7 @@ def run_stage2(config: dict):
 
     model = CrossLingualOTModel(model_name=config["model_name"]).to(device)
     criterion = OTAlignmentLoss(
-        hidden_size=model.hidden_size,
+        hidden_size=get_model(model).hidden_size,
     ).to(device)
 
     # ── 1. Load Stage 1 checkpoint (trước khi bọc LoRA, keys khớp 1-1) ───────────────
@@ -423,6 +427,9 @@ def run_stage2(config: dict):
     log.info("Applying LoRA to backbone...")
     model.apply_lora()
     model.to(device) # Ensure new LoRA layers are on the target device
+
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
 
     # Disable dropout to prevent representation drift from random masks
     log.info("Disabling dropout in backbone, adapters & criterion to prevent L_reg variance...")
@@ -467,17 +474,17 @@ def run_stage2(config: dict):
     # ── Optimizer — differential learning rates ──────────────────
     # backbone: frozen except for LoRA parameters
     # layer_weights + QA head: stage2_head_lr (QA head frozen if freeze_qa_head is True)
-    trainable_backbone = [p for p in model.backbone.parameters() if p.requires_grad]
+    trainable_backbone = [p for p in get_model(model).backbone.parameters() if p.requires_grad]
     if config.get("freeze_qa_head", False):
         optimizer = AdamW([
             {"params": trainable_backbone,           "lr": config["stage2_head_lr"], "weight_decay": config["weight_decay"]},
-            {"params": [model.layer_weights],        "lr": config["stage2_head_lr"], "weight_decay": 0.0},
+            {"params": [get_model(model).layer_weights],        "lr": config["stage2_head_lr"], "weight_decay": 0.0},
         ])
         log.info("Optimizer: LoRA (with decay) + layer_weights (no decay). QA head frozen.")
     else:
         optimizer = AdamW([
             {"params": trainable_backbone,           "lr": config["stage2_head_lr"], "weight_decay": config["weight_decay"]},
-            {"params": [model.layer_weights],        "lr": config["stage2_head_lr"], "weight_decay": 0.0},
+            {"params": [get_model(model).layer_weights],        "lr": config["stage2_head_lr"], "weight_decay": 0.0},
             {"params": list(criterion.parameters()), "lr": config["stage2_head_lr"], "weight_decay": 0.0},
         ])
         log.info("Optimizer: LoRA (with decay) + layer_weights (no decay) + QA head (no decay).")
@@ -541,7 +548,7 @@ def run_stage2(config: dict):
             ckpt = torch.load(resume_path, map_location=device)
             
             # Load states
-            model.load_state_dict(ckpt["model_state"], strict=False)
+            get_model(model).load_state_dict(ckpt["model_state"], strict=False)
             criterion.load_state_dict(ckpt["criterion_state"])
             
             # Re-apply QA head freeze if enabled in config
