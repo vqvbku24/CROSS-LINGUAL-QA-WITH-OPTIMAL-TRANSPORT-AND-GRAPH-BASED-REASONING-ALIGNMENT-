@@ -1,6 +1,8 @@
 import os
 import subprocess
 import logging
+import random
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -107,3 +109,19 @@ def get_model(model):
     Giúp truy xuất các thuộc tính custom và lưu checkpoint nhất quán.
     """
     return model.module if hasattr(model, 'module') else model
+
+# ──────────────────────────────────────────────────────────────
+# Reproducibility
+# ──────────────────────────────────────────────────────────────
+
+def set_seed(seed=42):
+    """
+    Set random seed for reproducibility across all libraries.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
+    log.info(f"Set random seed to {seed}")

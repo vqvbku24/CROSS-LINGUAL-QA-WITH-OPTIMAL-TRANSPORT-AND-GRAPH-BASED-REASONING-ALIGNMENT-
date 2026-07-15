@@ -30,9 +30,10 @@ torchrun --nproc_per_node=4 --master_port=29500 train_stage2.py \
     --stage2_head_lr 1e-4 \
     --lambda_ot 0.5 \
     --lambda_span 1.0 \
-    --lambda_margin 0.5 \
-    --lambda_qa 0.3 \
-    --lambda_reg 50.0 \
+    --lambda_margin 1.0 \
+    --anneal_margin \
+    --lambda_qa 0.5 \
+    --lambda_reg 60.0 \
     --output_dir "$BASE/checkpoint_stage2"
 
 echo "=== [EXP-MARGIN] Finished at $(date) ==="

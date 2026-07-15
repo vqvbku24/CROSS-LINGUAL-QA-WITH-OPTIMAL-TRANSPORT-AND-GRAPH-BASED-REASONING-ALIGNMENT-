@@ -15,7 +15,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from phase1_dataloader.process_qa_sample import load_squad_data, process_qa_sample
 from phase2_model.model_core import CrossLingualOTModel
 from phase3_loss.losses import OTAlignmentLoss
-from gpu_utils import get_model, setup_ddp, cleanup_ddp, is_main_process, get_local_rank
+from gpu_utils import get_model, setup_ddp, cleanup_ddp, is_main_process, get_local_rank, set_seed
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO, datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
@@ -191,6 +191,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--mode", type=str, default="train")
     parser.add_argument("--hf_repo_id", type=str, default="")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
     config = {
@@ -203,6 +204,8 @@ if __name__ == "__main__":
         "weight_decay": 0.01,
         "epochs": args.epochs,
         "mode": args.mode,
-        "hf_repo_id": args.hf_repo_id
+        "hf_repo_id": args.hf_repo_id,
+        "seed": args.seed
     }
+    set_seed(config["seed"])
     run_stage1(config)

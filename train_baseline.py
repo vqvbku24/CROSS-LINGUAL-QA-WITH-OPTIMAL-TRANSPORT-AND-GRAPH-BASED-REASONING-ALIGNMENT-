@@ -26,6 +26,7 @@ from typing import Optional
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.optim import AdamW
+from gpu_utils import set_seed
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -508,6 +509,7 @@ def main():
                         help="Path to ViQuAD2 dev file for eval mode")
     parser.add_argument("--resume_from", type=str, default="",
                         help="Path to checkpoint to resume training")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
     config = dict(DEFAULT_CONFIG)
@@ -520,7 +522,10 @@ def main():
         "lr": args.lr,
         "max_length": args.max_length,
         "resume_from": args.resume_from,
+        "seed": args.seed,
     })
+    
+    set_seed(config["seed"])
     if args.checkpoint:
         config["checkpoint"] = args.checkpoint
     if args.eval_file:

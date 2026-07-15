@@ -35,7 +35,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from gpu_utils import auto_select_free_gpus, get_model, setup_ddp, cleanup_ddp, is_main_process, get_local_rank
+from gpu_utils import auto_select_free_gpus, get_model, setup_ddp, cleanup_ddp, is_main_process, get_local_rank, set_seed
 from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
@@ -95,6 +95,7 @@ STAGE2_CONFIG = {
     "root_dir"        : os.path.dirname(os.path.abspath(__file__)),
     "output_dir"      : os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoint_stage2"),
     "hf_repo_id"      : "",
+    "seed"            : 42,
 }
 
 
@@ -543,7 +544,7 @@ def run_stage2(config: dict):
     global_step    = 0
 
     # Margin scheduling state
-    margin_schedule = [1.0, 0.5, 0.3]
+    margin_schedule = [1.0, 0.7]
     current_margin_idx = 0
     best_vi_f1 = 0.0
     margin_patience_count = 0
@@ -912,6 +913,8 @@ def parse_args() -> dict:
                         help="Hard stop threshold for EN EM drop")
     parser.add_argument("--hf_repo_id",    type=str,   default=STAGE2_CONFIG["hf_repo_id"],
                         help="HuggingFace repo ID for auto backup of checkpoints/logs")
+    parser.add_argument("--seed",          type=int,   default=STAGE2_CONFIG["seed"],
+                        help="Random seed")
     args = parser.parse_args()
 
 
@@ -921,6 +924,8 @@ def parse_args() -> dict:
 
 if __name__ == "__main__":
     config = parse_args()
+    
+    set_seed(config["seed"])
 
     if is_main_process():
         log.info("Stage 2 config:")
