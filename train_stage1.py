@@ -4,8 +4,10 @@ import argparse
 import logging
 import torch
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -13,7 +15,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from phase1_dataloader.process_qa_sample import load_squad_data, process_qa_sample
 from phase2_model.model_core import CrossLingualOTModel
 from phase3_loss.losses import OTAlignmentLoss
-from gpu_utils import auto_select_free_gpus, get_model
+from gpu_utils import get_model, setup_ddp, cleanup_ddp, is_main_process, get_local_rank
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO, datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
@@ -49,19 +51,20 @@ class SquadDatasetStage1(Dataset):
         }
 
 def run_stage1(config):
-    auto_select_free_gpus()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info(f"Starting Stage 1 on {device}")
+    local_rank, world_size = setup_ddp()
+    device = torch.device(f"cuda:{local_rank}")
+    if is_main_process():
+        log.info(f"Starting Stage 1 on {device} (DDP world_size={world_size})")
     
     tokenizer = AutoTokenizer.from_pretrained(config["model_name"], use_fast=True)
     dataset = SquadDatasetStage1(config["squad_file"], tokenizer, max_length=384, doc_stride=128)
-    
-    loader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True, num_workers=2, pin_memory=True)
+
+    sampler = DistributedSampler(dataset, shuffle=True)
+    loader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=False, sampler=sampler, num_workers=2, pin_memory=True)
     
     # Model (compute_cost_matrix=False for speed)
     model = CrossLingualOTModel(model_name=config["model_name"], compute_cost_matrix=False).to(device)
-    if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
+    model = DDP(model, device_ids=[local_rank])
     
     # Loss — OT/span/cons đều tắt (λ=0), chỉ L_qa + L_has_ans hoạt động.
     # L_qa train trên toàn bộ batch (unanswerable -> start=0, end=0).
@@ -93,6 +96,7 @@ def run_stage1(config):
     os.makedirs(os.path.join(config["root_dir"], "checkpoints"), exist_ok=True)
     
     for epoch in range(1, config["epochs"] + 1):
+        sampler.set_epoch(epoch)
         model.train()
         criterion.train()
         epoch_loss = 0.0
@@ -137,7 +141,7 @@ def run_stage1(config):
             
             epoch_loss += loss.item()
             
-            if step % 50 == 0:
+            if step % 50 == 0 and is_main_process():
                 ans_count = batch["en_is_answerable"].sum().item()
                 log.info(
                     f"Epoch {epoch} Step {step}/{len(loader)} | "
@@ -147,34 +151,38 @@ def run_stage1(config):
                     f"answerable: {ans_count}/{B})"
                 )
                 
-        log.info(f"━━ Epoch {epoch} Avg Loss: {epoch_loss/len(loader):.4f} ━━")
+        if is_main_process():
+            log.info(f"━━ Epoch {epoch} Avg Loss: {epoch_loss/len(loader):.4f} ━━")
         
-        # Eval
-        import importlib.util
-        eval_file = os.path.join(config["root_dir"], "phase4-evaluation", "quick_eval.py")
-        spec = importlib.util.spec_from_file_location("quick_eval", eval_file)
-        quick_eval_mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(quick_eval_mod)
-        
-        dev_file = os.path.join(config["root_dir"], "dataset", "Squad2.0", "dev-v2.0.json")
-        try:
-            em = quick_eval_mod.quick_em(model, criterion, tokenizer, dev_file, n_samples=500, device=device)
-            log.info(f"Epoch {epoch} Quick EM (500 samples): {em:.2f}%")
-        except Exception as e:
-            log.error(f"Eval failed: {e}")
-            em = 0.0
+        # Eval (rank 0 only)
+        if is_main_process():
+            import importlib.util
+            eval_file = os.path.join(config["root_dir"], "phase4-evaluation", "quick_eval.py")
+            spec = importlib.util.spec_from_file_location("quick_eval", eval_file)
+            quick_eval_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(quick_eval_mod)
             
-        # Save best model
-        if em >= best_em:
-            best_em = em
-            save_path = os.path.join(config["root_dir"], "checkpoints", "stage1_squad_best.pt")
-            torch.save({
-                "epoch": epoch,
-                "model_state": get_model(model).state_dict(),
-                "criterion_state": criterion.state_dict(),
-                "em": em,
-            }, save_path)
-            log.info(f"🏆 Saved best Stage 1 checkpoint to {save_path} (EM: {em:.2f}%)")
+            dev_file = os.path.join(config["root_dir"], "dataset", "Squad2.0", "dev-v2.0.json")
+            try:
+                em = quick_eval_mod.quick_em(model, criterion, tokenizer, dev_file, n_samples=500, device=device)
+                log.info(f"Epoch {epoch} Quick EM (500 samples): {em:.2f}%")
+            except Exception as e:
+                log.error(f"Eval failed: {e}")
+                em = 0.0
+                
+            # Save best model
+            if em >= best_em:
+                best_em = em
+                save_path = os.path.join(config["root_dir"], "checkpoints", "stage1_squad_best.pt")
+                torch.save({
+                    "epoch": epoch,
+                    "model_state": get_model(model).state_dict(),
+                    "criterion_state": criterion.state_dict(),
+                    "em": em,
+                }, save_path)
+                log.info(f"🏆 Saved best Stage 1 checkpoint to {save_path} (EM: {em:.2f}%)")
+
+    cleanup_ddp()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

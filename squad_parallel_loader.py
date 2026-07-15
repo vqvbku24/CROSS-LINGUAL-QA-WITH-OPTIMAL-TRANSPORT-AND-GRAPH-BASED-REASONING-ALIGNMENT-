@@ -88,9 +88,15 @@ class SquadParallelDataset(Dataset):
             "vi_question_end": torch.tensor(vi_question_end, dtype=torch.long)
         }
 
-def create_squad_parallel_dataloaders(tokenizer, en_path="dataset/Squad2.0/train-v2.0.json", vi_path="dataset/AIForge_vietnamese-squad/train-00000-of-00001.parquet", batch_size=32, max_length=384):
+def create_squad_parallel_dataloaders(tokenizer, en_path="dataset/Squad2.0/train-v2.0.json", vi_path="dataset/AIForge_vietnamese-squad/train-00000-of-00001.parquet", batch_size=32, max_length=384, distributed=False):
     """
     Hàm tạo DataLoader cho dữ liệu song song từ local files.
+
+    Args:
+        distributed: If True, use DistributedSampler for DDP training.
+
+    Returns:
+        (train_loader, dataset, sampler_or_None)
     """
     # Bước 1: Tải dữ liệu tiếng Anh từ local json
     logger.info(f"Đang tải dữ liệu tiếng Anh từ {en_path}...")
@@ -145,13 +151,19 @@ def create_squad_parallel_dataloaders(tokenizer, en_path="dataset/Squad2.0/train
         tokenizer=tokenizer, 
         max_length=max_length
     )
+
+    sampler = None
+    if distributed:
+        from torch.utils.data.distributed import DistributedSampler
+        sampler = DistributedSampler(dataset, shuffle=True)
     
     train_loader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,       # Shuffle the data
-        num_workers=4,      # Số worker
-        pin_memory=True     # Đẩy nhanh tốc độ transfer dữ liệu lên GPU
+        shuffle=(sampler is None),  # DistributedSampler handles shuffling
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True,
     )
     
-    return train_loader, dataset
+    return train_loader, dataset, sampler

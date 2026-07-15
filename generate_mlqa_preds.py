@@ -73,52 +73,70 @@ def generate_predictions(args):
                     qa_id = qa['id']
                     question = qa['question']
 
-                    # Tokenize
-                    input_ids, attn_mask, _, _, q_end = process_qa_sample(
-                        question=question, context=context, answer=None,
-                        tokenizer=tokenizer, max_length=args.max_length, doc_stride=128
+                    # Tokenize with sliding window
+                    inputs = tokenizer(
+                        question,
+                        context,
+                        max_length=args.max_length,
+                        truncation="only_second",
+                        stride=128,
+                        return_overflowing_tokens=True,
+                        padding="max_length",
+                        return_tensors="pt"
                     )
-                    input_ids = input_ids.unsqueeze(0).to(device)
-                    attn_mask = attn_mask.unsqueeze(0).to(device)
-                    q_end_val = q_end.item()
-
-                    # Forward pass
-                    out = model.backbone(input_ids, attn_mask)
-                    stacked = torch.stack([out.hidden_states[i] for i in [6, 7, 8, 9]], dim=0)
-                    weights = torch.softmax(model.layer_weights, dim=0).view(4, 1, 1, 1)
-                    hidden = (stacked * weights).sum(dim=0)
-
-                    q_emb = hidden[:, :q_end_val, :]
-                    q_mask = torch.zeros(1, q_end_val, dtype=torch.bool, device=device)
-
-                    start_logits, end_logits, _ = criterion.qa_head(hidden, q_emb, q_mask)
-
-                    # Masking padding
-                    padding_mask = (attn_mask[0] == 0)
-                    start_logits[0].masked_fill_(padding_mask, float('-inf'))
-                    end_logits[0].masked_fill_(padding_mask, float('-inf'))
                     
-                    # Masking question tokens
-                    question_mask = torch.arange(start_logits.size(1), device=device) <= q_end_val
+                    num_windows = inputs["input_ids"].size(0)
+                    sep_positions = (inputs["input_ids"][0] == tokenizer.sep_token_id).nonzero(as_tuple=True)[0]
+                    q_end_val = sep_positions[0].item() if len(sep_positions) > 0 else 0
                     
-                    # ĐỔI THÀNH TRUE ĐỂ MASK LUÔN [CLS], ÉP MODEL PHẢI TRẢ LỜI
-                    question_mask[0] = True 
+                    best_score = float('-inf')
+                    best_span = ""
                     
-                    start_logits[0].masked_fill_(question_mask, float('-inf'))
-                    end_logits[0].masked_fill_(question_mask, float('-inf'))
+                    for w in range(num_windows):
+                        input_ids = inputs["input_ids"][w].unsqueeze(0).to(device)
+                        attn_mask = inputs["attention_mask"][w].unsqueeze(0).to(device)
 
-                    # Trích xuất ranh giới
-                    MAX_ANSWER_LEN = 30
-                    start_idx = start_logits[0].argmax().item()
-                    end_logits_masked = end_logits[0].clone()
-                    end_logits_masked[:start_idx] = float('-inf')
-                    end_logits_masked[start_idx + MAX_ANSWER_LEN:] = float('-inf')
-                    end_idx = end_logits_masked.argmax().item()
+                        # Forward pass
+                        out = model.backbone(input_ids, attn_mask)
+                        stacked = torch.stack([out.hidden_states[i] for i in [6, 7, 8, 9]], dim=0)
+                        weights = torch.softmax(model.layer_weights, dim=0).view(4, 1, 1, 1)
+                        hidden = (stacked * weights).sum(dim=0)
 
-                    pred_ids = input_ids[0][start_idx: end_idx + 1]
-                    pred_span = tokenizer.decode(pred_ids, skip_special_tokens=True).strip()
+                        q_emb = hidden[:, :q_end_val, :]
+                        q_mask = torch.zeros(1, q_end_val, dtype=torch.bool, device=device)
 
-                    predictions[qa_id] = pred_span
+                        start_logits, end_logits, _ = criterion.qa_head(hidden, q_emb, q_mask)
+
+                        # Masking padding
+                        padding_mask = (attn_mask[0] == 0)
+                        start_logits[0].masked_fill_(padding_mask, float('-inf'))
+                        end_logits[0].masked_fill_(padding_mask, float('-inf'))
+                        
+                        # Masking question tokens
+                        question_mask = torch.arange(start_logits.size(1), device=device) <= q_end_val
+                        
+                        # ĐỔI THÀNH TRUE ĐỂ MASK LUÔN [CLS], ÉP MODEL PHẢI TRẢ LỜI
+                        question_mask[0] = True 
+                        
+                        start_logits[0].masked_fill_(question_mask, float('-inf'))
+                        end_logits[0].masked_fill_(question_mask, float('-inf'))
+
+                        # Trích xuất ranh giới
+                        MAX_ANSWER_LEN = 30
+                        start_idx = start_logits[0].argmax().item()
+                        end_logits_masked = end_logits[0].clone()
+                        end_logits_masked[:start_idx] = float('-inf')
+                        end_logits_masked[start_idx + MAX_ANSWER_LEN:] = float('-inf')
+                        end_idx = end_logits_masked.argmax().item()
+
+                        score = start_logits[0][start_idx].item() + end_logits[0][end_idx].item()
+                        
+                        if score > best_score:
+                            best_score = score
+                            pred_ids = input_ids[0][start_idx: end_idx + 1]
+                            best_span = tokenizer.decode(pred_ids, skip_special_tokens=True).strip()
+
+                    predictions[qa_id] = best_span
                     total_samples += 1
                     
                     if total_samples % 500 == 0:

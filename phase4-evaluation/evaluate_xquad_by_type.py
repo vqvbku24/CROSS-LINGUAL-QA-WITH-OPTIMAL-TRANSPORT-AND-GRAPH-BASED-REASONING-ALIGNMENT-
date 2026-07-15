@@ -279,14 +279,52 @@ def classify_sample(question: str, answer_text: str) -> list[str]:
 # 4. Model Inference and Prediction Generation (Lazy Imports)
 # ─────────────────────────────────────────────────────────────
 
+class _InferenceDataset:
+    """Lightweight dataset that tokenizes all samples upfront for DataLoader batching."""
+    def __init__(self, data, tokenizer, max_length):
+        self.samples = []  # list of (qid, input_ids, attn_mask, q_end_val)
+        print(f"Pre-tokenizing {len(data)} samples...")
+        for item in tqdm(data, desc="Tokenizing"):
+            from phase1_dataloader.process_qa_sample import process_qa_sample
+            input_ids, attn_mask, _, _, q_end = process_qa_sample(
+                question=item["question"],
+                context=item["context"],
+                answer=None,
+                tokenizer=tokenizer,
+                max_length=max_length,
+                doc_stride=128,
+            )
+            self.samples.append((item["id"], input_ids, attn_mask, q_end.item()))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        qid, input_ids, attn_mask, q_end_val = self.samples[idx]
+        return qid, input_ids, attn_mask, q_end_val
+
+
+def _collate_fn(batch):
+    """Custom collate: stack tensors, keep qids and q_end_vals as lists."""
+    import torch
+    qids, all_ids, all_masks, all_qends = zip(*batch)
+    return (
+        list(qids),
+        torch.stack(all_ids),
+        torch.stack(all_masks),
+        list(all_qends),
+    )
+
+
 def run_model_inference(args, device_str):
-    """Run model inference on XQuAD-EN and return a dictionary of {qid: pred_span}."""
+    """Run model inference on XQuAD-EN using all available GPUs (DataParallel)."""
     # Lazy imports to support running dry-run or prediction mode without torch
     import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader
     from transformers import AutoTokenizer
     from phase2_model.model_core import CrossLingualOTModel
     from phase3_loss.losses import OTAlignmentLoss
-    from phase1_dataloader.process_qa_sample import process_qa_sample
 
     device = torch.device(device_str)
     print(f"Initializing tokenizer and model backbone: {args.model_name}")
@@ -301,7 +339,7 @@ def run_model_inference(args, device_str):
         model.load_state_dict(ckpt_stage1.get("model_state", ckpt_stage1), strict=False)
         if "criterion_state" in ckpt_stage1 and ckpt_stage1["criterion_state"] is not None:
             criterion.load_state_dict(ckpt_stage1["criterion_state"], strict=False)
-        
+
         print("Applying LoRA layers...")
         model.apply_lora()
         model.to(device)
@@ -319,71 +357,87 @@ def run_model_inference(args, device_str):
     model.eval()
     criterion.eval()
 
+    # 3. Wrap with DataParallel if multiple GPUs are available
+    num_gpus = torch.cuda.device_count() if device_str.startswith("cuda") else 0
+    if num_gpus > 1:
+        gpu_ids = list(range(num_gpus))
+        print(f"Using DataParallel across {num_gpus} GPUs: {gpu_ids}")
+        model = nn.DataParallel(model, device_ids=gpu_ids)
+        criterion = nn.DataParallel(criterion, device_ids=gpu_ids)
+    else:
+        print(f"Using single device: {device_str}")
+
+    # 4. Build dataset and DataLoader
     print(f"Loading SQuAD/XQuAD-EN data from: {args.squad_file}")
     data = load_squad_data_pure(args.squad_file)
     print(f"Loaded {len(data)} samples for evaluation.")
 
-    predictions = {}
-    with torch.no_grad():
-        for i, item in enumerate(tqdm(data, desc="Running Inference")):
-            question = item["question"]
-            context = item["context"]
-            qid = item["id"]
+    dataset = _InferenceDataset(data, tokenizer, args.max_length)
+    batch_size = args.batch_size * max(1, num_gpus)  # scale batch with GPU count
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=_collate_fn,
+    )
+    print(f"Effective batch size: {batch_size} ({args.batch_size} per GPU x {max(1, num_gpus)} GPU(s))")
 
-            # Tokenize sample
-            input_ids, attn_mask, _, _, q_end = process_qa_sample(
-                question=question,
-                context=context,
-                answer=None,
-                tokenizer=tokenizer,
-                max_length=args.max_length,
-                doc_stride=128,
-            )
-            input_ids = input_ids.unsqueeze(0).to(device)
-            attn_mask = attn_mask.unsqueeze(0).to(device)
-            q_end_val = q_end.item()
+    predictions = {}
+    MAX_ANSWER_LEN = 30
+
+    with torch.no_grad():
+        for qids, input_ids, attn_mask, q_end_vals in tqdm(loader, desc="Running Inference"):
+            input_ids = input_ids.to(device)   # [B, L]
+            attn_mask = attn_mask.to(device)   # [B, L]
 
             # Backbone forward pass
-            out = model.backbone(input_ids, attn_mask)
+            out = model.module.backbone(input_ids, attn_mask) if isinstance(model, nn.DataParallel) else model.backbone(input_ids, attn_mask)
             target_layers = [6, 7, 8, 9]
             stacked = torch.stack([out.hidden_states[l] for l in target_layers], dim=0)
-            weights = torch.softmax(model.layer_weights, dim=0).view(4, 1, 1, 1)
-            hidden = (stacked * weights).sum(dim=0)
+            raw_weights = model.module.layer_weights if isinstance(model, nn.DataParallel) else model.layer_weights
+            weights = torch.softmax(raw_weights, dim=0).view(4, 1, 1, 1)
+            hidden = (stacked * weights).sum(dim=0)  # [B, L, H]
 
-            # Question embeddings
-            q_emb = hidden[:, :q_end_val, :]
-            q_mask = torch.zeros(1, q_end_val, dtype=torch.bool, device=device)
+            # Process each sample individually for span decoding (q_end varies per sample)
+            for b_idx, (qid, q_end_val) in enumerate(zip(qids, q_end_vals)):
+                h = hidden[b_idx].unsqueeze(0)           # [1, L, H]
+                ids_b = input_ids[b_idx].unsqueeze(0)    # [1, L]
+                mask_b = attn_mask[b_idx].unsqueeze(0)   # [1, L]
 
-            # Predict logits
-            start_logits, end_logits, has_ans_logit = criterion.qa_head(hidden, q_emb, q_mask)
+                # Question embeddings
+                q_emb = h[:, :q_end_val, :]
+                q_mask = torch.zeros(1, q_end_val, dtype=torch.bool, device=device)
 
-            # Mask out padding tokens
-            padding_mask = (attn_mask[0] == 0)
-            start_logits[0].masked_fill_(padding_mask, float('-inf'))
-            end_logits[0].masked_fill_(padding_mask, float('-inf'))
+                # QA head — use .module if wrapped
+                qa_head = criterion.module.qa_head if isinstance(criterion, nn.DataParallel) else criterion.qa_head
+                start_logits, end_logits, has_ans_logit = qa_head(h, q_emb, q_mask)
 
-            # Mask out question tokens
-            question_mask = torch.arange(start_logits.size(1), device=device) <= q_end_val
-            question_mask[0] = False 
-            start_logits[0].masked_fill_(question_mask, float('-inf'))
-            end_logits[0].masked_fill_(question_mask, float('-inf'))
+                # Mask padding and question tokens
+                padding_mask = (mask_b[0] == 0)
+                start_logits[0].masked_fill_(padding_mask, float('-inf'))
+                end_logits[0].masked_fill_(padding_mask, float('-inf'))
 
-            # Decode span
-            MAX_ANSWER_LEN = 30
-            start_idx = start_logits[0].argmax().item()
-            end_logits_masked = end_logits[0].clone()
-            end_logits_masked[:start_idx] = float('-inf')
-            end_logits_masked[start_idx + MAX_ANSWER_LEN:] = float('-inf')
-            end_idx = end_logits_masked.argmax().item()
+                question_mask = torch.arange(start_logits.size(1), device=device) <= q_end_val
+                question_mask[0] = False
+                start_logits[0].masked_fill_(question_mask, float('-inf'))
+                end_logits[0].masked_fill_(question_mask, float('-inf'))
 
-            is_answerable_pred = has_ans_logit.item() > 0
-            if start_idx == 0 or not is_answerable_pred:
-                pred_span = ""
-            else:
-                pred_ids = input_ids[0][start_idx: end_idx + 1]
-                pred_span = tokenizer.decode(pred_ids, skip_special_tokens=True).strip()
+                # Decode span
+                start_idx = start_logits[0].argmax().item()
+                end_logits_masked = end_logits[0].clone()
+                end_logits_masked[:start_idx] = float('-inf')
+                end_logits_masked[start_idx + MAX_ANSWER_LEN:] = float('-inf')
+                end_idx = end_logits_masked.argmax().item()
 
-            predictions[qid] = pred_span
+                is_answerable_pred = has_ans_logit.item() > 0
+                if start_idx == 0 or not is_answerable_pred:
+                    pred_span = ""
+                else:
+                    pred_ids = ids_b[0][start_idx: end_idx + 1]
+                    pred_span = tokenizer.decode(pred_ids, skip_special_tokens=True).strip()
+
+                predictions[qid] = pred_span
 
     if args.save_preds:
         pred_out_file = args.save_preds
@@ -517,6 +571,7 @@ def main():
     parser.add_argument("--stage1_ckpt", type=str, default=None, help="Path to Stage 1 base checkpoint")
     parser.add_argument("--model_name", type=str, default="xlm-roberta-base", help="Pretrained model name")
     parser.add_argument("--max_length", type=int, default=384, help="Maximum token length")
+    parser.add_argument("--batch_size", type=int, default=8, help="Inference batch size per GPU")
     parser.add_argument("--save_preds", type=str, default=None, help="Path to save predictions to JSON")
     
     # Mode B: Pre-computed Prediction Files comparison
@@ -595,9 +650,17 @@ def main():
 
     # We only check for GPU/Torch inside run_model_inference
     import torch
-    device_str = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device_str}")
-    
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        gpu_names = [torch.cuda.get_device_name(i) for i in range(num_gpus)]
+        print(f"Detected {num_gpus} GPU(s):")
+        for i, name in enumerate(gpu_names):
+            print(f"  cuda:{i} — {name}")
+        device_str = "cuda"
+    else:
+        print("No GPU detected. Running on CPU.")
+        device_str = "cpu"
+
     predictions = run_model_inference(args, device_str)
     
     results = evaluate_pred_dict(predictions, squad_data)

@@ -34,7 +34,8 @@ except ImportError:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from gpu_utils import auto_select_free_gpus, get_model
+from torch.nn.parallel import DistributedDataParallel as DDP
+from gpu_utils import auto_select_free_gpus, get_model, setup_ddp, cleanup_ddp, is_main_process, get_local_rank
 from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
@@ -224,7 +225,7 @@ def stage2_step(
 
     # ── 1. EN branch — LoRA OFF, no gradient (frozen anchor) ────
     with torch.no_grad():
-        with model.backbone.disable_adapter():
+        with get_model(model).backbone.disable_adapter():
             en_frz_out = model(batch, branch="en")
             h_en_frz   = en_frz_out["hidden"]        # (B, T_en, H) — detached anchor
             en_mask    = ~en_frz_out["en_pad_mask"]  # (B, T_en) True = real token
@@ -376,34 +377,22 @@ def stage2_step(
     return losses
 
 
-def get_annealed_margin(epoch: int, step: int, steps_per_epoch: int, max_epochs: int) -> float:
-    if epoch == 1:
-        return 0.3
-    elif epoch == 2:
-        ratio = (step + 1) / steps_per_epoch
-        return 0.3 + 0.2 * ratio
-    elif epoch == 3:
-        return 0.5
-    else:
-        # epoch >= 4
-        if max_epochs <= 3:
-            return 0.5
-        total_decay_steps = (max_epochs - 3) * steps_per_epoch
-        current_decay_step = (epoch - 4) * steps_per_epoch + step
-        ratio = (current_decay_step + 1) / total_decay_steps
-        return 0.5 - 0.3 * ratio
+
 
 # ──────────────────────────────────────────────────────────────
 # Main Training Loop
 # ──────────────────────────────────────────────────────────────
 
 def run_stage2(config: dict):
-    auto_select_free_gpus()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info(f"Device: {device}")
-    log.info("=" * 60)
-    log.info("STAGE 2: Teacher-Student Sinkhorn Alignment")
-    log.info("=" * 60)
+    # ── DDP initialization ───────────────────────────────────────
+    local_rank, world_size = setup_ddp()
+    device = torch.device(f"cuda:{local_rank}")
+
+    if is_main_process():
+        log.info(f"Device: {device} (DDP world_size={world_size})")
+        log.info("=" * 60)
+        log.info("STAGE 2: Teacher-Student Sinkhorn Alignment")
+        log.info("=" * 60)
 
     os.makedirs(config["output_dir"], exist_ok=True)
 
@@ -424,15 +413,17 @@ def run_stage2(config: dict):
     en_em_baseline = load_stage1_checkpoint(ckpt_path, model, criterion, device)
 
     # ── 2. Apply LoRA ───────────────────────────────────────────────
-    log.info("Applying LoRA to backbone...")
+    if is_main_process():
+        log.info("Applying LoRA to backbone...")
     model.apply_lora()
     model.to(device) # Ensure new LoRA layers are on the target device
 
-    if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
+    # Wrap with DDP
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     # Disable dropout to prevent representation drift from random masks
-    log.info("Disabling dropout in backbone, adapters & criterion to prevent L_reg variance...")
+    if is_main_process():
+        log.info("Disabling dropout in backbone, adapters & criterion to prevent L_reg variance...")
     for m in model.modules():
         if isinstance(m, torch.nn.Dropout):
             m.p = 0.0
@@ -451,25 +442,29 @@ def run_stage2(config: dict):
     if en_em_baseline is None:
         en_em_baseline = compute_en_em_baseline(model, criterion, tokenizer, config, device)
 
-    # ── XQuAD dataloaders for Evaluation ────────────────────────
-    from data.xquad_loader import create_xquad_dataloaders
-    _, _, val_pairs = create_xquad_dataloaders(
-        root_dir=config["root_dir"],
-        tokenizer=tokenizer,
-        batch_size=config["batch_size"],
-        max_length=config["max_length"],
-    )
+    # ── XQuAD dataloaders for Evaluation (rank 0 only) ──────────
+    val_pairs = None
+    if is_main_process():
+        from data.xquad_loader import create_xquad_dataloaders
+        _, _, val_pairs = create_xquad_dataloaders(
+            root_dir=config["root_dir"],
+            tokenizer=tokenizer,
+            batch_size=config["batch_size"],
+            max_length=config["max_length"],
+        )
 
-    # ── Squad Parallel dataloaders ──────────────────────────────
+    # ── Squad Parallel dataloaders (with DistributedSampler) ────
     from squad_parallel_loader import create_squad_parallel_dataloaders
-    train_loader, _ = create_squad_parallel_dataloaders(
+    train_loader, _, train_sampler = create_squad_parallel_dataloaders(
         tokenizer=tokenizer,
         en_path=os.path.join(config["root_dir"], "dataset", "Squad2.0", "train-v2.0.json"),
         vi_path=os.path.join(config["root_dir"], "dataset", "AIForge_vietnamese-squad", "train-00000-of-00001.parquet"),
         batch_size=config["batch_size"],
         max_length=config["max_length"],
+        distributed=True,
     )
-    log.info(f"Train (SQuAD Parallel): {len(train_loader)} batches | XQuAD Val: {len(val_pairs)} pairs")
+    if is_main_process():
+        log.info(f"Train (SQuAD Parallel): {len(train_loader)} batches/GPU | XQuAD Val: {len(val_pairs)} pairs")
 
     # ── Optimizer — differential learning rates ──────────────────
     # backbone: frozen except for LoRA parameters
@@ -480,14 +475,16 @@ def run_stage2(config: dict):
             {"params": trainable_backbone,           "lr": config["stage2_head_lr"], "weight_decay": config["weight_decay"]},
             {"params": [get_model(model).layer_weights],        "lr": config["stage2_head_lr"], "weight_decay": 0.0},
         ])
-        log.info("Optimizer: LoRA (with decay) + layer_weights (no decay). QA head frozen.")
+        if is_main_process():
+            log.info("Optimizer: LoRA (with decay) + layer_weights (no decay). QA head frozen.")
     else:
         optimizer = AdamW([
             {"params": trainable_backbone,           "lr": config["stage2_head_lr"], "weight_decay": config["weight_decay"]},
             {"params": [get_model(model).layer_weights],        "lr": config["stage2_head_lr"], "weight_decay": 0.0},
             {"params": list(criterion.parameters()), "lr": config["stage2_head_lr"], "weight_decay": 0.0},
         ])
-        log.info("Optimizer: LoRA (with decay) + layer_weights (no decay) + QA head (no decay).")
+        if is_main_process():
+            log.info("Optimizer: LoRA (with decay) + layer_weights (no decay) + QA head (no decay).")
 
     # ── Scheduler ────────────────────────────────────────────────
     steps_per_epoch = len(train_loader)
@@ -499,7 +496,8 @@ def run_stage2(config: dict):
         num_warmup_steps=warmup_steps,
         num_training_steps=total_steps,
     )
-    log.info(f"Scheduler: linear warmup {warmup_steps}/{total_steps} steps")
+    if is_main_process():
+        log.info(f"Scheduler: linear warmup {warmup_steps}/{total_steps} steps")
 
     stage2_loss = Stage2Loss(
         lambda_ot     = config["lambda_ot"],
@@ -509,14 +507,17 @@ def run_stage2(config: dict):
         lambda_qa     = config["lambda_qa"],
     ).to(device)
 
-    log.info(
-        f"Stage 2 Loss config: lambda_ot={config['lambda_ot']}, lambda_reg={config['lambda_reg']}, lambda_qa={config['lambda_qa']}, lambda_margin={config['lambda_margin']}, anneal_margin={config.get('anneal_margin', False)}"
-    )
+    if is_main_process():
+        log.info(
+            f"Stage 2 Loss config: lambda_ot={config['lambda_ot']}, lambda_reg={config['lambda_reg']}, lambda_qa={config['lambda_qa']}, lambda_margin={config['lambda_margin']}, anneal_margin={config.get('anneal_margin', False)}"
+        )
 
-    # ── TensorBoard ─────────────────────────────────────────────
+    # ── TensorBoard (rank 0 only) ───────────────────────────────
+    writer = None
     tb_dir = os.path.join(config["output_dir"], "tensorboard_stage2")
-    writer = SummaryWriter(log_dir=tb_dir)
-    log.info(f"TensorBoard: {tb_dir}")
+    if is_main_process():
+        writer = SummaryWriter(log_dir=tb_dir)
+        log.info(f"TensorBoard: {tb_dir}")
 
     # ── Verification Check ──────────────────────────────────────
     if config.get("freeze_qa_head", False):
@@ -526,19 +527,26 @@ def run_stage2(config: dict):
         assert any(p.requires_grad for p in criterion.qa_head.parameters()), \
             "BUG: QA head does not have requires_grad=True"
 
-    assert any(p.requires_grad for p in model.backbone.parameters()), \
+    assert any(p.requires_grad for p in get_model(model).backbone.parameters()), \
         "BUG: Backbone has no trainable parameters (LoRA missing)"
 
-    assert model.layer_weights.requires_grad, \
+    assert get_model(model).layer_weights.requires_grad, \
         "BUG: layer_weights is frozen"
 
-    log.info("Ablation setup verified successfully.")
+    if is_main_process():
+        log.info("Ablation setup verified successfully.")
 
     # ── Initial state ───────────────────────────────────────────
     start_epoch    = 1
     best_vi_em     = 0.0
     patience_count = 0
     global_step    = 0
+
+    # Margin scheduling state
+    margin_schedule = [1.0, 0.5, 0.3]
+    current_margin_idx = 0
+    best_vi_f1 = 0.0
+    margin_patience_count = 0
 
     # ── Resume Logic ─────────────────────────────────────────────
     if config.get("resume_from"):
@@ -578,12 +586,17 @@ def run_stage2(config: dict):
     # ── Training epochs ─────────────────────────────────────────
     for epoch in range(start_epoch, config["max_epochs"] + 1):
 
+        # Set epoch for DistributedSampler (ensures different shuffle per epoch)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         # LoRA adapter handles freeze/unfreeze automatically during forward
         model.train()
         criterion.train()
 
-        log.info(f"{'━'*60}")
-        log.info(f"Epoch {epoch}/{config['max_epochs']}")
+        if is_main_process():
+            log.info(f"{'━'*60}")
+            log.info(f"Epoch {epoch}/{config['max_epochs']}")
 
         epoch_losses = {
             "total": 0.0, "ot": 0.0, "reg": 0.0, "span": 0.0, "margin": 0.0, "qa": 0.0, "has_ans": 0.0,
@@ -614,7 +627,7 @@ def run_stage2(config: dict):
             current_alpha = 1.0
 
             if config.get("anneal_margin"):
-                current_margin = get_annealed_margin(epoch, step, steps_per_epoch, config["max_epochs"])
+                current_margin = margin_schedule[current_margin_idx]
                 stage2_loss.lambda_margin = current_margin
             else:
                 current_margin = config["lambda_margin"]
@@ -649,8 +662,8 @@ def run_stage2(config: dict):
                 elif isinstance(v, float):
                     epoch_losses[k] += v
 
-            # ── Per-step TensorBoard logging ─────────────────────
-            if global_step % config["log_every"] == 0:
+            # ── Per-step TensorBoard logging (rank 0 only) ────────
+            if global_step % config["log_every"] == 0 and is_main_process():
                 g_ent  = losses.get("gamma_entropy", 0.0)
                 span_w = losses.get("span_weight", torch.tensor(0.0)).item()
 
@@ -702,129 +715,167 @@ def run_stage2(config: dict):
                 writer.add_scalar("Hyperparameters/Alpha", current_alpha, global_step)
                 writer.add_scalar("Hyperparameters/Lambda_Margin", current_margin, global_step)
 
-        # ── End of epoch summary ─────────────────────────────────
-        avg = {k: v / max(step_count, 1) for k, v in epoch_losses.items()}
-        log.info(
-            f"Epoch {epoch} avg | total={avg['total']:.4f} | "
-            f"raw_ot={avg['raw_ot_loss']:.4f} | raw_reg={avg['raw_reg_loss']:.4f} | raw_span={avg.get('raw_span_loss', 0.0):.4f} | raw_margin={avg.get('raw_margin_loss', 0.0):.4f} | raw_qa={avg['raw_qa_loss']:.4f} | "
-            f"w_ot={avg['weighted_ot']:.4f} | w_reg={avg['weighted_reg']:.4f} | w_span={avg.get('weighted_span', 0.0):.4f} | w_margin={avg.get('weighted_margin', 0.0):.4f} | w_qa={avg['weighted_qa']:.4f}"
-        )
-
-        # ── Evaluation ───────────────────────────────────────────
-        import importlib.util
-        eval_file = os.path.join(config["root_dir"], "phase4-evaluation", "quick_eval.py")
-        spec = importlib.util.spec_from_file_location("quick_eval", eval_file)
-        quick_eval_mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(quick_eval_mod)
-
-        # VI EM on XQuAD val
-        vi_em, vi_f1 = quick_eval_mod.quick_em_f1_xquad_vi(
-            model, criterion, tokenizer, val_pairs, device,
-            max_length=config["max_length"],
-        )
-        log.info(f"Epoch {epoch} XQuAD VI EM: {vi_em:.2f}%, F1: {vi_f1:.2f}%")
-        writer.add_scalar("Eval/XQuAD_VI_EM", vi_em, epoch)
-        writer.add_scalar("Eval/XQuAD_VI_F1", vi_f1, epoch)
-
-        # EN EM regression check (200 SQuAD samples)
-        dev_file = os.path.join(config["root_dir"], "dataset", "Squad2.0", "dev-v2.0.json")
-        if os.path.exists(dev_file):
-            en_em, en_f1 = quick_eval_mod.quick_em_f1(
-                model, criterion, tokenizer, dev_file, n_samples=200, device=device,
+        # ── End of epoch summary (rank 0) ─────────────────────────
+        if is_main_process():
+            avg = {k: v / max(step_count, 1) for k, v in epoch_losses.items()}
+            log.info(
+                f"Epoch {epoch} avg | total={avg['total']:.4f} | "
+                f"raw_ot={avg['raw_ot_loss']:.4f} | raw_reg={avg['raw_reg_loss']:.4f} | raw_span={avg.get('raw_span_loss', 0.0):.4f} | raw_margin={avg.get('raw_margin_loss', 0.0):.4f} | raw_qa={avg['raw_qa_loss']:.4f} | "
+                f"w_ot={avg['weighted_ot']:.4f} | w_reg={avg['weighted_reg']:.4f} | w_span={avg.get('weighted_span', 0.0):.4f} | w_margin={avg.get('weighted_margin', 0.0):.4f} | w_qa={avg['weighted_qa']:.4f}"
             )
-            log.info(f"Epoch {epoch} SQuAD EN EM (200): {en_em:.2f}% (baseline={en_em_baseline:.2f}%), F1: {en_f1:.2f}%")
-            writer.add_scalar("Eval/SQuAD_EN_EM_Quick", en_em, epoch)
-            writer.add_scalar("Eval/SQuAD_EN_F1_Quick", en_f1, epoch)
 
-            drop = en_em_baseline - en_em
-            if epoch >= 4 and drop > config["en_em_safety"]:
-                log.warning(
-                    f"EN EM dropped {drop:.1f} pts (>{config['en_em_safety']}) — hard stop!"
+        # ── Evaluation & checkpoint (rank 0 only) ─────────────────
+        vi_em = 0.0
+        en_em = 0.0
+        should_break = False
+
+        if is_main_process():
+            import importlib.util
+            eval_file = os.path.join(config["root_dir"], "phase4-evaluation", "quick_eval.py")
+            spec = importlib.util.spec_from_file_location("quick_eval", eval_file)
+            quick_eval_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(quick_eval_mod)
+
+            # VI EM on XQuAD val
+            vi_em, vi_f1 = quick_eval_mod.quick_em_f1_xquad_vi(
+                model, criterion, tokenizer, val_pairs, device,
+                max_length=config["max_length"],
+            )
+            log.info(f"Epoch {epoch} XQuAD VI EM: {vi_em:.2f}%, F1: {vi_f1:.2f}%")
+            writer.add_scalar("Eval/XQuAD_VI_EM", vi_em, epoch)
+            writer.add_scalar("Eval/XQuAD_VI_F1", vi_f1, epoch)
+
+            # Validation-driven margin scheduling
+            if config.get("anneal_margin"):
+                if epoch >= 1:
+                    min_delta_f1 = 0.1
+                    if vi_f1 > best_vi_f1 + min_delta_f1:
+                        best_vi_f1 = vi_f1
+                        margin_patience_count = 0
+                    else:
+                        margin_patience_count += 1
+                        log.info(f"  [Margin Schedule] F1 plateau/drop detected (best F1: {best_vi_f1:.2f}%). Patience: {margin_patience_count}")
+                        if margin_patience_count >= 1:
+                            if current_margin_idx < len(margin_schedule) - 1:
+                                current_margin_idx += 1
+                                log.info(f"  [Margin Schedule] 📉 Stepping down margin to {margin_schedule[current_margin_idx]}")
+                            margin_patience_count = 0
+
+            # EN EM regression check (200 SQuAD samples)
+            dev_file = os.path.join(config["root_dir"], "dataset", "Squad2.0", "dev-v2.0.json")
+            if os.path.exists(dev_file):
+                en_em, en_f1 = quick_eval_mod.quick_em_f1(
+                    model, criterion, tokenizer, dev_file, n_samples=200, device=device,
                 )
-                break
+                log.info(f"Epoch {epoch} SQuAD EN EM (200): {en_em:.2f}% (baseline={en_em_baseline:.2f}%), F1: {en_f1:.2f}%")
+                writer.add_scalar("Eval/SQuAD_EN_EM_Quick", en_em, epoch)
+                writer.add_scalar("Eval/SQuAD_EN_F1_Quick", en_f1, epoch)
 
-        # ── Checkpoint saving ─────────────────────────────────────
-        if epoch % config["save_every"] == 0:
-            ckpt_out = os.path.join(config["output_dir"], f"stage2_epoch_{epoch:03d}.pt")
-            save_stage2_checkpoint(
-                ckpt_out, epoch, global_step,
-                model, criterion, optimizer, scheduler,
-                config, vi_em, best_vi_em, patience_count,
-            )
-
-            # Upload to Hugging Face
-            if config.get("hf_repo_id"):
-                try:
-                    from huggingface_hub import HfApi
-                    api = HfApi(token=os.environ.get("HF_TOKEN"))
-                    output_basename = os.path.basename(os.path.normpath(config["output_dir"])) or "checkpoint_stage2"
-                    log.info(f"   Uploading epoch checkpoint to Hugging Face ({config['hf_repo_id']})...")
-                    api.upload_file(
-                        path_or_fileobj=ckpt_out,
-                        path_in_repo=f"{output_basename}/stage2_epoch_{epoch:03d}.pt",
-                        repo_id=config["hf_repo_id"],
-                        repo_type="model"
+                drop = en_em_baseline - en_em
+                if epoch >= 4 and drop > config["en_em_safety"]:
+                    log.warning(
+                        f"EN EM dropped {drop:.1f} pts (>{config['en_em_safety']}) — hard stop!"
                     )
-                    if writer is not None:
-                        api.upload_folder(
-                            folder_path=tb_dir,
-                            path_in_repo=f"logs/{output_basename}_tensorboard",
-                            repo_id=config["hf_repo_id"],
-                            repo_type="model"
-                        )
-                    log.info("   ✅ Epoch checkpoint & TensorBoard logs uploaded successfully!")
-                except Exception as e:
-                    log.error(f"   Upload epoch checkpoint error (local file still safe): {e}")
+                    should_break = True
 
-
-        # ── Early stopping ────────────────────────────────────────
-        if epoch >= 4:
-            if vi_em > best_vi_em + config["min_delta_em"]:
-                best_vi_em     = vi_em
-                patience_count = 0
-                best_path = os.path.join(config["output_dir"], "stage2_best.pt")
+            # ── Checkpoint saving ─────────────────────────────────────
+            if epoch % config["save_every"] == 0:
+                ckpt_out = os.path.join(config["output_dir"], f"stage2_epoch_{epoch:03d}.pt")
                 save_stage2_checkpoint(
-                    best_path, epoch, global_step,
+                    ckpt_out, epoch, global_step,
                     model, criterion, optimizer, scheduler,
                     config, vi_em, best_vi_em, patience_count,
                 )
-                log.info(f"  ★ New best VI EM={vi_em:.2f}% — saved {best_path}")
 
-                # Upload best checkpoint to Hugging Face
+                # Upload to Hugging Face
                 if config.get("hf_repo_id"):
                     try:
                         from huggingface_hub import HfApi
                         api = HfApi(token=os.environ.get("HF_TOKEN"))
                         output_basename = os.path.basename(os.path.normpath(config["output_dir"])) or "checkpoint_stage2"
-                        log.info(f"   Uploading best checkpoint to Hugging Face...")
+                        log.info(f"   Uploading epoch checkpoint to Hugging Face ({config['hf_repo_id']})...")
                         api.upload_file(
-                            path_or_fileobj=best_path,
-                            path_in_repo=f"{output_basename}/stage2_best.pt",
+                            path_or_fileobj=ckpt_out,
+                            path_in_repo=f"{output_basename}/stage2_epoch_{epoch:03d}.pt",
                             repo_id=config["hf_repo_id"],
                             repo_type="model"
                         )
-                        log.info("   ✅ Best checkpoint uploaded successfully!")
+                        if writer is not None:
+                            api.upload_folder(
+                                folder_path=tb_dir,
+                                path_in_repo=f"logs/{output_basename}_tensorboard",
+                                repo_id=config["hf_repo_id"],
+                                repo_type="model"
+                            )
+                        log.info("   ✅ Epoch checkpoint & TensorBoard logs uploaded successfully!")
                     except Exception as e:
-                        log.error(f"   Upload best checkpoint error: {e}")
+                        log.error(f"   Upload epoch checkpoint error (local file still safe): {e}")
 
-            else:
-                patience_count += 1
-                log.info(
-                    f"  No improvement. Patience {patience_count}/{config['patience']}"
-                )
-                if patience_count >= config["patience"]:
-                    log.info(
-                        f"Early stopping at epoch {epoch} — best VI EM={best_vi_em:.2f}%"
+
+            # ── Early stopping ────────────────────────────────────────
+            if epoch >= 4:
+                if vi_em > best_vi_em + config["min_delta_em"]:
+                    best_vi_em     = vi_em
+                    patience_count = 0
+                    best_path = os.path.join(config["output_dir"], "stage2_best.pt")
+                    save_stage2_checkpoint(
+                        best_path, epoch, global_step,
+                        model, criterion, optimizer, scheduler,
+                        config, vi_em, best_vi_em, patience_count,
                     )
-                    break
-        else:
-            log.info(f"  Epoch {epoch} < 4. Early stopping monitoring is suspended.")
+                    log.info(f"  ★ New best VI EM={vi_em:.2f}% — saved {best_path}")
 
-    writer.close()
-    log.info("=" * 60)
-    log.info(f"Stage 2 complete. Best VI EM: {best_vi_em:.2f}%")
-    log.info(f"Best checkpoint: {os.path.join(config['output_dir'], 'stage2_best.pt')}")
-    log.info("=" * 60)
+                    # Upload best checkpoint to Hugging Face
+                    if config.get("hf_repo_id"):
+                        try:
+                            from huggingface_hub import HfApi
+                            api = HfApi(token=os.environ.get("HF_TOKEN"))
+                            output_basename = os.path.basename(os.path.normpath(config["output_dir"])) or "checkpoint_stage2"
+                            log.info(f"   Uploading best checkpoint to Hugging Face...")
+                            api.upload_file(
+                                path_or_fileobj=best_path,
+                                path_in_repo=f"{output_basename}/stage2_best.pt",
+                                repo_id=config["hf_repo_id"],
+                                repo_type="model"
+                            )
+                            log.info("   ✅ Best checkpoint uploaded successfully!")
+                        except Exception as e:
+                            log.error(f"   Upload best checkpoint error: {e}")
+
+                else:
+                    patience_count += 1
+                    log.info(
+                        f"  No improvement. Patience {patience_count}/{config['patience']}"
+                    )
+                    if patience_count >= config["patience"]:
+                        log.info(
+                            f"Early stopping at epoch {epoch} — best VI EM={best_vi_em:.2f}%"
+                        )
+                        should_break = True
+            else:
+                log.info(f"  Epoch {epoch} < 4. Early stopping monitoring is suspended.")
+
+        # Broadcast break signal and margin state to all ranks
+        if world_size > 1:
+            signal_tensor = torch.tensor([
+                1 if should_break else 0,
+                current_margin_idx
+            ], device=device)
+            torch.distributed.broadcast(signal_tensor, src=0)
+            should_break = signal_tensor[0].item() == 1
+            current_margin_idx = int(signal_tensor[1].item())
+
+        if should_break:
+            break
+
+    if is_main_process() and writer is not None:
+        writer.close()
+        log.info("=" * 60)
+        log.info(f"Stage 2 complete. Best VI EM: {best_vi_em:.2f}%")
+        log.info(f"Best checkpoint: {os.path.join(config['output_dir'], 'stage2_best.pt')}")
+        log.info("=" * 60)
+
+    cleanup_ddp()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -871,9 +922,10 @@ def parse_args() -> dict:
 if __name__ == "__main__":
     config = parse_args()
 
-    log.info("Stage 2 config:")
-    for k, v in config.items():
-        if k != "root_dir":
-            log.info(f"  {k:20s}: {v}")
+    if is_main_process():
+        log.info("Stage 2 config:")
+        for k, v in config.items():
+            if k != "root_dir":
+                log.info(f"  {k:20s}: {v}")
 
     run_stage2(config)

@@ -1,42 +1,99 @@
-### BUGFIX_SPEC.md: Khắc phục lỗi rò rỉ Question và crash Sinkhorn
+# BUGFIX SPEC — requirements.txt thiếu dependency trước khi build Docker
 
-#### 1. Bug 1.1: Rò rỉ Logits vào Question Tokens
+## Priority Table
 
-* **File ảnh hưởng:** `quick_eval.py`
-* **Hàm cần sửa:** `quick_em` và `quick_em_xquad_vi`
-* **Vấn đề:** Model hiện tại chỉ mask các padding tokens (`attn_mask == 0`), dẫn đến việc QA head có thể trích xuất nhầm các token nằm trong câu hỏi thay vì context (vi phạm nguyên tắc extractive QA).
-* **Giải pháp:** Bổ sung `question_mask` dựa trên `q_end_val` để ép logits của vùng câu hỏi về $-\infty$.
-* **Chi tiết triển khai:**
-Chèn đoạn code sau ngay bên dưới logic `padding_mask`:
+| # | Mức độ | Vấn đề | File |
+|---|---|---|---|
+| 1 | CRITICAL | Thiếu `peft` — code import trực tiếp, container sẽ crash khi chạy model | `requirements.txt` |
+| 2 | IMPORTANT | Thiếu `accelerate` — cần cho multi-GPU / device_map trên HPC node 8-GPU | `requirements.txt` |
+| 3 | IMPORTANT | Thiếu `scikit-learn` — cần nếu có tính metric (F1/EM) hoặc dùng gián tiếp qua `evaluate` | `requirements.txt` |
+| 4 | OPTIONAL | Thiếu `evaluate` — chỉ thêm nếu thực sự dùng HF `evaluate` lib để tính metric | `requirements.txt` |
+| 5 | OPTIONAL | `sentencepiece` chưa pin version | `requirements.txt` |
+
+---
+
+## 1. [CRITICAL] Thiếu `peft`
+
+**File & vị trí:** `phase2_model/model_core.py:19`
+
+**Snippet vấn đề (code có nhưng requirements.txt không khai báo):**
 ```python
-# Mask out padding tokens
-padding_mask = (attn_mask[0] == 0)
-start_logits[0].masked_fill_(padding_mask, float('-inf'))
-end_logits[0].masked_fill_(padding_mask, float('-inf'))
-
-# [NEW] Mask out question tokens (từ index 0 đến q_end_val)
-question_mask = torch.arange(start_logits.size(1), device=device) <= q_end_val
-start_logits[0].masked_fill_(question_mask, float('-inf'))
-end_logits[0].masked_fill_(question_mask, float('-inf'))
-
+from peft import get_peft_model, LoraConfig, TaskType
 ```
 
+**Fix — thêm vào `requirements.txt`:**
+```diff
+ transformers==4.41.2
++peft==0.12.0
+ datasets==3.2.0
+```
 
+> Chọn `peft==0.12.0` vì tương thích với `transformers==4.41.2` (peft 0.12.x hỗ trợ transformers >=4.31, <4.45 không vấn đề). Không đổi version `transformers` hiện tại.
 
-#### 2. Bug 1.2: Rủi ro $\log(0)$ sinh ra $-\infty$ trong Sinkhorn Log-domain
+---
 
-* **File ảnh hưởng:** `losses.py`
-* **Hàm cần sửa:** `sinkhorn_masked`
-* **Vấn đề:** Trong trường hợp `mu_override` được kích hoạt và chứa các giá trị tiệm cận hoặc bằng 0, phép toán `torch.log(mu)` sẽ trả về $-\infty$. Điều này gây ra lỗi `NaN` ở các bước tính toán `logsumexp` tiếp theo, làm sụp đổ toàn bộ gradient của batch.
-* **Giải pháp:** Thêm hàm `.clamp(min=1e-8)` vào `mu` (tương tự như đã làm với `nu` nếu cần thiết) để đảm bảo an toàn số học.
-* **Chi tiết triển khai:**
-Sửa đổi dòng tính `log_u` (khoảng dòng 761):
-```python
-# [OLD]
-# log_u = torch.log(mu) - torch.logsumexp(log_K + log_v[None, :], dim=1)
+## 2. [IMPORTANT] Thiếu `accelerate`
 
-# [NEW] Clamp mu để tránh log(0) -> -inf
-log_u = torch.log(mu.clamp(min=1e-8)) - torch.logsumexp(log_K + log_v[None, :], dim=1)
+**Vấn đề:** Không thấy import trực tiếp trong code hiện tại, nhưng chạy multi-GPU trên node `fcdgx00090` (8 GPU) qua `Trainer`/`device_map="auto"` sau này sẽ cần. Thêm trước để không phải rebuild image giữa chừng khi mở rộng sang multi-GPU.
 
-# Giữ nguyên log_v hoặc kẹp thêm nu cho đồng bộ tính an toàn
-log_v = torch.log(nu.clamp(min=1e-8)) - torch.logsumexp(log_K + log_u[:, None], dim=0)
+**Fix:**
+```diff
+ huggingface_hub==0.23.0
++accelerate==0.33.0
+ sentencepiece==0.2.0
+```
+
+---
+
+## 3. [IMPORTANT] Thiếu `scikit-learn`
+
+**Vấn đề:** Cần xác nhận có dùng cho tính metric (ví dụ cosine similarity, clustering trong OT diagnostics) hay không trước khi thêm.
+
+**Fix (nếu xác nhận cần):**
+```diff
++scikit-learn==1.5.1
+```
+
+**Điều kiện:** Chỉ thêm sau khi grep xác nhận có dùng `from sklearn import ...` ở đâu đó trong repo:
+```bash
+grep -r "sklearn" --include="*.py" .
+```
+Nếu không có kết quả nào → bỏ qua bước này, không thêm lib không dùng.
+
+---
+
+## 4. [OPTIONAL] `evaluate`
+
+Chỉ thêm nếu grep thấy:
+```bash
+grep -r "import evaluate" --include="*.py" .
+```
+Nếu không có → không cần, tránh phình requirements không cần thiết.
+
+---
+
+## 5. [OPTIONAL] Pin `sentencepiece`
+
+```diff
+-sentencepiece
++sentencepiece==0.2.0
+```
+
+---
+
+## No-touch zones
+
+- **KHÔNG đổi** version `transformers` (giữ `4.41.2`), `datasets` (giữ `3.2.0`), `huggingface_hub` (giữ `0.23.0`), `POT` (giữ `0.9.3`) — đây là các version đã chạy thật với code, đổi theo số trong checklist ban đầu (4.44.2/2.20.0/...) là không cần thiết và có rủi ro breaking change.
+- **KHÔNG** thêm `evaluate`/`scikit-learn` nếu không grep thấy import thực tế — tránh bloat image và tăng thời gian build/scp không cần thiết.
+- **KHÔNG** sửa `.gitignore`, `run.sh`, hay token-loading logic — các phần này đã đúng theo review.
+
+---
+
+## Sau khi fix — rebuild lại từ Bước 3 trong PREP_CHECKLIST_SOFTBANK.md
+
+```bash
+cd ~/pytorch-simple-image
+docker buildx build --platform linux/amd64 -t comer-pytorch:cuda .
+docker run --rm comer-pytorch:cuda \
+  python -c "import torch, transformers, peft, datasets, accelerate; print('all imports OK')"
+```

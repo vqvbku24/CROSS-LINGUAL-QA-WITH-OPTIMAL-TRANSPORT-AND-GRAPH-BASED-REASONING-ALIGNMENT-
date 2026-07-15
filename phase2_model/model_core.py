@@ -87,10 +87,8 @@ class CrossLingualOTModel(nn.Module):
             stacked = torch.stack([out.hidden_states[i] for i in target_layers], dim=0)
             weights = torch.softmax(self.layer_weights, dim=0).view(4, 1, 1, 1)
             H = (stacked * weights).sum(dim=0)
-            seq_len = int(batch["en_attention_mask"].sum(dim=1).max().item())
-            H = H[:, :seq_len, :]
-            pad_mask = (batch["en_attention_mask"][:, :seq_len] == 0)
-            return {"hidden": H, "en_pad_mask": pad_mask, "en_seq_len": seq_len}
+            pad_mask = (batch["en_attention_mask"] == 0)
+            return {"hidden": H, "en_pad_mask": pad_mask}
 
         if branch == "vi":
             out = self.backbone(batch["vi_input_ids"], batch["vi_attention_mask"])
@@ -98,10 +96,8 @@ class CrossLingualOTModel(nn.Module):
             stacked = torch.stack([out.hidden_states[i] for i in target_layers], dim=0)
             weights = torch.softmax(self.layer_weights, dim=0).view(4, 1, 1, 1)
             H = (stacked * weights).sum(dim=0)
-            seq_len = int(batch["vi_attention_mask"].sum(dim=1).max().item())
-            H = H[:, :seq_len, :]
-            pad_mask = (batch["vi_attention_mask"][:, :seq_len] == 0)
-            return {"hidden": H, "vi_pad_mask": pad_mask, "vi_seq_len": seq_len}
+            pad_mask = (batch["vi_attention_mask"] == 0)
+            return {"hidden": H, "vi_pad_mask": pad_mask}
 
         # ── branch="both" — Stage 1 behavior (unchanged) ────────────────
         # ── 1. Shared Backbone ─────────────────────────────────────
