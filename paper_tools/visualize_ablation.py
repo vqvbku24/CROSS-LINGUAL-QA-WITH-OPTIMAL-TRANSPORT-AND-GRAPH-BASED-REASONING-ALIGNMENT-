@@ -3,15 +3,28 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-def generate_dummy_data():
+def generate_ablation_data():
+    # Các nhãn đã được note rõ ràng chức năng (Baseline, OT, Margin...) 
+    # ghép với mã M0-M5 để hội đồng phản biện dễ theo dõi tiến trình
     data = {
-        'Method': ['Baseline', 'OT', 'OT+Span', 'OT+Span+Margin', 'Full'],
-        'SQuAD_EN': [75.0, 75.5, 76.0, 77.2, 78.5],
-        'MLQA_VI': [55.0, 58.2, 60.1, 61.5, 63.0],
-        'XQuAD_VI': [60.0, 63.5, 65.2, 66.8, 68.4]
+        'Method': [
+            'M0: Zero-shot (Baseline)', 
+            'M1: Vanilla KD', 
+            'M2: OT Only (Global)', 
+            'M3: OT + Span (Local)', 
+            'M4: Static Margin', 
+            'M5: Ours (Dynamic)'
+        ],
+        # Điểm F1 tương ứng từ bảng LaTeX
+        'SQuAD_EN': [72.84, 73.93, 72.75, 73.09, 73.90, 73.27],
+        'MLQA_VI': [67.21, 64.42, 56.06, 65.33, 67.41, 68.10],
+        
+        # TODO: Nhập điểm F1 của XQuAD_VI tương ứng với các cấu hình M0 -> M5 vào list dưới đây
+        'XQuAD_VI': [63.64, 69.31 , 57.63 , 70.11, 71.24 , 71.22] 
     }
     df = pd.DataFrame(data)
-    df.to_csv('ablation.csv', index=False)
+    # Lưu file với chuẩn UTF-8 để tránh lỗi font
+    df.to_csv('ablation.csv', index=False, encoding='utf-8')
 
 def plot_figure4():
     # Setup fonts
@@ -20,28 +33,31 @@ def plot_figure4():
     plt.rcParams['font.size'] = 10
     
     if not os.path.exists('ablation.csv'):
-        print("Generating dummy data...")
-        generate_dummy_data()
+        print("Generating ablation data...")
+        generate_ablation_data()
         
-    df = pd.read_csv('ablation.csv')
+    df = pd.read_csv('ablation.csv', encoding='utf-8')
     
     methods = df['Method'].values
     metrics = ['SQuAD_EN', 'MLQA_VI', 'XQuAD_VI']
     
     # Normalize metrics to [0, 1] per column for visualization purposes
-    # Or normalize globally. Usually min-max scaling per column is used.
     norm_df = df.copy()
     for col in metrics:
         min_val = norm_df[col].min()
         max_val = norm_df[col].max()
-        norm_df[col] = (norm_df[col] - min_val) / (max_val - min_val)
+        # Tránh lỗi chia cho 0 nếu data XQuAD_VI chưa được nhập
+        if max_val - min_val == 0:
+            norm_df[col] = 0.001
+        else:
+            norm_df[col] = (norm_df[col] - min_val) / (max_val - min_val)
         
     # Radar chart setup
     N = len(metrics)
     angles = [n / float(N) * 2 * np.pi for n in range(N)]
     angles += angles[:1] # Close the loop
     
-    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+    fig, ax = plt.subplots(figsize=(7, 7), subplot_kw=dict(polar=True))
     
     # Remove background colors
     ax.set_facecolor('white')
@@ -51,23 +67,28 @@ def plot_figure4():
     ax.set_theta_direction(-1)
     
     # Custom ticks
-    plt.xticks(angles[:-1], ['SQuAD EN', 'MLQA VI', 'XQuAD VI'])
+    plt.xticks(angles[:-1], ['SQuAD EN (Source)', 'MLQA VI (Target)', 'XQuAD VI (Target)'], size=11, fontweight='bold')
     ax.set_rlabel_position(0)
     plt.yticks([0.2, 0.4, 0.6, 0.8, 1.0], ["0.2", "0.4", "0.6", "0.8", "1.0"], color="grey", size=8)
     plt.ylim(0, 1.05)
     
-    line_styles = ['-', '--', '-.', ':', '-']
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+    # Update styles and colors for 6 methods
+    line_styles = ['-', '--', '-.', ':', '-', '--']
+    colors = ['#7f7f7f', '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+    linewidths = [1.5, 1.5, 1.5, 1.5, 2.0, 2.5] # Nhấn mạnh M4 và M5
     
     for i, method in enumerate(methods):
         values = norm_df.loc[i, metrics].values.flatten().tolist()
         values += values[:1] # Close the loop
         
-        ax.plot(angles, values, linewidth=2, linestyle=line_styles[i % len(line_styles)], color=colors[i % len(colors)], label=method)
-        ax.fill(angles, values, color=colors[i % len(colors)], alpha=0.1)
+        ax.plot(angles, values, linewidth=linewidths[i], linestyle=line_styles[i], color=colors[i], label=method)
+        
+        # Chỉ fill màu cho phương pháp đề xuất (M5) để làm nổi bật
+        if 'Ours' in method:
+            ax.fill(angles, values, color=colors[i], alpha=0.15)
         
     # Legend outside
-    plt.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
+    plt.legend(loc='upper right', bbox_to_anchor=(1.45, 1.1), title="Configurations", title_fontsize='11')
     
     plt.tight_layout()
     
