@@ -161,6 +161,7 @@ def main():
     all_common_mode = []
     all_en_norm_before, all_en_norm_after = [], []
     all_vi_norm_before, all_vi_norm_after = [], []
+    all_example_ids = []
     skipped = 0
     for d in example_dirs:
         try:
@@ -179,6 +180,7 @@ def main():
         all_before.extend(before_vals.tolist())
         all_after.extend(after_vals.tolist())
         per_example_n.append(len(before_vals))
+        all_example_ids.extend([os.path.basename(d.rstrip('/'))] * len(before_vals))
 
         cos_before = ot_weighted_cosine_sim(hb, gamma, en_ans_rows, num_en_total)
         cos_after = ot_weighted_cosine_sim(ha, gamma, en_ans_rows, num_en_total)
@@ -216,6 +218,17 @@ def main():
           f"std={diffs.std():.4f}")
     n_closer = int((diffs < 0).sum())
     print(f"Tokens that got closer: {n_closer}/{n} ({100 * n_closer / n:.1f}%)")
+
+    # Flag the largest-magnitude outliers by example name, so they're easy to
+    # go back and inspect (e.g. unusually long answer span, degenerate gamma).
+    example_ids_arr = np.array(all_example_ids)
+    top_k = min(3, n)
+    outlier_idx = np.argsort(-np.abs(diffs))[:top_k]
+    print(f"Largest |after-before| distance outliers (check these examples "
+          f"if reviewers ask about spread):")
+    for i in outlier_idx:
+        print(f"  {example_ids_arr[i]}: before={all_before[i]:.4f}, "
+              f"after={all_after[i]:.4f}, diff={diffs[i]:+.4f}")
 
     # Statistical significance (paired, since before/after share the same token)
     try:
@@ -364,10 +377,13 @@ def main():
     # Save raw values for further analysis / re-plotting
     csv_path = f"{args.output_prefix}.csv"
     with open(csv_path, 'w') as f:
-        f.write("dist_before,dist_after,dist_diff,cos_before,cos_after,common_mode_shift_cosine\n")
-        for b, a, cb, ca, cm in zip(all_before, all_after, all_cos_before,
-                                     all_cos_after, all_common_mode):
-            f.write(f"{b},{a},{a - b},{cb},{ca},{cm}\n")
+        f.write("example,dist_before,dist_after,cos_before,cos_after,common_mode_shift_cosine,"
+                 "en_norm_before,en_norm_after,vi_norm_before,vi_norm_after\n")
+        for ex, b, a, cb, ca, cm, enb, ena, vib, via in zip(
+                all_example_ids, all_before, all_after, all_cos_before, all_cos_after,
+                all_common_mode, en_norm_before, en_norm_after,
+                vi_norm_before, vi_norm_after):
+            f.write(f"{ex},{b},{a},{cb},{ca},{cm},{enb},{ena},{vib},{via}\n")
     print(f"Saved raw per-token values to {csv_path}")
 
 
