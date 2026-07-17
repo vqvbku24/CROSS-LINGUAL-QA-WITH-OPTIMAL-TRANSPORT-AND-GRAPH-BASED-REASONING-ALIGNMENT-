@@ -15,6 +15,17 @@ Usage:
         --output_dir paper_tools/export \
         --sample_index 0 \
         --alpha 0.5
+
+For a Stage 2 (LoRA) checkpoint, you must also point at the Stage 1 base
+backbone it was fine-tuned from — otherwise the backbone silently loads with
+random weights and every downstream number is meaningless:
+    python paper_tools/exporter.py \
+        --checkpoint checkpoint_stage2/stage2_epoch_003.pt \
+        --stage1_checkpoint checkpoints/stage1_squad_best.pt \
+        --dataset    dataset/xquad.vi.json \
+        --output_dir paper_tools/export \
+        --sample_index 0 \
+        --alpha 0.5
 """
 
 import os
@@ -63,6 +74,12 @@ def parse_args():
     parser.add_argument("--stage",         type=str, default="auto",
                         choices=["1", "2", "auto"],
                         help="Checkpoint stage. 'auto' = has LoRA if 'config' key present")
+    parser.add_argument("--stage1_checkpoint", type=str, default=None,
+                        help="Explicit path to the Stage 1 (full backbone) checkpoint. "
+                             "Overrides config['stage1_ckpt'] from the Stage 2 checkpoint, "
+                             "which is often a stale/relative path from a different machine. "
+                             "Required (one way or another) whenever the checkpoint is Stage 2 — "
+                             "without it the backbone silently falls back to random init.")
     return parser.parse_args()
 
 
@@ -160,16 +177,30 @@ def main():
     if is_stage2:
         # Stage 2: load Stage 1 weights first (full backbone), THEN apply LoRA,
         # THEN load Stage 2 delta (LoRA + layer_weights only).
-        stage1_path = config.get("stage1_ckpt", "")
+        # Prefer an explicit CLI override — config['stage1_ckpt'] is often a path
+        # baked in at training time on a different machine, so it silently fails
+        # to resolve here and previously just fell back to a random backbone.
+        stage1_path = args.stage1_checkpoint or config.get("stage1_ckpt", "")
         if stage1_path and not os.path.isabs(stage1_path):
             stage1_path = os.path.join(str(Path(__file__).parent.parent), stage1_path)
+
         if stage1_path and os.path.exists(stage1_path):
             print(f"Loading Stage 1 base weights from {stage1_path}")
             s1 = torch.load(stage1_path, map_location=device)
             model.load_state_dict(s1["model_state"], strict=True)
             criterion.load_state_dict(s1["criterion_state"])
         else:
-            print("[warn] Stage 1 checkpoint not found — backbone uses random weights")
+            # This used to be a soft [warn] that let the run continue on a
+            # randomly-initialized backbone — every downstream number (gamma,
+            # hidden states, alignment metrics) would then be meaningless.
+            # Fail loudly instead.
+            raise FileNotFoundError(
+                f"Stage 2 checkpoint requires a Stage 1 base backbone, but none was "
+                f"found. config['stage1_ckpt']={config.get('stage1_ckpt', '<missing>')!r} "
+                f"did not resolve to an existing file, and --stage1_checkpoint was not "
+                f"passed. Pass it explicitly, e.g.:\n"
+                f"  --stage1_checkpoint checkpoints/stage1_squad_best.pt"
+            )
 
         print("Applying LoRA...")
         model.apply_lora()

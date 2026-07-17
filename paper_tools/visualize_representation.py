@@ -43,6 +43,10 @@ def main():
     parser = argparse.ArgumentParser(description="Plot Figure 5: Representation UMAP/t-SNE and OT Heatmap")
     parser.add_argument("--data_dir", type=str, default=".", help="Directory containing npy files")
     parser.add_argument("--output_pdf", type=str, default="figure5.pdf", help="Path to save output PDF")
+    parser.add_argument("--center", dest="center", action="store_true", default=True,
+                         help="Mean-center EN and VI to remove language bias (default: on)")
+    parser.add_argument("--no-center", dest="center", action="store_false",
+                         help="Disable mean-centering (shows raw language gap)")
     args = parser.parse_args()
 
     # Determine data directory
@@ -78,6 +82,54 @@ def main():
         langs = np.array(['EN'] * N_en + ['VI'] * N_vi)
         labels = np.array(['normal'] * N)
         
+    # Optional: Mean Center to remove Language Bias
+    if args.center:
+        print("Applying mean-centering to remove XLM-R language gap...")
+        en_idx = (langs == 'EN')
+        vi_idx = (langs == 'VI')
+        
+        # Calculate centroids from the 'before' state to be a fixed reference
+        en_centroid = hidden_before[en_idx].mean(axis=0)
+        vi_centroid = hidden_before[vi_idx].mean(axis=0)
+        
+        # Shift everything to origin
+        hidden_before[en_idx] -= en_centroid
+        hidden_before[vi_idx] -= vi_centroid
+        
+        hidden_after[en_idx] -= en_centroid
+        hidden_after[vi_idx] -= vi_centroid
+
+    # ── Quantitative alignment metric (gamma-weighted EN-VI answer distance) ──
+    # This is a much more reliable signal than eyeballing the UMAP/t-SNE plot,
+    # since those methods distort absolute distances. Compute it in the ORIGINAL
+    # (centered) space, restricted to the answer-token rows, weighted by the OT plan.
+    en_ans_mask_full = (langs == 'EN') & (labels == 'answer')
+    vi_ans_mask_full = (langs == 'VI') & (labels == 'answer')
+    num_en_total = int(np.sum(langs == 'EN'))
+
+    if np.any(en_ans_mask_full) and np.any(vi_ans_mask_full):
+        en_ans_rows = np.where(en_ans_mask_full)[0]
+        vi_ans_rows = np.where(vi_ans_mask_full)[0] - num_en_total  # index into gamma's VI axis
+
+        def gamma_weighted_distance(hidden):
+            en_vecs = hidden[en_ans_rows]
+            vi_vecs = hidden[num_en_total:][vi_ans_rows]
+            sub_gamma = gamma[np.ix_(en_ans_rows, vi_ans_rows)]
+            w = sub_gamma / (sub_gamma.sum() + 1e-12)
+            diffs = en_vecs[:, None, :] - vi_vecs[None, :, :]
+            dists = np.linalg.norm(diffs, axis=-1)
+            return float((dists * w).sum())
+
+        dist_before = gamma_weighted_distance(hidden_before)
+        dist_after = gamma_weighted_distance(hidden_after)
+        print(f"[metric] Gamma-weighted EN-VI answer-token distance — "
+              f"before: {dist_before:.4f}, after: {dist_after:.4f} "
+              f"({'closer' if dist_after < dist_before else 'farther'} by "
+              f"{abs(dist_before - dist_after):.4f})")
+    else:
+        en_ans_rows = vi_ans_rows = np.array([], dtype=int)
+        print("[warn] No answer-labeled rows found, skipping alignment metric.")
+
     # Fit projection using a SINGLE shared basis for both before and after
     print("Projecting embeddings (shared basis)...")
     if HAS_UMAP:
@@ -108,7 +160,27 @@ def main():
     idx_ans = labels == 'answer'
     if np.any(idx_ans):
         ax1.scatter(proj_before[idx_ans, 0], proj_before[idx_ans, 1], marker='*', color='red', s=100, label='Answer', edgecolors='black')
-        
+
+    # Draw thin lines connecting the top-weighted EN-VI answer-token correspondences
+    # (per the OT plan). This is the visual evidence of alignment that a global
+    # UMAP/t-SNE view can hide when the semantic shift is small relative to spread.
+    def draw_correspondences(ax, proj):
+        if en_ans_rows.size == 0 or vi_ans_rows.size == 0:
+            return
+        sub_gamma = gamma[np.ix_(en_ans_rows, vi_ans_rows)]
+        top_vi_per_en = sub_gamma.argmax(axis=1)
+        max_w = sub_gamma.max()
+        for i, en_row in enumerate(en_ans_rows):
+            vi_row_local = top_vi_per_en[i]
+            vi_row_global = num_en_total + vi_ans_rows[vi_row_local]
+            w = sub_gamma[i, vi_row_local]
+            ax.plot([proj[en_row, 0], proj[vi_row_global, 0]],
+                    [proj[en_row, 1], proj[vi_row_global, 1]],
+                    color='red', linewidth=0.8, alpha=0.3 + 0.5 * (w / (max_w + 1e-12)),
+                    zorder=1)
+
+    draw_correspondences(ax1, proj_before)
+
     ax1.set_title('(a) Before Alignment')
     ax1.axis('equal')
     ax1.grid(False)
@@ -135,10 +207,6 @@ def main():
         en_start, en_end = en_ans_idx.min(), en_ans_idx.max()
         vi_start, vi_end = vi_ans_idx.min(), vi_ans_idx.max()
         
-        # Calculate mass inside the box
-        mass = gamma[en_start:en_end+1, vi_start:vi_end+1].sum()
-        print(f"OT Plan: True answer box mass = {mass:.4f}")
-        
         # matplotlib Rectangle: (x, y) = (col, row), width, height
         rect = patches.Rectangle((vi_start - 0.5, en_start - 0.5), vi_end - vi_start + 1, en_end - en_start + 1, 
                                  linewidth=2, edgecolor='red', facecolor='none')
@@ -155,7 +223,9 @@ def main():
         
     if np.any(idx_ans):
         ax3.scatter(proj_after[idx_ans, 0], proj_after[idx_ans, 1], marker='*', color='red', s=100, edgecolors='black')
-        
+
+    draw_correspondences(ax3, proj_after)
+
     ax3.set_title('(c) After Alignment')
     ax3.axis('equal')
     ax3.grid(False)
@@ -187,4 +257,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

@@ -62,7 +62,7 @@ STAGE2_CONFIG = {
     "lambda_span"     : 1.0,    # Span Loss
     "lambda_margin"   : 1.0,    # Margin Loss (Decision boundary)
     "anneal_margin"   : False,  # Dynamic margin schedule
-    "lambda_qa"       : 0.3,    # Supervised EN QA loss weight
+    "lambda_qa"       : 1.0,    # Supervised EN QA loss weight (1.0 to dominate over margin early on)
 
     # OT hyperparameters
     "epsilon"         : 0.03,   # Restored to paper default (0.05 hurts XSQuAD per ablation)
@@ -544,10 +544,15 @@ def run_stage2(config: dict):
     global_step    = 0
 
     # Margin scheduling state
-    margin_schedule = [1.0, 0.7]
+    # Epoch 1: margin=0.0 (LoRA warmup — stabilize EN QA before adding VI pressure)
+    # Epoch 2: margin=1.0 (introduce boundary pressure once EN is stable)
+    # Epoch 3+: patience-based annealing 1.0 → 0.5 → 0.3
+    margin_schedule = [0.0, 1.0, 0.5, 0.3]
     current_margin_idx = 0
     best_vi_f1 = 0.0
     margin_patience_count = 0
+    # margin_warmup_epochs: number of fixed-schedule epochs before patience kicks in
+    margin_warmup_epochs = config.get("margin_warmup_epochs", 2)
 
     # ── Resume Logic ─────────────────────────────────────────────
     if config.get("resume_from"):
@@ -748,7 +753,18 @@ def run_stage2(config: dict):
 
             # Validation-driven margin scheduling
             if config.get("anneal_margin"):
-                if epoch >= 1:
+                if epoch < margin_warmup_epochs:
+                    # Epoch-based warmup: fixed margin per epoch
+                    # epoch=1 → idx=0 (margin=0.0), epoch=2 → idx=1 (margin=1.0)
+                    next_idx = min(epoch - 1, len(margin_schedule) - 1)
+                    if next_idx != current_margin_idx:
+                        current_margin_idx = next_idx
+                        log.info(f"  [Margin Schedule] 📈 Warmup step → margin={margin_schedule[current_margin_idx]:.1f} (epoch {epoch+1})")
+                    # Reset patience baseline at end of warmup so patience starts fresh
+                    best_vi_f1 = vi_f1
+                    margin_patience_count = 0
+                else:
+                    # Patience-based annealing from epoch margin_warmup_epochs+1 onwards
                     min_delta_f1 = 0.1
                     if vi_f1 > best_vi_f1 + min_delta_f1:
                         best_vi_f1 = vi_f1
@@ -759,7 +775,7 @@ def run_stage2(config: dict):
                         if margin_patience_count >= 1:
                             if current_margin_idx < len(margin_schedule) - 1:
                                 current_margin_idx += 1
-                                log.info(f"  [Margin Schedule] 📉 Stepping down margin to {margin_schedule[current_margin_idx]}")
+                                log.info(f"  [Margin Schedule] 📉 Stepping down margin to {margin_schedule[current_margin_idx]:.1f}")
                             margin_patience_count = 0
 
             # EN EM regression check (200 SQuAD samples)

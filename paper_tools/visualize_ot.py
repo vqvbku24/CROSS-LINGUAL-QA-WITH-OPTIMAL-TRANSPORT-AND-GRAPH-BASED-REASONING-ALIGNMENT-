@@ -67,13 +67,25 @@ def main():
     # Ticks
     if vi_tokens is not None and len(vi_tokens) == gamma.shape[1]:
         ax.set_xticks(np.arange(len(vi_tokens)))
-        ax.set_xticklabels(vi_tokens, rotation=45, ha='right')
+        ax.set_xticklabels(vi_tokens, rotation=90, ha='center', fontsize=6)
+        # If there are too many tokens, hide some to prevent overlap
+        if len(vi_tokens) > 30:
+            step = len(vi_tokens) // 30 + 1
+            for i, label in enumerate(ax.xaxis.get_ticklabels()):
+                if i % step != 0:
+                    label.set_visible(False)
     else:
         ax.set_xlabel('Vietnamese tokens')
         
     if en_tokens is not None and len(en_tokens) == gamma.shape[0]:
         ax.set_yticks(np.arange(len(en_tokens)))
-        ax.set_yticklabels(en_tokens)
+        ax.set_yticklabels(en_tokens, fontsize=6)
+        # If there are too many tokens, hide some to prevent overlap
+        if len(en_tokens) > 30:
+            step = len(en_tokens) // 30 + 1
+            for i, label in enumerate(ax.yaxis.get_ticklabels()):
+                if i % step != 0:
+                    label.set_visible(False)
     else:
         ax.set_ylabel('English tokens')
         
