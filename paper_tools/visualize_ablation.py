@@ -16,11 +16,11 @@ def generate_ablation_data():
             'M5: Ours (Dynamic)'
         ],
         # Điểm F1 tương ứng từ bảng LaTeX
-        'SQuAD_EN': [72.84, 73.93, 72.75, 73.09, 73.90, 73.27],
-        'MLQA_VI': [67.21, 64.42, 56.06, 65.33, 67.41, 68.10],
+        'SQuAD_EN': [64.26, 65.65, 66.08, 64.58, 65.64, 64.84],
+        'MLQA_VI': [46.05, 41.34, 36.08, 44.35, 45.41, 46],
         
         # TODO: Nhập điểm F1 của XQuAD_VI tương ứng với các cấu hình M0 -> M5 vào list dưới đây
-        'XQuAD_VI': [63.64, 69.31 , 57.63 , 70.11, 71.24 , 71.22] 
+        'XQuAD_VI': [46.22, 45.55 , 38.66 , 46.62 , 51.26 , 51.26] 
     }
     df = pd.DataFrame(data)
     # Lưu file với chuẩn UTF-8 để tránh lỗi font
@@ -93,9 +93,9 @@ def plot_figure4():
     plt.tight_layout()
     
     # Save
-    plt.savefig('figure4.pdf', format='pdf', bbox_inches='tight')
-    plt.savefig('figure4.svg', format='svg', bbox_inches='tight')
-    plt.savefig('figure4.png', format='png', dpi=600, bbox_inches='tight')
+    plt.savefig('figure4_EM.pdf', format='pdf', bbox_inches='tight')
+    plt.savefig('figure4_EM.svg', format='svg', bbox_inches='tight')
+    plt.savefig('figure4_EM.png', format='png', dpi=600, bbox_inches='tight')
     plt.close()
 
 if __name__ == '__main__':

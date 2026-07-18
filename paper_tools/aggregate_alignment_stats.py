@@ -157,10 +157,13 @@ def main():
     print(f"Found {len(example_dirs)} example directories.")
 
     all_before, all_after, per_example_n = [], [], []
+    all_tok_before, all_tok_after = [], []
     all_cos_before, all_cos_after = [], []
     all_common_mode = []
     all_en_norm_before, all_en_norm_after = [], []
     all_vi_norm_before, all_vi_norm_after = [], []
+    all_tok_en_norm_before, all_tok_en_norm_after = [], []
+    all_tok_vi_norm_before, all_tok_vi_norm_after = [], []
     all_example_ids = []
     skipped = 0
     for d in example_dirs:
@@ -179,6 +182,13 @@ def main():
         after_vals = ot_weighted_distance(ha, gamma, en_ans_rows, num_en_total)
         all_before.extend(before_vals.tolist())
         all_after.extend(after_vals.tolist())
+        
+        all_tok_rows = np.arange(num_en_total)
+        at_before_vals = ot_weighted_distance(hb, gamma, all_tok_rows, num_en_total)
+        at_after_vals = ot_weighted_distance(ha, gamma, all_tok_rows, num_en_total)
+        all_tok_before.extend(at_before_vals.tolist())
+        all_tok_after.extend(at_after_vals.tolist())
+
         per_example_n.append(len(before_vals))
         all_example_ids.extend([os.path.basename(d.rstrip('/'))] * len(before_vals))
 
@@ -196,6 +206,13 @@ def main():
         all_en_norm_after.extend(en_norm_a.tolist())
         all_vi_norm_before.extend(vi_norm_b.tolist())
         all_vi_norm_after.extend(vi_norm_a.tolist())
+
+        at_en_norm_b, at_vi_norm_b = norm_stats(hb, gamma, all_tok_rows, num_en_total)
+        at_en_norm_a, at_vi_norm_a = norm_stats(ha, gamma, all_tok_rows, num_en_total)
+        all_tok_en_norm_before.extend(at_en_norm_b.tolist())
+        all_tok_en_norm_after.extend(at_en_norm_a.tolist())
+        all_tok_vi_norm_before.extend(at_vi_norm_b.tolist())
+        all_tok_vi_norm_after.extend(at_vi_norm_a.tolist())
 
     if skipped:
         print(f"[warn] Skipped {skipped}/{len(example_dirs)} examples "
@@ -292,8 +309,14 @@ def main():
     en_norm_after = np.array(all_en_norm_after)
     vi_norm_before = np.array(all_vi_norm_before)
     vi_norm_after = np.array(all_vi_norm_after)
+    
+    at_en_norm_before = np.array(all_tok_en_norm_before)
+    at_en_norm_after = np.array(all_tok_en_norm_after)
+    at_vi_norm_before = np.array(all_tok_vi_norm_before)
+    at_vi_norm_after = np.array(all_tok_vi_norm_after)
 
     print(f"\n=== Vector norm (magnitude) check ===")
+    print(f"--- [Answer Tokens Only (n={len(en_norm_before)})] ---")
     print(f"EN answer-token norm:        before={en_norm_before.mean():.4f}, "
           f"after={en_norm_after.mean():.4f} "
           f"({'+' if en_norm_after.mean() > en_norm_before.mean() else ''}"
@@ -302,6 +325,28 @@ def main():
           f"after={vi_norm_after.mean():.4f} "
           f"({'+' if vi_norm_after.mean() > vi_norm_before.mean() else ''}"
           f"{vi_norm_after.mean() - vi_norm_before.mean():.4f})")
+
+    en_norm_diff = en_norm_after - en_norm_before
+    vi_norm_diff = vi_norm_after - vi_norm_before
+    print(f"Δnorm stats:")
+    print(f"EN Δnorm: mean={en_norm_diff.mean():.4f}, std={en_norm_diff.std():.4f}")
+    print(f"VI Δnorm: mean={vi_norm_diff.mean():.4f}, std={vi_norm_diff.std():.4f}")
+
+    print(f"\n--- [All Valid Tokens (n={len(at_en_norm_before)})] ---")
+    print(f"EN all-token norm:           before={at_en_norm_before.mean():.4f}, "
+          f"after={at_en_norm_after.mean():.4f} "
+          f"({'+' if at_en_norm_after.mean() > at_en_norm_before.mean() else ''}"
+          f"{at_en_norm_after.mean() - at_en_norm_before.mean():.4f})")
+    print(f"VI OT-weighted centroid norm: before={at_vi_norm_before.mean():.4f}, "
+          f"after={at_vi_norm_after.mean():.4f} "
+          f"({'+' if at_vi_norm_after.mean() > at_vi_norm_before.mean() else ''}"
+          f"{at_vi_norm_after.mean() - at_vi_norm_before.mean():.4f})")
+
+    at_en_norm_diff = at_en_norm_after - at_en_norm_before
+    at_vi_norm_diff = at_vi_norm_after - at_vi_norm_before
+    print(f"Δnorm stats:")
+    print(f"EN Δnorm: mean={at_en_norm_diff.mean():.4f}, std={at_en_norm_diff.std():.4f}")
+    print(f"VI Δnorm: mean={at_vi_norm_diff.mean():.4f}, std={at_vi_norm_diff.std():.4f}")
     try:
         from scipy import stats
         if n >= 2:
