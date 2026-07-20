@@ -63,6 +63,9 @@ STAGE2_CONFIG = {
     "lambda_margin"   : 1.0,    # Margin Loss (Decision boundary)
     "anneal_margin"   : False,  # Dynamic margin schedule
     "lambda_qa"       : 1.0,    # Supervised EN QA loss weight (1.0 to dominate over margin early on)
+    # Vanilla KD (additive, default OFF — set lambda_kd>0 only for M1 runs)
+    "lambda_kd"       : 0.0,    # Naive index-to-index KL distillation weight (0 = disabled)
+    "kd_temperature"  : 2.0,    # KD temperature (Hinton et al. standard)
 
     # OT hyperparameters
     "epsilon"         : 0.03,   # Restored to paper default (0.05 hurts XSQuAD per ablation)
@@ -205,6 +208,8 @@ def stage2_step(
     n_iters: int,
     epoch: int,
     device: torch.device,
+    lambda_kd: float = 0.0,
+    kd_temperature: float = 2.0,
 ) -> dict:
     """
     One Stage 2 training step with THREE forward passes (per paper):
@@ -352,8 +357,33 @@ def stage2_step(
         device,
     )
 
+    # ── 6c. Vanilla KD loss (additive, only when lambda_kd > 0) ─────────────
+    L_kd = torch.tensor(0.0, device=device)
+    kd_valid_ratio = 1.0
+    if lambda_kd > 0.0:
+        from losses.vanilla_kd_loss import naive_index_to_index_kd_loss
+        en_valid_len = en_mask.sum(dim=1)  # [B] real token count EN
+        vi_valid_len = vi_mask.sum(dim=1)  # [B] real token count VI
+        L_kd, kd_valid_mask = naive_index_to_index_kd_loss(
+            student_start_logits=vi_start_logits,
+            student_end_logits=vi_end_logits,
+            teacher_start_logits=en_start_logits,
+            teacher_end_logits=en_end_logits,
+            student_valid_len=vi_valid_len,
+            teacher_valid_len=en_valid_len,
+            student_gold_start=en_start,   # use EN gold as proxy (zero-shot: no VI labels)
+            student_gold_end=en_end,
+            temperature=kd_temperature,
+        )
+        kd_valid_ratio = kd_valid_mask.float().mean().item()
+
     # ── 7. Combine losses ────────────────────────────────────────
     losses = stage2_loss(L_ot, L_reg, L_span, L_margin, L_qa, L_has_ans, epoch)
+    # Add KD term additively (no-op when lambda_kd=0.0)
+    losses["kd"] = L_kd
+    losses["kd_valid_ratio"] = kd_valid_ratio
+    if lambda_kd > 0.0:
+        losses["total"] = losses["total"] + lambda_kd * L_kd
 
     # ── 8. Debug metrics ─────────────────────────────────────────
     with torch.no_grad():
@@ -645,6 +675,8 @@ def run_stage2(config: dict):
                 n_iters=config["sinkhorn_iters"],
                 epoch=epoch,
                 device=device,
+                lambda_kd=config.get("lambda_kd", 0.0),
+                kd_temperature=config.get("kd_temperature", 2.0),
             )
 
             losses["total"].backward()
@@ -917,6 +949,11 @@ def parse_args() -> dict:
     parser.add_argument("--epsilon",        type=float, default=STAGE2_CONFIG["epsilon"])
     parser.add_argument("--epsilon_end",    type=float, default=STAGE2_CONFIG["epsilon_end"])
     parser.add_argument("--sinkhorn_iters", type=int,   default=STAGE2_CONFIG["sinkhorn_iters"])
+    # Vanilla KD (additive, default OFF)
+    parser.add_argument("--lambda_kd",      type=float, default=STAGE2_CONFIG["lambda_kd"],
+                        help="Naive index-to-index KD loss weight (0.0=disabled, use 1.0 for M1)")
+    parser.add_argument("--kd_temperature", type=float, default=STAGE2_CONFIG["kd_temperature"],
+                        help="KD temperature (default 2.0, Hinton et al.)")
     parser.add_argument("--patience",       type=int,   default=STAGE2_CONFIG["patience"])
     parser.add_argument("--max_length",     type=int,   default=STAGE2_CONFIG["max_length"])
     parser.add_argument("--output_dir",     default=STAGE2_CONFIG["output_dir"])
