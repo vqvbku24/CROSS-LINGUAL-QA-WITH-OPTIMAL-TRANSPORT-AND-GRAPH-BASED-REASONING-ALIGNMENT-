@@ -59,7 +59,7 @@ def normalize_answer(s, lang):
         elif lang == 'de':
             return re.sub(r'\b(ein|eine|einen|einem|eines|einer|der|die|das|den|dem|des)\b', ' ', text)
         elif lang == 'ar':
-            return re.sub('\sال^|ال', ' ', text)
+            return re.sub(r'\sال^|ال', ' ', text)
         elif lang == 'zh':
             return text # Chinese does not have formal articles
         else:

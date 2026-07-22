@@ -105,12 +105,11 @@ def forward_backward_pass(variant, model, teacher_model, batch):
         en_mask = ~hf_batch["attention_mask"].bool()
         
         # OT (Sinkhorn)
-        # sinkhorn_masked returns gamma_list, C_list
-        gamma_list, C_list = sinkhorn_masked(
+        # sinkhorn_masked returns gamma_list, swd_loss
+        gamma_list, swd_loss = sinkhorn_masked(
             teacher_hidden, student_hidden, en_mask, en_mask, epsilon=0.03, n_iters=100
         )
-        # Compute L_ot as sum of transport costs
-        loss_ot = torch.stack([(g.detach() * c).sum() for g, c in zip(gamma_list, C_list)]).mean() if gamma_list else torch.tensor(0.0, device=model.device, requires_grad=True)
+        loss_ot = swd_loss
         
         # Span Loss
         loss_span = compute_span_loss(
@@ -126,11 +125,14 @@ def forward_backward_pass(variant, model, teacher_model, batch):
         # Margin Loss
         en_start = hf_batch["start_positions"]
         en_end = hf_batch["end_positions"]
+        answerable_mask = torch.ones_like(en_start, dtype=torch.bool, device=model.device)
         loss_margin = compute_pure_margin_loss(
             en_start, en_end,
             student_outputs.start_logits, student_outputs.end_logits,
             teacher_outputs.start_logits, teacher_outputs.end_logits,
-            en_mask, en_mask
+            en_mask, en_mask,
+            answerable_mask,
+            model.device
         )
         
         loss_total = loss_qa + loss_ot + loss_span + loss_reg + loss_margin

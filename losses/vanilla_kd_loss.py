@@ -52,11 +52,19 @@ def naive_index_to_index_kd_loss(
         return torch.tensor(0.0, device=device, requires_grad=True), valid_mask
 
     def crop_and_mask(logits, lens, L):
-        """Crop to L, mask out positions >= per-example valid len with -inf."""
+        """Crop to L, mask out positions >= per-example valid len with a large
+        negative constant (-1e9) instead of -inf.
+        Using -inf causes softmax to return nan when ALL positions in a row are -inf
+        (0/0 = nan). -1e9 is large enough to zero out softmax probabilities while
+        remaining numerically stable.
+        """
         cropped = logits[:, :L].clone()
+        # Replace any pre-existing -inf values (e.g. from QA head question masking)
+        # with -1e9 to avoid nan in softmax
+        cropped = torch.nan_to_num(cropped, nan=0.0, posinf=1e9, neginf=-1e9)
         arange = torch.arange(L, device=device).unsqueeze(0)  # [1, L]
         pad_mask = arange >= lens.unsqueeze(1)                 # [B, L]
-        cropped = cropped.masked_fill(pad_mask, float("-inf"))
+        cropped = cropped.masked_fill(pad_mask, -1e9)
         return cropped
 
     s_start = crop_and_mask(student_start_logits, min_len, max_crop_len)
@@ -68,6 +76,9 @@ def naive_index_to_index_kd_loss(
         s_logits, t_logits = s_logits[mask], t_logits[mask]
         log_p_student = F.log_softmax(s_logits / temperature, dim=-1)
         p_teacher     = F.softmax(t_logits / temperature, dim=-1)
+        # Safety: if NaN survives (e.g. all-zero rows after masking), zero out
+        log_p_student = torch.nan_to_num(log_p_student, nan=0.0, neginf=-1e9)
+        p_teacher     = torch.nan_to_num(p_teacher, nan=0.0)
         # batchmean + T^2 scaling: standard Hinton et al. KD
         return F.kl_div(log_p_student, p_teacher, reduction="batchmean") * (temperature ** 2)
 

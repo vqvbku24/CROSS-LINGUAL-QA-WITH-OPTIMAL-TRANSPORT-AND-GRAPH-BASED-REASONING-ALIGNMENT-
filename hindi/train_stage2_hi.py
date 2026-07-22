@@ -1,30 +1,30 @@
-# arabic/train_stage2_ar.py
+# hindi/train_stage2_hi.py
 """
-Stage 2 Training Loop — Arabic Branch.
+Stage 2 Training Loop — Hindi Branch.
 
-Identical in structure to ../train_stage2.py (VI) but adapted for Arabic:
-  - Uses ZIZOUArabic_Squad parallel data (EN-AR)
-  - Uses XQuAD-ar for val evaluation
-  - Uses 'ar_*' batch keys throughout
+Identical in structure to ../arabic/train_stage2_ar.py but adapted for Hindi:
+  - Uses IndicSQuAD parallel data (EN-HI): dataset/IndicSQuAD/train_hindi.json
+  - Uses XQuAD-hi for val evaluation: dataset/xquad.hi.json
+  - Uses 'hi_*' batch keys throughout
   - Has lambda_kd / kd_temperature natively (M1 Vanilla KD is built-in)
-  - Output dir: checkpoint_stage2_ar/
-  - TensorBoard: tensorboard_stage2_ar
+  - Output dir: checkpoint_stage2_hi/
+  - TensorBoard: tensorboard_stage2_hi
 
-Invariants (same as VI branch):
+Invariants (same as VI/AR branch):
   - EN backbone: always frozen (no_grad) throughout Stage 2
-  - AR ground-truth labels: NEVER used (strict zero-shot)
+  - HI ground-truth labels: NEVER used (strict zero-shot)
   - Stage 1 checkpoint: loaded read-only; never overwritten
 
 Usage:
     # M5: Ours (full coordinated, dynamic margin)
-    python arabic/train_stage2_ar.py --stage1_ckpt checkpoints/stage1_squad_best.pt --anneal_margin
+    python hindi/train_stage2_hi.py --stage1_ckpt checkpoints/stage1_squad_best.pt --anneal_margin
 
     # M2: OT only (ablation)
-    python arabic/train_stage2_ar.py --stage1_ckpt checkpoints/stage1_squad_best.pt \\
+    python hindi/train_stage2_hi.py --stage1_ckpt checkpoints/stage1_squad_best.pt \\
         --lambda_span 0.0 --lambda_margin 0.0 --lambda_kd 0.0
 
     # M1: Vanilla KD
-    python arabic/train_stage2_ar.py --stage1_ckpt checkpoints/stage1_squad_best.pt \\
+    python hindi/train_stage2_hi.py --stage1_ckpt checkpoints/stage1_squad_best.pt \\
         --lambda_ot 0.0 --lambda_span 0.0 --lambda_margin 0.0 --lambda_kd 1.0
 """
 
@@ -35,8 +35,8 @@ import argparse
 import logging
 
 # Add parent project root to path (so we can import phase2_model, phase3_loss, etc.)
-_ARABIC_DIR = os.path.dirname(os.path.abspath(__file__))
-_ROOT_DIR   = os.path.dirname(_ARABIC_DIR)
+_HINDI_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT_DIR  = os.path.dirname(_HINDI_DIR)
 sys.path.insert(0, _ROOT_DIR)
 
 try:
@@ -63,10 +63,10 @@ log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────
-# Default Config (AR-specific)
+# Default Config (HI-specific)
 # ──────────────────────────────────────────────────────────────
 
-STAGE2_AR_CONFIG = {
+STAGE2_HI_CONFIG = {
     'stage1_ckpt'    : 'checkpoints/stage1_squad_best.pt',
     'model_name'     : 'xlm-roberta-base',
 
@@ -77,7 +77,7 @@ STAGE2_AR_CONFIG = {
     'lambda_margin'  : 1.0,
     'anneal_margin'  : False,
     'lambda_qa'      : 1.0,
-    # Vanilla KD — native to AR branch (M1 uses lambda_kd=1.0)
+    # Vanilla KD — native to HI branch (M1 uses lambda_kd=1.0)
     'lambda_kd'      : 0.0,
     'kd_temperature' : 2.0,
 
@@ -106,16 +106,16 @@ STAGE2_AR_CONFIG = {
     'log_every'      : 50,
     'save_every'     : 1,
 
-    # Paths (AR-specific output dir)
+    # Paths (HI-specific output dir)
     'root_dir'       : _ROOT_DIR,
-    'output_dir'     : os.path.join(_ROOT_DIR, 'checkpoint_stage2_ar'),
+    'output_dir'     : os.path.join(_ROOT_DIR, 'checkpoint_stage2_hi'),
     'hf_repo_id'     : '',
     'seed'           : 42,
 }
 
 
 # ──────────────────────────────────────────────────────────────
-# Checkpoint helpers (same logic as VI, but saves to _ar dir)
+# Checkpoint helpers
 # ──────────────────────────────────────────────────────────────
 
 def load_stage1_checkpoint(ckpt_path, model, criterion, device):
@@ -132,7 +132,7 @@ def load_stage1_checkpoint(ckpt_path, model, criterion, device):
     return en_em_baseline
 
 
-def save_stage2_checkpoint(path, epoch, global_step, model, criterion, optimizer, scheduler, config, ar_em, best_ar_em, patience_count):
+def save_stage2_checkpoint(path, epoch, global_step, model, criterion, optimizer, scheduler, config, hi_em, best_hi_em, patience_count):
     base_model = get_model(model)
     trainable_keys = {n for n, p in base_model.named_parameters() if p.requires_grad}
     trainable_state_dict = {k: v for k, v in base_model.state_dict().items() if k in trainable_keys}
@@ -144,8 +144,8 @@ def save_stage2_checkpoint(path, epoch, global_step, model, criterion, optimizer
         'optimizer_state': optimizer.state_dict(),
         'scheduler_state': scheduler.state_dict() if scheduler else None,
         'config'         : config,
-        'ar_em'          : ar_em,
-        'best_ar_em'     : best_ar_em,
+        'hi_em'          : hi_em,
+        'best_hi_em'     : best_hi_em,
         'patience_count' : patience_count,
         'rng_state_cpu'  : torch.get_rng_state(),
         'rng_state_cuda' : torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
@@ -169,21 +169,21 @@ def compute_en_em_baseline(model, criterion, tokenizer, config, device):
 
 
 # ──────────────────────────────────────────────────────────────
-# AR training step (mirrors stage2_step but with ar_* batch keys)
+# HI training step (mirrors stage2_step_ar but with hi_* batch keys)
 # ──────────────────────────────────────────────────────────────
 
-def stage2_step_ar(batch, model, criterion, stage2_loss, epsilon, alpha, n_iters, epoch, device, lambda_kd=0.0, kd_temperature=2.0):
+def stage2_step_hi(batch, model, criterion, stage2_loss, epsilon, alpha, n_iters, epoch, device, lambda_kd=0.0, kd_temperature=2.0):
     """
-    One Stage 2 AR training step.
+    One Stage 2 HI training step.
 
     Three forward passes:
       1. EN branch — LoRA OFF, no_grad  → h_en_frz (frozen anchor)
       2. EN branch — LoRA ON, with_grad → h_en_lora (for L_Reg, L_qa)
-      3. AR branch — LoRA ON, with_grad → h_ar
+      3. HI branch — LoRA ON, with_grad → h_hi
 
     Batch keys expected: en_input_ids, en_attention_mask, en_start_position,
                          en_end_position, en_is_answerable, en_question_end,
-                         ar_input_ids, ar_attention_mask, ar_question_end
+                         hi_input_ids, hi_attention_mask, hi_question_end
     """
     from phase3_loss.losses import (
         sinkhorn_masked, compute_span_loss, compute_pure_margin_loss,
@@ -191,13 +191,12 @@ def stage2_step_ar(batch, model, criterion, stage2_loss, epsilon, alpha, n_iters
         qa_loss, compute_reg_loss,
     )
 
-    # Remap ar_* keys to vi_* for model forward (model expects vi_*)
-    # We pass a remapped batch so we don't touch model internals
+    # Remap hi_* keys to vi_* for model forward (model expects vi_*)
     batch_remapped = {
-        **{k: v for k, v in batch.items() if not k.startswith('ar_')},
-        'vi_input_ids':      batch['ar_input_ids'],
-        'vi_attention_mask': batch['ar_attention_mask'],
-        'vi_question_end':   batch['ar_question_end'],
+        **{k: v for k, v in batch.items() if not k.startswith('hi_')},
+        'vi_input_ids':      batch['hi_input_ids'],
+        'vi_attention_mask': batch['hi_attention_mask'],
+        'vi_question_end':   batch['hi_question_end'],
     }
 
     # ── 1. EN frozen pass ────────────────────────────────────
@@ -207,8 +206,8 @@ def stage2_step_ar(batch, model, criterion, stage2_loss, epsilon, alpha, n_iters
             h_en_frz   = en_frz_out['hidden']
             en_mask    = ~en_frz_out['en_pad_mask']
 
-            ar_frz_out = model(batch_remapped, branch='vi')
-            h_ar_frz   = ar_frz_out['hidden']
+            hi_frz_out = model(batch_remapped, branch='vi')
+            h_hi_frz   = hi_frz_out['hidden']
 
             en_q_emb, en_q_mask = _extract_question_embeddings(h_en_frz, batch_remapped['en_question_end'])
             en_start_logits, en_end_logits, _ = criterion.qa_head(h_en_frz, en_q_emb, en_q_mask)
@@ -220,17 +219,17 @@ def stage2_step_ar(batch, model, criterion, stage2_loss, epsilon, alpha, n_iters
     en_q_emb_lora, en_q_mask_lora = _extract_question_embeddings(h_en_lora, batch_remapped['en_question_end'])
     en_lora_start_logits, en_lora_end_logits, en_lora_has_ans = criterion.qa_head(h_en_lora, en_q_emb_lora, en_q_mask_lora)
 
-    # ── 3. AR branch ─────────────────────────────────────────
-    ar_out  = model(batch_remapped, branch='vi')
-    h_ar    = ar_out['hidden']
-    ar_mask = ~ar_out['vi_pad_mask']
+    # ── 3. HI branch ─────────────────────────────────────────
+    hi_out  = model(batch_remapped, branch='vi')
+    h_hi    = hi_out['hidden']
+    hi_mask = ~hi_out['vi_pad_mask']
 
-    ar_q_emb, ar_q_mask = _extract_question_embeddings(h_ar, batch_remapped['vi_question_end'])
-    ar_start_logits, ar_end_logits, _ = criterion.qa_head(h_ar, ar_q_emb, ar_q_mask)
+    hi_q_emb, hi_q_mask = _extract_question_embeddings(h_hi, batch_remapped['vi_question_end'])
+    hi_start_logits, hi_end_logits, _ = criterion.qa_head(h_hi, hi_q_emb, hi_q_mask)
 
     # ── 4. OT (EMA teacher-student) ──────────────────────────
-    gamma_teacher, _ = sinkhorn_masked(h_en_frz, h_ar_frz, en_mask, ar_mask, epsilon=epsilon, n_iters=n_iters)
-    gamma_student, _ = sinkhorn_masked(h_en_frz, h_ar,     en_mask, ar_mask, epsilon=epsilon, n_iters=n_iters)
+    gamma_teacher, _ = sinkhorn_masked(h_en_frz, h_hi_frz, en_mask, hi_mask, epsilon=epsilon, n_iters=n_iters)
+    gamma_student, _ = sinkhorn_masked(h_en_frz, h_hi,     en_mask, hi_mask, epsilon=epsilon, n_iters=n_iters)
 
     L_ot_list  = []
     gamma_list = []
@@ -241,14 +240,14 @@ def stage2_step_ar(batch, model, criterion, stage2_loss, epsilon, alpha, n_iters
         gamma_list.append(g_mix)
 
         h_en_b = h_en_frz[i][en_mask[i]]
-        h_ar_b = h_ar[i][ar_mask[i]]
-        if h_en_b.size(0) == 0 or h_ar_b.size(0) == 0:
+        h_hi_b = h_hi[i][hi_mask[i]]
+        if h_en_b.size(0) == 0 or h_hi_b.size(0) == 0:
             L_ot_list.append(torch.tensor(0.0, device=device, requires_grad=True))
             continue
 
         h_en_n = F.normalize(h_en_b, dim=-1)
-        h_ar_n = F.normalize(h_ar_b, dim=-1)
-        C_student = 1.0 - h_en_n @ h_ar_n.T
+        h_hi_n = F.normalize(h_hi_b, dim=-1)
+        C_student = 1.0 - h_en_n @ h_hi_n.T
         L_ot_list.append((g_mix.detach() * C_student).sum())
 
     L_ot = torch.stack(L_ot_list).mean() if L_ot_list else torch.tensor(0.0, device=device, requires_grad=True)
@@ -277,16 +276,16 @@ def stage2_step_ar(batch, model, criterion, stage2_loss, epsilon, alpha, n_iters
     # ── 6. Span loss ─────────────────────────────────────────
     L_span = compute_span_loss(
         gamma_list, en_start_logits, en_end_logits,
-        ar_start_logits, ar_end_logits,
-        en_mask, ar_mask,
+        hi_start_logits, hi_end_logits,
+        en_mask, hi_mask,
     )
 
     # ── 6b. Margin loss ──────────────────────────────────────
     L_margin = compute_pure_margin_loss(
         en_start, en_end,
         en_start_logits, en_end_logits,
-        ar_start_logits, ar_end_logits,
-        en_mask, ar_mask,
+        hi_start_logits, hi_end_logits,
+        en_mask, hi_mask,
         answerable_mask,
         device,
     )
@@ -297,13 +296,13 @@ def stage2_step_ar(batch, model, criterion, stage2_loss, epsilon, alpha, n_iters
     if lambda_kd > 0.0:
         from losses.vanilla_kd_loss import naive_index_to_index_kd_loss
         en_valid_len = en_mask.sum(dim=1)
-        ar_valid_len = ar_mask.sum(dim=1)
+        hi_valid_len = hi_mask.sum(dim=1)
         L_kd, kd_valid_mask = naive_index_to_index_kd_loss(
-            student_start_logits=ar_start_logits,
-            student_end_logits=ar_end_logits,
+            student_start_logits=hi_start_logits,
+            student_end_logits=hi_end_logits,
             teacher_start_logits=en_start_logits,
             teacher_end_logits=en_end_logits,
-            student_valid_len=ar_valid_len,
+            student_valid_len=hi_valid_len,
             teacher_valid_len=en_valid_len,
             student_gold_start=en_start,
             student_gold_end=en_end,
@@ -322,8 +321,8 @@ def stage2_step_ar(batch, model, criterion, stage2_loss, epsilon, alpha, n_iters
     with torch.no_grad():
         g_entropy = gamma_entropy(gamma_list)
         avg_n_en  = en_mask.sum(dim=1).float().mean().item()
-        avg_n_ar  = ar_mask.sum(dim=1).float().mean().item()
-        h_max     = math.log(max(avg_n_en * avg_n_ar, 1.0))
+        avg_n_hi  = hi_mask.sum(dim=1).float().mean().item()
+        h_max     = math.log(max(avg_n_en * avg_n_hi, 1.0))
         h_ratio   = g_entropy / h_max if h_max > 0 else 0
 
         if h_ratio > 0.90:
@@ -339,14 +338,14 @@ def stage2_step_ar(batch, model, criterion, stage2_loss, epsilon, alpha, n_iters
 # Main Training Loop
 # ──────────────────────────────────────────────────────────────
 
-def run_stage2_ar(config: dict):
+def run_stage2_hi(config: dict):
     local_rank, world_size = setup_ddp()
     device = torch.device(f'cuda:{local_rank}')
 
     if is_main_process():
         log.info(f'Device: {device} (DDP world_size={world_size})')
         log.info('=' * 60)
-        log.info('STAGE 2 AR: Teacher-Student Sinkhorn Alignment (Arabic)')
+        log.info('STAGE 2 HI: Teacher-Student Sinkhorn Alignment (Hindi)')
         log.info('=' * 60)
 
     os.makedirs(config['output_dir'], exist_ok=True)
@@ -369,7 +368,7 @@ def run_stage2_ar(config: dict):
     model.to(device)
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
-    # Disable dropout (same as VI branch)
+    # Disable dropout (same as VI/AR branch)
     for m in model.modules():
         if isinstance(m, torch.nn.Dropout):
             m.p = 0.0
@@ -387,26 +386,26 @@ def run_stage2_ar(config: dict):
     if en_em_baseline is None:
         en_em_baseline = compute_en_em_baseline(model, criterion, tokenizer, config, device)
 
-    # ── XQuAD-ar val pairs (rank 0 only, local file only) ───
+    # ── XQuAD-hi val pairs (rank 0 only, local file only) ───
     # Do NOT call HuggingFace inside DDP — causes network race conditions.
     val_pairs = []
     if is_main_process():
-        from arabic.data.xquad_loader_ar import load_xquad_ar_pairs
-        val_pairs = load_xquad_ar_pairs(config['root_dir'])
-        log.info(f'XQuAD-ar val pairs loaded: {len(val_pairs)}')
+        from hindi.data.xquad_loader_hi import load_xquad_hi_pairs
+        val_pairs = load_xquad_hi_pairs(config['root_dir'])
+        log.info(f'XQuAD-hi val pairs loaded: {len(val_pairs)}')
 
-    # ── AR parallel train dataloader (all ranks) ────────────
-    from arabic.squad_parallel_loader_ar import create_squad_parallel_dataloaders_ar
-    train_loader, _, train_sampler = create_squad_parallel_dataloaders_ar(
+    # ── HI parallel train dataloader (all ranks) ────────────
+    from hindi.squad_parallel_loader_hi import create_squad_parallel_dataloaders_hi
+    train_loader, _, train_sampler = create_squad_parallel_dataloaders_hi(
         tokenizer=tokenizer,
         en_path=os.path.join(config['root_dir'], 'dataset', 'Squad2.0', 'train-v2.0.json'),
-        ar_path=os.path.join(config['root_dir'], 'dataset', 'ZIZOUArabic_Squad', 'train.json'),
+        hi_path=os.path.join(config['root_dir'], 'dataset', 'IndicSQuAD', 'train_hindi.json'),
         batch_size=config['batch_size'],
         max_length=config['max_length'],
         distributed=True,
     )
     if is_main_process():
-        log.info(f'Train (SQuAD Parallel AR): {len(train_loader)} batches/GPU | XQuAD-ar Val: {len(val_pairs)} pairs')
+        log.info(f'Train (IndicSQuAD Parallel HI): {len(train_loader)} batches/GPU | XQuAD-hi Val: {len(val_pairs)} pairs')
 
     # ── Optimizer ────────────────────────────────────────────
     trainable_backbone = [p for p in get_model(model).backbone.parameters() if p.requires_grad]
@@ -437,14 +436,14 @@ def run_stage2_ar(config: dict):
 
     # ── TensorBoard ──────────────────────────────────────────
     writer = None
-    tb_dir = os.path.join(config['output_dir'], 'tensorboard_stage2_ar')
+    tb_dir = os.path.join(config['output_dir'], 'tensorboard_stage2_hi')
     if is_main_process():
         writer = SummaryWriter(log_dir=tb_dir)
         log.info(f'TensorBoard: {tb_dir}')
 
     # ── Initial state ────────────────────────────────────────
     start_epoch           = 1
-    best_ar_em            = 0.0
+    best_hi_em            = 0.0
     patience_count        = 0
     global_step           = 0
     margin_schedule_by_epoch = {1: 0.0, 2: 1.0, 3: 1.0, 4: 0.7, 5: 0.5}
@@ -465,9 +464,9 @@ def run_stage2_ar(config: dict):
                 scheduler.load_state_dict(ckpt['scheduler_state'])
             start_epoch    = ckpt['epoch'] + 1
             global_step    = ckpt['global_step']
-            best_ar_em     = ckpt.get('best_ar_em', 0.0)
+            best_hi_em     = ckpt.get('best_hi_em', 0.0)
             patience_count = ckpt.get('patience_count', 0)
-            log.info(f'  Resumed at Epoch {start_epoch}, Step {global_step}, Best AR EM: {best_ar_em:.2f}%')
+            log.info(f'  Resumed at Epoch {start_epoch}, Step {global_step}, Best HI EM: {best_hi_em:.2f}%')
 
     # ── Training epochs ──────────────────────────────────────
     for epoch in range(start_epoch, config['max_epochs'] + 1):
@@ -503,7 +502,7 @@ def run_stage2_ar(config: dict):
             else:
                 current_margin = config['lambda_margin']
 
-            losses = stage2_step_ar(
+            losses = stage2_step_hi(
                 batch, model, criterion, stage2_loss,
                 epsilon=current_eps,
                 alpha=current_alpha,
@@ -550,36 +549,36 @@ def run_stage2_ar(config: dict):
                     f'eps={current_eps:.4f} | λ_margin={current_margin:.4f}'
                 )
                 if writer:
-                    writer.add_scalar('Loss/Stage2_Total_AR',  losses['total'].item(),  global_step)
-                    writer.add_scalar('Loss/OT_AR',            losses['ot'].item(),      global_step)
-                    writer.add_scalar('Loss/Reg_AR',           losses['reg'].item(),     global_step)
-                    writer.add_scalar('Loss/Span_AR',          losses['span'].item(),    global_step)
-                    writer.add_scalar('Loss/Margin_AR',        losses['margin'].item(),  global_step)
-                    writer.add_scalar('Loss/QA_AR',            losses['qa'].item(),      global_step)
-                    writer.add_scalar('Loss/KD_AR',            losses['kd'].item(),      global_step)
-                    writer.add_scalar('Hyperparameters/Lambda_Margin_AR', current_margin, global_step)
+                    writer.add_scalar('Loss/Stage2_Total_HI',  losses['total'].item(),  global_step)
+                    writer.add_scalar('Loss/OT_HI',            losses['ot'].item(),      global_step)
+                    writer.add_scalar('Loss/Reg_HI',           losses['reg'].item(),     global_step)
+                    writer.add_scalar('Loss/Span_HI',          losses['span'].item(),    global_step)
+                    writer.add_scalar('Loss/Margin_HI',        losses['margin'].item(),  global_step)
+                    writer.add_scalar('Loss/QA_HI',            losses['qa'].item(),      global_step)
+                    writer.add_scalar('Loss/KD_HI',            losses['kd'].item(),      global_step)
+                    writer.add_scalar('Hyperparameters/Lambda_Margin_HI', current_margin, global_step)
 
         # ── End of epoch eval ────────────────────────────────
-        ar_em        = 0.0
+        hi_em        = 0.0
         should_break = False
 
         if is_main_process():
             import importlib.util
 
-            # AR eval on XQuAD-ar val
-            ar_eval_file = os.path.join(_ARABIC_DIR, 'phase4_evaluation', 'quick_eval_ar.py')
-            ar_spec = importlib.util.spec_from_file_location('quick_eval_ar', ar_eval_file)
-            ar_eval_mod = importlib.util.module_from_spec(ar_spec)
-            ar_spec.loader.exec_module(ar_eval_mod)
+            # HI eval on XQuAD-hi val
+            hi_eval_file = os.path.join(_HINDI_DIR, 'phase4_evaluation', 'quick_eval_hi.py')
+            hi_spec = importlib.util.spec_from_file_location('quick_eval_hi', hi_eval_file)
+            hi_eval_mod = importlib.util.module_from_spec(hi_spec)
+            hi_spec.loader.exec_module(hi_eval_mod)
 
-            ar_em, ar_f1 = ar_eval_mod.quick_em_f1_xquad_ar(
+            hi_em, hi_f1 = hi_eval_mod.quick_em_f1_xquad_hi(
                 model, criterion, tokenizer, val_pairs, device,
                 max_length=config['max_length'],
             )
-            log.info(f'Epoch {epoch} XQuAD-ar EM: {ar_em:.2f}%, F1: {ar_f1:.2f}%')
+            log.info(f'Epoch {epoch} XQuAD-hi EM: {hi_em:.2f}%, F1: {hi_f1:.2f}%')
             if writer:
-                writer.add_scalar('Eval/XQuAD_AR_EM', ar_em, epoch)
-                writer.add_scalar('Eval/XQuAD_AR_F1', ar_f1, epoch)
+                writer.add_scalar('Eval/XQuAD_HI_EM', hi_em, epoch)
+                writer.add_scalar('Eval/XQuAD_HI_F1', hi_f1, epoch)
 
             # Margin annealing (Fixed epoch-based schedule)
             if config.get('anneal_margin'):
@@ -598,7 +597,7 @@ def run_stage2_ar(config: dict):
                 en_em, en_f1 = en_eval_mod.quick_em_f1(model, criterion, tokenizer, dev_file, n_samples=200, device=device)
                 log.info(f'Epoch {epoch} SQuAD EN EM (200): {en_em:.2f}% (baseline={en_em_baseline:.2f}%), F1: {en_f1:.2f}%')
                 if writer:
-                    writer.add_scalar('Eval/SQuAD_EN_EM_Quick_AR', en_em, epoch)
+                    writer.add_scalar('Eval/SQuAD_EN_EM_Quick_HI', en_em, epoch)
                 drop = en_em_baseline - en_em
                 if epoch >= 4 and drop > config['en_em_safety']:
                     log.warning(f'EN EM dropped {drop:.1f} pts (>{config["en_em_safety"]}) — hard stop!')
@@ -606,31 +605,31 @@ def run_stage2_ar(config: dict):
 
             # Checkpoint
             if epoch % config['save_every'] == 0:
-                ckpt_out = os.path.join(config['output_dir'], f'stage2_ar_epoch_{epoch:03d}.pt')
-                save_stage2_checkpoint(ckpt_out, epoch, global_step, model, criterion, optimizer, scheduler, config, ar_em, best_ar_em, patience_count)
+                ckpt_out = os.path.join(config['output_dir'], f'stage2_hi_epoch_{epoch:03d}.pt')
+                save_stage2_checkpoint(ckpt_out, epoch, global_step, model, criterion, optimizer, scheduler, config, hi_em, best_hi_em, patience_count)
 
             # Early stopping
             if epoch >= 4:
-                if ar_em > best_ar_em + config['min_delta_em']:
-                    best_ar_em     = ar_em
+                if hi_em > best_hi_em + config['min_delta_em']:
+                    best_hi_em     = hi_em
                     patience_count = 0
-                    best_path = os.path.join(config['output_dir'], 'stage2_ar_best.pt')
-                    save_stage2_checkpoint(best_path, epoch, global_step, model, criterion, optimizer, scheduler, config, ar_em, best_ar_em, patience_count)
-                    log.info(f'  ★ New best AR EM={ar_em:.2f}% — saved {best_path}')
+                    best_path = os.path.join(config['output_dir'], 'stage2_hi_best.pt')
+                    save_stage2_checkpoint(best_path, epoch, global_step, model, criterion, optimizer, scheduler, config, hi_em, best_hi_em, patience_count)
+                    log.info(f'  ★ New best HI EM={hi_em:.2f}% — saved {best_path}')
                 else:
                     patience_count += 1
                     log.info(f'  No improvement. Patience {patience_count}/{config["patience"]}')
                     if patience_count >= config['patience']:
-                        log.info(f'Early stopping at epoch {epoch} — best AR EM={best_ar_em:.2f}%')
+                        log.info(f'Early stopping at epoch {epoch} — best HI EM={best_hi_em:.2f}%')
                         should_break = True
             else:
                 log.info(f'  Epoch {epoch} < 4. Early stopping monitoring suspended.')
 
         # Broadcast break signal (all ranks must participate)
+        should_break_tensor = torch.tensor([1 if should_break else 0], dtype=torch.long, device=device)
         if world_size > 1:
-            signal_tensor = torch.tensor([1 if should_break else 0], dtype=torch.long, device=device)
-            torch.distributed.broadcast(signal_tensor, src=0)
-            should_break = signal_tensor[0].item() == 1
+            torch.distributed.broadcast(should_break_tensor, src=0)
+        should_break = should_break_tensor[0].item() == 1
 
         if should_break:
             break
@@ -638,8 +637,8 @@ def run_stage2_ar(config: dict):
     if is_main_process() and writer is not None:
         writer.close()
         log.info('=' * 60)
-        log.info(f'Stage 2 AR complete. Best AR EM: {best_ar_em:.2f}%')
-        log.info(f'Best checkpoint: {os.path.join(config["output_dir"], "stage2_ar_best.pt")}')
+        log.info(f'Stage 2 HI complete. Best HI EM: {best_hi_em:.2f}%')
+        log.info(f'Best checkpoint: {os.path.join(config["output_dir"], "stage2_hi_best.pt")}')
         log.info('=' * 60)
 
     cleanup_ddp()
@@ -650,34 +649,34 @@ def run_stage2_ar(config: dict):
 # ──────────────────────────────────────────────────────────────
 
 def parse_args() -> dict:
-    parser = argparse.ArgumentParser(description='Stage 2 AR: Teacher-Student Sinkhorn Alignment (Arabic)')
-    parser.add_argument('--stage1_ckpt',    default=STAGE2_AR_CONFIG['stage1_ckpt'])
-    parser.add_argument('--model_name',     default=STAGE2_AR_CONFIG['model_name'])
-    parser.add_argument('--batch_size',     type=int,   default=STAGE2_AR_CONFIG['batch_size'])
-    parser.add_argument('--max_epochs',     type=int,   default=STAGE2_AR_CONFIG['max_epochs'])
-    parser.add_argument('--stage2_head_lr', type=float, default=STAGE2_AR_CONFIG['stage2_head_lr'])
-    parser.add_argument('--lambda_ot',      type=float, default=STAGE2_AR_CONFIG['lambda_ot'])
-    parser.add_argument('--lambda_reg',     type=float, default=STAGE2_AR_CONFIG['lambda_reg'])
-    parser.add_argument('--lambda_span',    type=float, default=STAGE2_AR_CONFIG['lambda_span'])
-    parser.add_argument('--lambda_margin',  type=float, default=STAGE2_AR_CONFIG['lambda_margin'])
-    parser.add_argument('--anneal_margin',  action='store_true', default=STAGE2_AR_CONFIG.get('anneal_margin', False))
-    parser.add_argument('--lambda_qa',      type=float, default=STAGE2_AR_CONFIG['lambda_qa'])
-    parser.add_argument('--lambda_kd',      type=float, default=STAGE2_AR_CONFIG['lambda_kd'],
+    parser = argparse.ArgumentParser(description='Stage 2 HI: Teacher-Student Sinkhorn Alignment (Hindi)')
+    parser.add_argument('--stage1_ckpt',    default=STAGE2_HI_CONFIG['stage1_ckpt'])
+    parser.add_argument('--model_name',     default=STAGE2_HI_CONFIG['model_name'])
+    parser.add_argument('--batch_size',     type=int,   default=STAGE2_HI_CONFIG['batch_size'])
+    parser.add_argument('--max_epochs',     type=int,   default=STAGE2_HI_CONFIG['max_epochs'])
+    parser.add_argument('--stage2_head_lr', type=float, default=STAGE2_HI_CONFIG['stage2_head_lr'])
+    parser.add_argument('--lambda_ot',      type=float, default=STAGE2_HI_CONFIG['lambda_ot'])
+    parser.add_argument('--lambda_reg',     type=float, default=STAGE2_HI_CONFIG['lambda_reg'])
+    parser.add_argument('--lambda_span',    type=float, default=STAGE2_HI_CONFIG['lambda_span'])
+    parser.add_argument('--lambda_margin',  type=float, default=STAGE2_HI_CONFIG['lambda_margin'])
+    parser.add_argument('--anneal_margin',  action='store_true', default=STAGE2_HI_CONFIG.get('anneal_margin', False))
+    parser.add_argument('--lambda_qa',      type=float, default=STAGE2_HI_CONFIG['lambda_qa'])
+    parser.add_argument('--lambda_kd',      type=float, default=STAGE2_HI_CONFIG['lambda_kd'],
                         help='Vanilla KD weight (0=disabled, 1.0 for M1)')
-    parser.add_argument('--kd_temperature', type=float, default=STAGE2_AR_CONFIG['kd_temperature'])
-    parser.add_argument('--epsilon',        type=float, default=STAGE2_AR_CONFIG['epsilon'])
-    parser.add_argument('--sinkhorn_iters', type=int,   default=STAGE2_AR_CONFIG['sinkhorn_iters'])
-    parser.add_argument('--patience',       type=int,   default=STAGE2_AR_CONFIG['patience'])
-    parser.add_argument('--max_length',     type=int,   default=STAGE2_AR_CONFIG['max_length'])
-    parser.add_argument('--output_dir',     default=STAGE2_AR_CONFIG['output_dir'])
-    parser.add_argument('--log_every',      type=int,   default=STAGE2_AR_CONFIG['log_every'])
+    parser.add_argument('--kd_temperature', type=float, default=STAGE2_HI_CONFIG['kd_temperature'])
+    parser.add_argument('--epsilon',        type=float, default=STAGE2_HI_CONFIG['epsilon'])
+    parser.add_argument('--sinkhorn_iters', type=int,   default=STAGE2_HI_CONFIG['sinkhorn_iters'])
+    parser.add_argument('--patience',       type=int,   default=STAGE2_HI_CONFIG['patience'])
+    parser.add_argument('--max_length',     type=int,   default=STAGE2_HI_CONFIG['max_length'])
+    parser.add_argument('--output_dir',     default=STAGE2_HI_CONFIG['output_dir'])
+    parser.add_argument('--log_every',      type=int,   default=STAGE2_HI_CONFIG['log_every'])
     parser.add_argument('--freeze_qa_head', action='store_true', default=False)
     parser.add_argument('--resume_from',    type=str,   default=None)
-    parser.add_argument('--en_em_safety',   type=float, default=STAGE2_AR_CONFIG['en_em_safety'])
-    parser.add_argument('--hf_repo_id',     type=str,   default=STAGE2_AR_CONFIG['hf_repo_id'])
-    parser.add_argument('--seed',           type=int,   default=STAGE2_AR_CONFIG['seed'])
+    parser.add_argument('--en_em_safety',   type=float, default=STAGE2_HI_CONFIG['en_em_safety'])
+    parser.add_argument('--hf_repo_id',     type=str,   default=STAGE2_HI_CONFIG['hf_repo_id'])
+    parser.add_argument('--seed',           type=int,   default=STAGE2_HI_CONFIG['seed'])
     args = parser.parse_args()
-    config = {**STAGE2_AR_CONFIG, **vars(args)}
+    config = {**STAGE2_HI_CONFIG, **vars(args)}
     return config
 
 
@@ -686,9 +685,9 @@ if __name__ == '__main__':
     set_seed(config['seed'])
 
     if is_main_process():
-        log.info('Stage 2 AR config:')
+        log.info('Stage 2 HI config:')
         for k, v in config.items():
             if k != 'root_dir':
                 log.info(f'  {k:20s}: {v}')
 
-    run_stage2_ar(config)
+    run_stage2_hi(config)
