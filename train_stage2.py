@@ -573,16 +573,8 @@ def run_stage2(config: dict):
     patience_count = 0
     global_step    = 0
 
-    # Margin scheduling state
-    # Epoch 1: margin=0.0 (LoRA warmup — stabilize EN QA before adding VI pressure)
-    # Epoch 2: margin=1.0 (introduce boundary pressure once EN is stable)
-    # Epoch 3+: patience-based annealing 1.0 → 0.5 → 0.3
-    margin_schedule = [0.0, 1.0, 0.5, 0.3]
-    current_margin_idx = 0
-    best_vi_f1 = 0.0
-    margin_patience_count = 0
-    # margin_warmup_epochs: number of fixed-schedule epochs before patience kicks in
-    margin_warmup_epochs = config.get("margin_warmup_epochs", 2)
+    # Margin scheduling state (Fixed epoch-based schedule)
+    margin_schedule_by_epoch = {1: 1.0, 2: 0.7, 3: 0.5, 4: 0.3, 5: 0.3}
 
     # ── Resume Logic ─────────────────────────────────────────────
     if config.get("resume_from"):
@@ -663,7 +655,7 @@ def run_stage2(config: dict):
             current_alpha = 1.0
 
             if config.get("anneal_margin"):
-                current_margin = margin_schedule[current_margin_idx]
+                current_margin = margin_schedule_by_epoch.get(epoch, 0.3)
                 stage2_loss.lambda_margin = current_margin
             else:
                 current_margin = config["lambda_margin"]
@@ -783,32 +775,12 @@ def run_stage2(config: dict):
             writer.add_scalar("Eval/XQuAD_VI_EM", vi_em, epoch)
             writer.add_scalar("Eval/XQuAD_VI_F1", vi_f1, epoch)
 
-            # Validation-driven margin scheduling
+            # Margin annealing (Fixed epoch-based schedule)
             if config.get("anneal_margin"):
-                if epoch < margin_warmup_epochs:
-                    # Epoch-based warmup: fixed margin per epoch
-                    # epoch=1 → idx=0 (margin=0.0), epoch=2 → idx=1 (margin=1.0)
-                    next_idx = min(epoch - 1, len(margin_schedule) - 1)
-                    if next_idx != current_margin_idx:
-                        current_margin_idx = next_idx
-                        log.info(f"  [Margin Schedule] 📈 Warmup step → margin={margin_schedule[current_margin_idx]:.1f} (epoch {epoch+1})")
-                    # Reset patience baseline at end of warmup so patience starts fresh
-                    best_vi_f1 = vi_f1
-                    margin_patience_count = 0
-                else:
-                    # Patience-based annealing from epoch margin_warmup_epochs+1 onwards
-                    min_delta_f1 = 0.1
-                    if vi_f1 > best_vi_f1 + min_delta_f1:
-                        best_vi_f1 = vi_f1
-                        margin_patience_count = 0
-                    else:
-                        margin_patience_count += 1
-                        log.info(f"  [Margin Schedule] F1 plateau/drop detected (best F1: {best_vi_f1:.2f}%). Patience: {margin_patience_count}")
-                        if margin_patience_count >= 1:
-                            if current_margin_idx < len(margin_schedule) - 1:
-                                current_margin_idx += 1
-                                log.info(f"  [Margin Schedule] 📉 Stepping down margin to {margin_schedule[current_margin_idx]:.1f}")
-                            margin_patience_count = 0
+                next_margin = margin_schedule_by_epoch.get(epoch + 1, 0.3)
+                current_margin = margin_schedule_by_epoch.get(epoch, 0.3)
+                if next_margin != current_margin:
+                    log.info(f"  [Margin] Schedule update: Epoch {epoch+1} → margin={next_margin:.1f}")
 
             # EN EM regression check (200 SQuAD samples)
             dev_file = os.path.join(config["root_dir"], "dataset", "Squad2.0", "dev-v2.0.json")
@@ -904,15 +876,13 @@ def run_stage2(config: dict):
             else:
                 log.info(f"  Epoch {epoch} < 4. Early stopping monitoring is suspended.")
 
-        # Broadcast break signal and margin state to all ranks
+        # Broadcast break signal to all ranks
         if world_size > 1:
             signal_tensor = torch.tensor([
-                1 if should_break else 0,
-                current_margin_idx
+                1 if should_break else 0
             ], device=device)
             torch.distributed.broadcast(signal_tensor, src=0)
             should_break = signal_tensor[0].item() == 1
-            current_margin_idx = int(signal_tensor[1].item())
 
         if should_break:
             break

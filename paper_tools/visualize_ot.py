@@ -1,4 +1,5 @@
 import os
+import unicodedata
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -46,13 +47,16 @@ def main():
     en_tok_path = os.path.join(data_dir, 'english_tokens.txt')
     if os.path.exists(en_tok_path):
         with open(en_tok_path, 'r', encoding='utf-8') as f:
-            en_tokens = [line.strip() for line in f.readlines()]
+            # NFC-normalize: source token files are sometimes NFD (decomposed
+            # diacritics), which matplotlib's PDF Type3 font backend cannot
+            # composite, silently dropping accents. NFC is a no-op on plain ASCII.
+            en_tokens = [unicodedata.normalize('NFC', line.strip()) for line in f.readlines()]
             
     vi_tokens = None
     vi_tok_path = os.path.join(data_dir, 'vietnamese_tokens.txt')
     if os.path.exists(vi_tok_path):
         with open(vi_tok_path, 'r', encoding='utf-8') as f:
-            vi_tokens = [line.strip() for line in f.readlines()]
+            vi_tokens = [unicodedata.normalize('NFC', line.strip()) for line in f.readlines()]
 
     plt.rcParams['font.family'] = 'serif'
     plt.rcParams['font.serif'] = ['Times New Roman']
@@ -61,7 +65,7 @@ def main():
     fig, ax = plt.subplots(figsize=(6, 4))
     
     # Heatmap
-    cax = ax.imshow(gamma, cmap='viridis', aspect='auto')
+    cax = ax.imshow(gamma, cmap='viridis', aspect='auto', interpolation='nearest')
     fig.colorbar(cax, ax=ax)
     
     # Ticks
@@ -132,4 +136,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

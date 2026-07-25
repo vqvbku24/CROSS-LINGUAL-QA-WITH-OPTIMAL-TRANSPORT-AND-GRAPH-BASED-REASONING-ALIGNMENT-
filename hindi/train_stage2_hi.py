@@ -446,7 +446,7 @@ def run_stage2_hi(config: dict):
     best_hi_em            = 0.0
     patience_count        = 0
     global_step           = 0
-    margin_schedule_by_epoch = {1: 0.0, 2: 1.0, 3: 1.0, 4: 0.7, 5: 0.5}
+    margin_schedule_by_epoch = {1: 1.0, 2: 0.7, 3: 0.5, 4: 0.3, 5: 0.3}
 
     # ── Resume ───────────────────────────────────────────────
     if config.get('resume_from'):

@@ -11,81 +11,70 @@ import matplotlib.pyplot as plt
 
 # ── Data (Please plug in your actual values here) ─────────────────────────
 def get_dummy_data():
+    # XQuAD-vi (Xquad_hi), seed 42
     return {
-        'M4: Static Margin': {
-            'epochs': [1, 2, 3, 8],
-            'em':     [50, 50.84, 51.26, 49.41],
-            'f1':     [70.86, 71.56, 71.24, 69.66],
-            'best_epoch': 3,
-            'color': '#1f77b4',
-            'marker': 'o',
+        'M4: Dynamic Curriculum Margin': {
+            'epochs': [1, 2, 3, 6],
+            'em':     [50.34, 49.08, 49.5, 47.98],
+            'f1':     [70.47, 69.27, 69.28, 68],
+            'best_epoch': 3, 'color': '#1f77b4', 'marker': 'o',
         },
-        'M5: Dynamic Curriculum Margin': {
-            'epochs': [1, 2, 3, 8],
-            'em':     [50.5, 50.17, 51.26, 50],
-            'f1':     [71.44, 70.87, 71.22, 70.17],
-            'best_epoch': 3,
-            'color': '#d62728',
-            'marker': 's',
+        'M5: Static Margin ': {
+            'epochs': [1, 2, 3, 6],
+            'em':     [50.34, 50.08, 49.7, 50.5],
+            'f1':     [70.47, 70.28, 69.73, 70.38],
+            'best_epoch': 3, 'color': '#d62728', 'marker': 's',
         },
     }
 
 def get_dummy_data_1():
+    # MLQA-vi (MLQA-hi), seed 42
     return {
-        'M4: Static Margin': {
-            'epochs': [1, 2, 3, 8],
-            'em':     [44.7, 45.26, 45.41, 45.39],
-            'f1':     [66.5, 67.52, 67.72, 67.41],
-            'best_epoch': 3,
-            'color': '#1f77b4',
-            'marker': 'o',
+        'M4: Dynamic Curriculum Margin': {
+            'epochs': [1, 2, 3, 6],
+            'em':     [44.8, 45.01, 45.23, 44.32],
+            'f1':     [66.52, 66.88, 67.33, 66.4],
+            'best_epoch': 3, 'color': '#1f77b4', 'marker': 'o',
         },
-        'M5: Dynamic Curriculum Margin': {
-            'epochs': [1, 2, 3, 8],
-            'em':     [44.75, 45.36, 46, 45.22],
-            'f1':     [66.3, 67.38, 68.1, 67.46],
-            'best_epoch': 3,
-            'color': '#d62728',
-            'marker': 's',
+        'M5: Static Margin': {
+            'epochs': [1, 2, 3, 6],
+            'em':     [44.8, 45.23, 46, 45.01],
+            'f1':     [66.52, 67, 67.6, 66.75],
+            'best_epoch': 3, 'color': '#d62728', 'marker': 's',
         },
     }
+
 def get_dummy_data_2():
+    # XQuAD-en, seed 42
     return {
-        'M4: Static Margin': {
-            'epochs': [1, 2, 3, 8],
-            'em':     [64.87, 61.76, 60.92, 56.55],
-            'f1':     [78.41, 74.16, 73.5, 67.58],
-            'best_epoch': 3,
-            'color': '#1f77b4',
-            'marker': 'o',
+        'M4: Dynamic Curriculum Margin': {
+            'epochs': [1, 2, 3, 6],
+            'em':     [65.04, 63.19, 61.6, 58.82],
+            'f1':     [78.41, 75.4, 73.47, 69.92],
+            'best_epoch': 3, 'color': '#1f77b4', 'marker': 'o',
         },
-        'M5: Dynamic Curriculum Margin': {
-            'epochs': [1, 2, 3, 8],
-            'em':     [65.55, 62.35, 62.32, 56.43],
-            'f1':     [79, 74.84, 74.8, 67.26],
-            'best_epoch': 3,
-            'color': '#d62728',
-            'marker': 's',
+        'M5: Static Margin': {
+            'epochs': [1, 2, 3, 6],
+            'em':     [65.04, 62.86, 62.44, 60.59],
+            'f1':     [78.41, 75.63, 74.78, 72.37],
+            'best_epoch': 3, 'color': '#d62728', 'marker': 's',
         },
     }
 
 def get_dummy_data_3():
+    # MLQA-en, seed 42
     return {
-        'M4: Static Margin': {
-            'epochs': [1, 2, 3, 8],
-            'em':     [66.03, 65.75, 65.73, 65.56],
-            'f1':     [79.7, 79.4, 79.51, 79.23],
-            'best_epoch': 3,
-            'color': '#1f77b4',
-            'marker': 'o',
+        'M4: Dynamic Curriculum Margin': {
+            'epochs': [1, 2, 3, 6],
+            'em':     [66.03, 65.9, 65.7, 65.7],
+            'f1':     [79.7, 79.5, 79.34, 79.47],
+            'best_epoch': 3, 'color': '#1f77b4', 'marker': 'o',
         },
-        'M5: Dynamic Curriculum Margin': {
-            'epochs': [1, 2, 3, 8],
-            'em':     [66.04, 65.9, 66, 65.84],
-            'f1':     [79.74, 79.3, 79.35, 79.34],
-            'best_epoch': 3,
-            'color': '#d62728',
-            'marker': 's',
+        'M5: Static Margin': {
+            'epochs': [1, 2, 3, 6],
+            'em':     [66.03, 66.13, 65.9, 65.8],
+            'f1':     [79.7, 79.6, 79.5, 79.45],
+            'best_epoch': 3, 'color': '#d62728', 'marker': 's',
         },
     }
 XQUAD_VI_DATA = get_dummy_data() # Thay đổi dict này cho XQuAD-VI
@@ -192,10 +181,10 @@ def main():
     plot_metric(MLQA_EN_DATA, axes[1, 1], 'em', 'EM', 'MLQA-en: Validation EM vs. Epoch')
     
     plt.tight_layout()
-    plt.savefig('figure_margin_dynamics_en_combined.pdf', bbox_inches='tight')
-    plt.savefig('figure_margin_dynamics_en_combined.png', dpi=300, bbox_inches='tight')
-    plt.savefig('figures/figure_margin_dynamics_en_combined.pdf', bbox_inches='tight')
-    plt.savefig('figures/figure_margin_dynamics_en_combined.png', dpi=300, bbox_inches='tight')
+    plt.savefig('figure_margin_en_combined.pdf', bbox_inches='tight')
+    plt.savefig('figure_margin_en_combined.png', dpi=300, bbox_inches='tight')
+    plt.savefig('figures/figure_margin_en_combined.pdf', bbox_inches='tight')
+    plt.savefig('figures/figure_margin_en_combined.png', dpi=300, bbox_inches='tight')
     plt.close()
     
     print("Saved combined figures for VI and EN to root and figures/")

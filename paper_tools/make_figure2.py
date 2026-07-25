@@ -7,8 +7,8 @@ def plot_figure2():
     plt.rcParams['font.size'] = 12
     
     # Data from schedule: Epoch 1 (0.0), Epoch 2-3 (1.0), Epoch 4 (0.7), Epoch 5 (0.5), Epoch 6-8 (0.3)
-    epochs = [1, 2, 3, 4, 5, 6, 7, 8]
-    margin = [0.0, 1.0, 1.0, 0.7, 0.5, 0.3, 0.3, 0.3]
+    epochs = [1, 2, 3, 4, 5, 6]
+    margin = [0.0, 1.0, 0.7, 0.5, 0.3, 0.3]
     
     fig, ax = plt.subplots(figsize=(6, 4))
     

@@ -11,12 +11,12 @@ def generate_ablation_data():
             'M1: Vanilla KD', 
             'M2: OT Only (Global)', 
             'M3: OT + Span (Local)', 
-            'M4: Static Margin', 
-            'M5: Ours (Dynamic)'
+            'M4: Dynamic Margin', 
+            'M5: Ours (Static)'
         ],
-        'SQuAD_EN': [64.26, 65.65, 66.08, 64.58, 65.64, 64.84],
-        'MLQA_VI': [46.05, 41.34, 36.08, 44.35, 45.41, 46.0],
-        'XQuAD_VI': [46.22, 45.55, 38.66, 46.62, 51.26, 51.26] 
+        'SQuAD_EN': [64.26, 64.08, 66.08, 64.58, 66.21, 65.69],
+        'MLQA_VI': [46.05, 33.79, 36.08, 44.35, 45.23, 46.0],
+        'XQuAD_VI': [46.22, 37.39, 38.66, 46.62, 49.5, 49.7] 
     }
     
     # F1 data from Table 3 (labeled tab:ablation_study) and Table 1 (tab:main_results)
@@ -26,13 +26,13 @@ def generate_ablation_data():
             'M1: Vanilla KD', 
             'M2: OT Only (Global)', 
             'M3: OT + Span (Local)', 
-            'M4: Static Margin', 
-            'M5: Ours (Dynamic)'
+            'M4: Dynamic Margin', 
+            'M5: Ours (Static)'
         ],
-        'SQuAD_EN': [72.84, 73.93, 72.75, 73.09, 73.9, 73.27],
-        'MLQA_VI': [67.21, 64.42, 56.06, 65.33, 67.41, 68.1],
+        'SQuAD_EN': [72.84, 72.8, 72.75, 73.09, 74.37, 74.02],
+        'MLQA_VI': [67.21, 56.39, 56.06, 65.33, 67.33, 67.6],
         # Note: adjust XQuAD_VI F1 values below if you have different experimental numbers
-        'XQuAD_VI': [63.64, 69.31, 57.63, 66.50, 71.24, 71.22] 
+        'XQuAD_VI': [63.64, 62.55 , 57.63, 66.50, 69.28, 69.73] 
     }
     
     pd.DataFrame(em_data).to_csv('ablation_em.csv', index=False, encoding='utf-8')

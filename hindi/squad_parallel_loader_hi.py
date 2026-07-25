@@ -14,8 +14,14 @@ Alignment strategy: ID-based (same as VI/AR branch).
 """
 import json
 import logging
+import sys
+import os
 import torch
 from torch.utils.data import Dataset, DataLoader
+
+# Import from parent project
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from phase1_dataloader.process_qa_sample import process_qa_sample
 
 logging.basicConfig(
     level=logging.INFO,
@@ -141,11 +147,6 @@ class SquadParallelDatasetHI(Dataset):
         return len(self.parallel_data)
 
     def __getitem__(self, idx):
-        import sys, os
-        # Import from parent project
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from phase1_dataloader.process_qa_sample import process_qa_sample
-
         item = self.parallel_data[idx]
         en_item = item['en']
         hi_item = item['hi']
