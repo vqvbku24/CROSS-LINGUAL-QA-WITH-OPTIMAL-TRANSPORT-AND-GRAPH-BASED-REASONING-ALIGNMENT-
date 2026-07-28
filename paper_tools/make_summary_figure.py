@@ -130,17 +130,17 @@ def main():
 
     fig, axes = plt.subplots(2, 3, figsize=(13, 7.8))
 
-    # (a) Anisotropy control: OT-weighted cosine vs. random-token control
+    # (a) Anisotropy control: OT-weighted cosine vs. uniform-token control
     ax = axes[0, 0]
-    data = [aniso_df['random_control_cosine'].values, aniso_df['ot_weighted_cosine'].values]
-    bp = ax.boxplot(data, tick_labels=['Random VI\ntoken', 'OT-weighted\nVI counterpart'],
+    data = [aniso_df['uniform_control_cosine'].values, aniso_df['ot_weighted_cosine'].values]
+    bp = ax.boxplot(data, tick_labels=['Uniform VI\ncontrol', 'OT-weighted\nVI counterpart'],
                      patch_artist=True, widths=0.5, showfliers=False)
     for patch, color in zip(bp['boxes'], ['#aec7e8', '#2ca02c']):
         patch.set_facecolor(color)
     ax.set_ylabel('Cosine similarity to EN answer token')
     ax.set_title(f"(a) Anisotropy control (n={len(aniso_df)})", fontsize=9.5)
-    loc_a = 'upper left' if aniso_df['ot_weighted_cosine'].mean() < aniso_df['random_control_cosine'].mean() else 'lower right'
-    annotate_stats(ax, stat_pair(aniso_df['ot_weighted_cosine'], aniso_df['random_control_cosine']), loc=loc_a)
+    loc_a = 'upper left' if aniso_df['ot_weighted_cosine'].mean() < aniso_df['uniform_control_cosine'].mean() else 'lower right'
+    annotate_stats(ax, stat_pair(aniso_df['ot_weighted_cosine'], aniso_df['uniform_control_cosine']), loc=loc_a)
 
     # (b) Euclidean distance, before vs after (paired)
     ax = axes[0, 1]

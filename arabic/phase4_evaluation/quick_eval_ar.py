@@ -373,3 +373,4 @@ if __name__ == "__main__":
     print(f"Exact Match (EM): {final_em:.2f}%")
     print(f"F1 Score: {final_f1:.2f}%")
     print(f"========================================")
+    print(f"========================================")

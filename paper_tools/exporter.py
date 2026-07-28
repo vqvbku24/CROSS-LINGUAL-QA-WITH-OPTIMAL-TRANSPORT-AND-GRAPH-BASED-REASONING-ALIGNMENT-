@@ -368,8 +368,8 @@ def main():
     labels = ["normal"] * (en_seq_len + vi_seq_len)
 
     # Mark answer tokens if we have span positions
-    en_start = int(batch.get("en_start_position", torch.tensor([0]))[0].item())
-    en_end   = int(batch.get("en_end_position",   torch.tensor([0]))[0].item())
+    en_start = int(batch.get("en_start_positions", torch.tensor([0]))[0].item())
+    en_end   = int(batch.get("en_end_positions",   torch.tensor([0]))[0].item())
     if en_start < en_seq_len and en_end < en_seq_len and en_start <= en_end:
         for i in range(en_start, en_end + 1):
             labels[i] = "answer"

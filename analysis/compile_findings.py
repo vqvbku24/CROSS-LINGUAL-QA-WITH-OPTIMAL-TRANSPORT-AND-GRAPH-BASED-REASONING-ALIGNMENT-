@@ -262,7 +262,7 @@ def main():
         f"| H3 | Representation drift (cosine alignment, norm change) | {h3_verdict} | See §H3 |\n",
     ]
     for j, row_line in enumerate(summary_rows):
-        lines.insert(summary_idx + 3 + j, row_line)
+        lines.insert(summary_idx + 2 + j, row_line)
 
     # ── Conclusion ───────────────────────────────────────────────
     lines.append("\n---\n\n## Conclusion\n")

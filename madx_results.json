@@ -1,0 +1,38 @@
+{
+  "ar": {
+    "mlqa": {
+      "f1": 21.83,
+      "exact_match": 14.04,
+      "total": 5335
+    },
+    "xquad": {
+      "f1": 29.03,
+      "exact_match": 21.68,
+      "total": 1190
+    }
+  },
+  "hi": {
+    "mlqa": {
+      "f1": 30.93,
+      "exact_match": 22.22,
+      "total": 4918
+    },
+    "xquad": {
+      "f1": 38.71,
+      "exact_match": 29.33,
+      "total": 1190
+    }
+  },
+  "vi": {
+    "mlqa": {
+      "f1": 29.07,
+      "exact_match": 20.47,
+      "total": 5495
+    },
+    "xquad": {
+      "f1": 35.57,
+      "exact_match": 25.71,
+      "total": 1190
+    }
+  }
+}

@@ -1,0 +1,4 @@
+language,status,n_total,n_unanswerable,pct_unanswerable,ans_len_words_mean,ans_len_words_median,ans_len_words_std,ans_len_tokens_mean,ans_len_tokens_median,ans_len_tokens_std,ctx_len_tokens_mean,ctx_len_tokens_median,ctx_len_tokens_std,ans_pos_pct_mean,ans_pos_pct_median,ans_pos_pct_std,ans_pos_head_pct,ans_pos_mid_pct,ans_pos_tail_pct
+VI,OK,1190,0,0.0,4.316,3.0,4.2818,5.2546,4.0,4.8394,214.6017,188.0,107.224,42.7143,40.703,29.1548,42.8,32.7,24.5
+AR,OK,1190,0,0.0,2.958,2.0,2.6484,5.6605,4.0,5.0287,214.3353,189.0,102.4682,42.7026,40.2621,29.0215,43.3,31.8,25.0
+HI,OK,1190,0,0.0,3.1361,2.0,3.3513,5.8244,4.0,5.3492,228.8622,200.0,107.7792,41.4765,38.0702,28.9377,44.5,31.8,23.6

@@ -1,0 +1,4 @@
+language,mean_ratio,median_ratio,std_ratio,n_samples,status
+VI,1.2008,1.1827,0.0906,240,OK
+AR,1.8539,1.8333,0.1947,240,OK
+HI,1.5924,1.5622,0.201,240,OK

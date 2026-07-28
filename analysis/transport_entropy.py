@@ -54,13 +54,13 @@ def resolve_ckpt_path(lang: str, seed: int, epoch: int) -> str:
     """Find existing checkpoint by checking multiple candidate locations."""
     if lang == "VI":
         dirs = [
-            f"checkpoint_stage2_vi/m5_anneal_seed{seed}",
-            f"checkpoint_stage2_vi/m4_static_seed{seed}",
+            f"checkpoint_stage2_vi/m4_static_seed{seed}",   # primary: same variant as HI
+            f"checkpoint_stage2_vi/m5_anneal_seed{seed}",   # fallback
             f"checkpoint_stage2_vi/m5_ours_seed{seed}",
             f"checkpoint_stage2_vi/table2_m5_ours",
             f"checkpoint_stage2_vi",
-            f"checkpoint_stage2/m5_anneal_seed{seed}",
             f"checkpoint_stage2/m4_static_seed{seed}",
+            f"checkpoint_stage2/m5_anneal_seed{seed}",
             f"checkpoint_stage2/m5_ours_seed{seed}",
             f"checkpoint_stage2",
         ]

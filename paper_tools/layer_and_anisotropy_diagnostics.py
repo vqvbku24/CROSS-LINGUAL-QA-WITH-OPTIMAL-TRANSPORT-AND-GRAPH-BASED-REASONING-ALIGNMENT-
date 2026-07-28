@@ -70,34 +70,36 @@ def load_common(example_dir):
 
 
 def ot_weighted_stats(en_vecs, vi_vecs, sub_gamma):
-    """Returns (distance, cosine_to_weighted_centroid) per EN answer row."""
+    """Returns (expected_pairwise_distance, expected_pairwise_cosine) per EN answer row."""
     w = sub_gamma / (sub_gamma.sum(axis=1, keepdims=True) + 1e-12)
-    vi_weighted_centroid = w @ vi_vecs
-    dists = np.linalg.norm(en_vecs - vi_weighted_centroid, axis=1)
-    en_norms = np.linalg.norm(en_vecs, axis=1) + 1e-12
-    vc_norms = np.linalg.norm(vi_weighted_centroid, axis=1) + 1e-12
-    cos = (en_vecs * vi_weighted_centroid).sum(axis=1) / (en_norms * vc_norms)
-    return dists, cos
+    
+    # Expected Pairwise Distance
+    diffs = en_vecs[:, None, :] - vi_vecs[None, :, :]
+    dist_matrix = np.linalg.norm(diffs, axis=-1)
+    expected_dists = (dist_matrix * w).sum(axis=1)
+    
+    # Expected Pairwise Cosine
+    en_norms = np.linalg.norm(en_vecs, axis=1, keepdims=True) + 1e-12
+    vi_norms = np.linalg.norm(vi_vecs, axis=1, keepdims=True) + 1e-12
+    cos_matrix = (en_vecs @ vi_vecs.T) / (en_norms @ vi_norms.T)
+    expected_cos = (cos_matrix * w).sum(axis=1)
+    
+    return expected_dists, expected_cos
 
 
-def random_control_cosine(en_vecs, vi_vecs, rng, n_draws=20):
-    """Cosine similarity between each EN vector and n_draws random (unrelated)
-    VI vectors from the same sentence, averaged. This is the anisotropy
-    baseline: if real alignment carries no signal beyond anisotropy, OT-weighted
-    cosine and this control should look statistically the same."""
-    n_vi = vi_vecs.shape[0]
-    draws = min(n_draws, n_vi)
-    out = np.zeros(en_vecs.shape[0])
-    en_norms = np.linalg.norm(en_vecs, axis=1) + 1e-12
-    for i, en_vec in enumerate(en_vecs):
-        idx = rng.choice(n_vi, size=draws, replace=False)
-        sampled = vi_vecs[idx]
-        cos = (sampled @ en_vec) / (np.linalg.norm(sampled, axis=1) * en_norms[i] + 1e-12)
-        out[i] = cos.mean()
-    return out
+def uniform_control_cosine(en_vecs, vi_vecs):
+    """Fair uniform baseline: Expected Pairwise Cosine across all VI tokens.
+    This exactly mirrors the Expected Pairwise Cosine of the OT plan, but
+    substitutes the learned OT weights for a uniform distribution (1/N)."""
+    en_norms = np.linalg.norm(en_vecs, axis=1, keepdims=True) + 1e-12
+    vi_norms = np.linalg.norm(vi_vecs, axis=1, keepdims=True) + 1e-12
+    cos_matrix = (en_vecs @ vi_vecs.T) / (en_norms @ vi_norms.T)
+    # Uniform expected cosine: mean over the VI tokens (axis=1)
+    return cos_matrix.mean(axis=1)
 
 
 def diagnostic_anisotropy(example_dirs, seed=0, output_prefix="alignment_stats"):
+    # Note: seed is no longer needed for uniform control, but kept for compatibility with callers
     rng = np.random.default_rng(seed)
     ot_cos_all, control_cos_all = [], []
     skipped = 0
@@ -118,10 +120,10 @@ def diagnostic_anisotropy(example_dirs, seed=0, output_prefix="alignment_stats")
         sub_gamma = gamma[en_ans_rows, :]
 
         _, ot_cos = ot_weighted_stats(en_vecs, vi_vecs, sub_gamma)
-        control_cos = random_control_cosine(en_vecs, vi_vecs, rng)
+        control_cos = uniform_control_cosine(en_vecs, vi_vecs)
 
-        ot_cos_all.extend(ot_cos.tolist())
-        control_cos_all.extend(control_cos.tolist())
+        ot_cos_all.append(ot_cos.mean())
+        control_cos_all.append(control_cos.mean())
 
     if skipped:
         print(f"[warn] Skipped {skipped}/{len(example_dirs)} examples for anisotropy check.")
@@ -132,45 +134,43 @@ def diagnostic_anisotropy(example_dirs, seed=0, output_prefix="alignment_stats")
 
     csv_path = f"{output_prefix}_anisotropy.csv"
     with open(csv_path, 'w') as f:
-        f.write("ot_weighted_cosine,random_control_cosine\n")
+        f.write("ot_weighted_cosine,uniform_control_cosine\n")
         for a, b in zip(ot_cos_all, control_cos_all):
             f.write(f"{a},{b}\n")
     print(f"Saved anisotropy control raw values to {csv_path}")
 
-    print(f"\n=== (1) Anisotropy control (n={n} answer tokens) ===")
+    print(f"\n=== (1) Anisotropy control (n={n} examples) ===")
     print(f"OT-weighted correspondence cosine: mean={ot_cos_all.mean():.4f}, "
           f"std={ot_cos_all.std():.4f}")
-    print(f"Random-VI-token control cosine:    mean={control_cos_all.mean():.4f}, "
+    print(f"Uniform-VI-token control cosine:    mean={control_cos_all.mean():.4f}, "
           f"std={control_cos_all.std():.4f}")
     diff = ot_cos_all - control_cos_all
-    print(f"Difference (OT-weighted - random control): mean={diff.mean():.4f}, "
+    print(f"Difference (OT-weighted - uniform control): mean={diff.mean():.4f}, "
           f"std={diff.std():.4f}")
     try:
         from scipy import stats
         if n >= 2:
             t_stat, t_p = stats.ttest_rel(ot_cos_all, control_cos_all)
-            print(f"Paired t-test (OT-weighted vs. random control): t={t_stat:.3f}, p={t_p:.4g}")
+            print(f"Paired t-test (OT-weighted vs. uniform control): t={t_stat:.3f}, p={t_p:.4g}")
     except ImportError:
         print("[note] Install scipy for a significance test here.")
 
     if abs(diff.mean()) < 0.01:
         print("[interpretation] OT-weighted cosine is barely distinguishable from "
-              "a RANDOM Vietnamese token in the same sentence. This strongly "
-              "suggests the ~0.99 angular-alignment number is dominated by "
-              "embedding-space anisotropy, not real cross-lingual correspondence "
-              "— it would be misleading to cite it as evidence of alignment.")
+              "a UNIFORM Vietnamese centroid in the same sentence. This strongly "
+              "suggests the angular-alignment number is dominated by "
+              "anisotropy (the 'cone effect') rather than meaningful alignment.")
     elif diff.mean() > 0:
-        print(f"[interpretation] OT-weighted cosine is meaningfully higher than "
-              f"the random-token control (by {diff.mean():.4f} on average), so "
-              f"the correspondence does carry some real signal above the "
-              f"anisotropy floor — worth reporting alongside the raw cosine value.")
+        print(f"[interpretation] OT-weighted alignment is substantially HIGHER than "
+              f"the uniform-token control (by {diff.mean():.4f} on average), so "
+              f"it is learning a true fine-grained correspondence beyond mere "
+              f"sentence-level anisotropy.")
     else:
-        print(f"[interpretation] OT-weighted cosine is meaningfully LOWER than "
-              f"the random-token control (by {abs(diff.mean()):.4f} on average) "
-              f"— the OT-predicted VI counterpart is actually LESS similar in "
-              f"direction than a random token, which is unexpected and worth "
-              f"investigating (e.g. check whether gamma/sinkhorn is well-behaved, "
-              f"not just near-uniform or degenerate).")
+        print(f"[interpretation] OT-weighted alignment is LOWER than "
+              f"the uniform-token control (by {abs(diff.mean()):.4f} on average) "
+              f"-- meaning the OT plan actively points in a WORSE (less aligned) "
+              f"direction than a uniform centroid, which is unexpected and worth "
+              f"investigating.")
 
 
 def diagnostic_layers(example_dirs, output_prefix="alignment_stats"):
