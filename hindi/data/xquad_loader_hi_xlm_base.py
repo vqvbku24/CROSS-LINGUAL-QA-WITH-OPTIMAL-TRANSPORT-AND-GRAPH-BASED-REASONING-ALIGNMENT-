@@ -214,8 +214,10 @@ class XQuADDatasetHI(Dataset):
 # Collate fn
 # ──────────────────────────────────────────────────────────────
 
-def xquad_hi_collate_fn(batch: list, pad_id: int = 1) -> dict:
+def xquad_hi_collate_fn(batch: list) -> dict:
     """Pad EN and HI independently to batch-max length."""
+    PAD_ID = 1  # XLM-R pad token id
+
     def _pad(tensors, pad_val):
         max_len = max(t.size(0) for t in tensors)
         return torch.stack([
@@ -225,13 +227,13 @@ def xquad_hi_collate_fn(batch: list, pad_id: int = 1) -> dict:
         ])
 
     return {
-        'en_input_ids':       _pad([b['en_input_ids']      for b in batch], pad_id),
+        'en_input_ids':       _pad([b['en_input_ids']      for b in batch], PAD_ID),
         'en_attention_mask':  _pad([b['en_attention_mask']  for b in batch], 0),
         'en_start_positions': torch.stack([b['en_start_positions'] for b in batch]),
         'en_end_positions':   torch.stack([b['en_end_positions']   for b in batch]),
         'en_question_end':    torch.stack([b['en_question_end']    for b in batch]),
         'en_is_answerable':   torch.ones(len(batch), dtype=torch.long),  # XQuAD fully answerable
-        'hi_input_ids':       _pad([b['hi_input_ids']       for b in batch], pad_id),
+        'hi_input_ids':       _pad([b['hi_input_ids']       for b in batch], PAD_ID),
         'hi_attention_mask':  _pad([b['hi_attention_mask']   for b in batch], 0),
         'hi_question_end':    torch.stack([b['hi_question_end']    for b in batch]),
     }
@@ -274,11 +276,6 @@ def create_xquad_hi_dataloaders(
         val_ids   = {p['id'] for p in val_pairs}
         assert len(train_ids & val_ids) == 0, "Data leakage: val IDs found in train split"
 
-    if tokenizer.pad_token_id is None:
-        raise ValueError("Tokenizer must have a valid pad_token_id defined.")
-    pad_id = tokenizer.pad_token_id
-    collate = lambda b: xquad_hi_collate_fn(b, pad_id=pad_id)
-
     train_ds = XQuADDatasetHI(train_pairs, tokenizer, max_length=max_length)
     val_ds   = XQuADDatasetHI(val_pairs,   tokenizer, max_length=max_length)
 
@@ -286,7 +283,7 @@ def create_xquad_hi_dataloaders(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=collate,
+        collate_fn=xquad_hi_collate_fn,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=False,
@@ -295,7 +292,7 @@ def create_xquad_hi_dataloaders(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=collate,
+        collate_fn=xquad_hi_collate_fn,
         num_workers=num_workers,
         pin_memory=False,
         drop_last=False,

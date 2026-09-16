@@ -187,13 +187,15 @@ class XQuADDataset(Dataset):
 # Collate fn: pad EN and VI independently to batch-max length
 # ──────────────────────────────────────────────────────────────
 
-def xquad_collate_fn(batch: list[dict], pad_id: int = 1) -> dict:
+def xquad_collate_fn(batch: list[dict]) -> dict:
     """
     Pad EN and VI sequences independently to their own batch-max length.
     L_en and L_vi will differ within a batch — that's expected.
 
-    pad_id defaults to 1 (XLM-R) or 0 (mmBERT).
+    Padding token id = 1 (XLM-R pad token).
     """
+    PAD_ID = 1  # XLM-R pad token id
+
     def _pad_field(tensors: list[torch.Tensor], pad_val: int) -> torch.Tensor:
         """Right-pad 1D tensors to the max length in the list."""
         max_len = max(t.size(0) for t in tensors)
@@ -205,9 +207,9 @@ def xquad_collate_fn(batch: list[dict], pad_id: int = 1) -> dict:
             padded.append(t)
         return torch.stack(padded, dim=0)
 
-    en_ids  = _pad_field([b["en_input_ids"]      for b in batch], pad_id)
+    en_ids  = _pad_field([b["en_input_ids"]      for b in batch], PAD_ID)
     en_mask = _pad_field([b["en_attention_mask"]  for b in batch], 0)
-    vi_ids  = _pad_field([b["vi_input_ids"]       for b in batch], pad_id)
+    vi_ids  = _pad_field([b["vi_input_ids"]       for b in batch], PAD_ID)
     vi_mask = _pad_field([b["vi_attention_mask"]  for b in batch], 0)
 
     return {
@@ -277,11 +279,6 @@ def create_xquad_dataloaders(
     val_ids   = {p["id"] for p in val_pairs}
     assert len(train_ids & val_ids) == 0, "Data leakage: val IDs found in train split"
 
-    if tokenizer.pad_token_id is None:
-        raise ValueError("Tokenizer must have a valid pad_token_id defined.")
-    pad_id = tokenizer.pad_token_id
-    collate = lambda b: xquad_collate_fn(b, pad_id=pad_id)
-
     train_ds = XQuADDataset(train_pairs, tokenizer, max_length=max_length)
     val_ds   = XQuADDataset(val_pairs,   tokenizer, max_length=max_length)
 
@@ -289,7 +286,7 @@ def create_xquad_dataloaders(
         train_ds,
         batch_size=batch_size,
         shuffle=True,           # train: shuffled
-        collate_fn=collate,
+        collate_fn=xquad_collate_fn,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=False,
@@ -299,7 +296,7 @@ def create_xquad_dataloaders(
         val_ds,
         batch_size=batch_size,
         shuffle=False,          # val: fixed order always
-        collate_fn=collate,
+        collate_fn=xquad_collate_fn,
         num_workers=num_workers,
         pin_memory=False,
         drop_last=False,

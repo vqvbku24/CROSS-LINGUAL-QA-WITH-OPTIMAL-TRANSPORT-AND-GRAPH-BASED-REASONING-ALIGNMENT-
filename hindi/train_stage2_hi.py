@@ -126,6 +126,10 @@ def load_stage1_checkpoint(ckpt_path, model, criterion, device):
     get_model(model).load_state_dict(ckpt['model_state'], strict=False)
     criterion.load_state_dict(ckpt['criterion_state'])
     log.info('  Stage 1 weights loaded')
+    ckpt_target_layers = ckpt.get('target_layers', None)
+    if ckpt_target_layers is not None and hasattr(get_model(model), 'target_layers'):
+        get_model(model).target_layers = ckpt_target_layers
+        log.info(f'  Target layers synced from Stage 1 checkpoint: {ckpt_target_layers}')
     en_em_baseline = ckpt.get('em', None)
     if en_em_baseline is not None:
         log.info(f'  Stage 1 EN EM (from checkpoint): {en_em_baseline:.2f}%')

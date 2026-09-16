@@ -5,7 +5,7 @@ import numpy as np
 def main():
     plt.rcParams['font.family'] = 'serif'
     plt.rcParams['font.serif'] = ['Times New Roman']
-    plt.rcParams['font.size'] = 14
+    plt.rcParams['font.size'] = 18
 
     epochs = np.arange(1, 7)
     
@@ -21,7 +21,7 @@ def main():
     axes[0].plot(epochs, static_m, marker='s', markersize=8, linewidth=2.5, color='#d62728', label='Static (m=1.0)')
     axes[0].set_xlabel('Epoch', fontweight='bold')
     axes[0].set_ylabel(r'Margin Coefficient $m(\epsilon)$', fontweight='bold')
-    axes[0].set_title('Static Strategy', fontweight='bold', fontsize=16)
+    axes[0].set_title('Static Strategy', fontweight='bold', fontsize=20)
     axes[0].set_ylim(0.2, 1.1)
     axes[0].set_xticks(epochs)
     axes[0].grid(True, linestyle='--', alpha=0.6)
@@ -31,7 +31,7 @@ def main():
     axes[1].plot(epochs, annealed_m, marker='o', markersize=8, linewidth=2.5, color='#1f77b4', label='Annealed (Dynamic)')
     axes[1].set_xlabel('Epoch', fontweight='bold')
     axes[1].set_ylabel(r'Margin Coefficient $m(\epsilon)$', fontweight='bold')
-    axes[1].set_title('Dynamic Boundary-Regularization', fontweight='bold', fontsize=16)
+    axes[1].set_title('Dynamic Boundary-Regularization', fontweight='bold', fontsize=20)
     axes[1].set_ylim(0.2, 1.1)
     axes[1].set_xticks(epochs)
     axes[1].grid(True, linestyle='--', alpha=0.6)

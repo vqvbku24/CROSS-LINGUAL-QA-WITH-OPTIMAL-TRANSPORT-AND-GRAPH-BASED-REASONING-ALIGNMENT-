@@ -55,7 +55,6 @@ log = logging.getLogger(__name__)
 STAGE2_CONFIG = {
     "stage1_ckpt"     : "checkpoints/stage1_squad_best.pt",
     "model_name"      : "xlm-roberta-base",
-    "target_layers"   : None,
 
     # Loss weights
     "lambda_ot"       : 0.5,
@@ -123,11 +122,6 @@ def load_stage1_checkpoint(ckpt_path: str, model, criterion, device: torch.devic
     get_model(model).load_state_dict(ckpt["model_state"], strict=False)
     criterion.load_state_dict(ckpt["criterion_state"])
     log.info("  Stage 1 weights loaded (model base + criterion/QA head)")
-
-    ckpt_target_layers = ckpt.get("target_layers", None)
-    if ckpt_target_layers is not None and hasattr(get_model(model), "target_layers"):
-        get_model(model).target_layers = ckpt_target_layers
-        log.info(f"  Target layers synced from Stage 1 checkpoint: {ckpt_target_layers}")
 
     en_em_baseline = ckpt.get("em", None)
     if en_em_baseline is not None:
@@ -437,10 +431,7 @@ def run_stage2(config: dict):
     from phase2_model.model_core import CrossLingualOTModel
     from phase3_loss.losses import OTAlignmentLoss, Stage2Loss
 
-    model = CrossLingualOTModel(
-        model_name=config["model_name"],
-        target_layers=config.get("target_layers"),
-    ).to(device)
+    model = CrossLingualOTModel(model_name=config["model_name"]).to(device)
     criterion = OTAlignmentLoss(
         hidden_size=get_model(model).hidden_size,
     ).to(device)
@@ -477,10 +468,6 @@ def run_stage2(config: dict):
 
     # ── Tokenizer ────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(config["model_name"], use_fast=True)
-    if tokenizer.pad_token_id is None:
-        raise ValueError(f"[Fail-Fast] Tokenizer for '{config['model_name']}' has no pad_token_id defined.")
-    if tokenizer.sep_token_id is None and tokenizer.eos_token_id is not None:
-        tokenizer.sep_token_id = tokenizer.eos_token_id
 
     # ── Compute EN EM baseline (if not in checkpoint) ───────────
     if en_em_baseline is None:
@@ -919,8 +906,6 @@ def parse_args() -> dict:
     parser.add_argument("--stage1_ckpt",    default=STAGE2_CONFIG["stage1_ckpt"],
                         help="Path to Stage 1 checkpoint (default: checkpoint/best.pt)")
     parser.add_argument("--model_name",     default=STAGE2_CONFIG["model_name"])
-    parser.add_argument("--target_layers",  nargs="+", type=int, default=None,
-                        help="Custom target layers (default: auto-detected or synced from Stage 1 ckpt)")
     parser.add_argument("--batch_size",     type=int,   default=STAGE2_CONFIG["batch_size"])
     parser.add_argument("--max_epochs",     type=int,   default=STAGE2_CONFIG["max_epochs"])
     parser.add_argument("--stage2_head_lr", type=float, default=STAGE2_CONFIG["stage2_head_lr"])

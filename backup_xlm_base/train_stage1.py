@@ -57,22 +57,13 @@ def run_stage1(config):
         log.info(f"Starting Stage 1 on {device} (DDP world_size={world_size})")
     
     tokenizer = AutoTokenizer.from_pretrained(config["model_name"], use_fast=True)
-    if tokenizer.pad_token_id is None:
-        raise ValueError(f"[Fail-Fast] Tokenizer for '{config['model_name']}' has no pad_token_id defined.")
-    if tokenizer.sep_token_id is None and tokenizer.eos_token_id is not None:
-        tokenizer.sep_token_id = tokenizer.eos_token_id
-
     dataset = SquadDatasetStage1(config["squad_file"], tokenizer, max_length=384, doc_stride=128)
 
     sampler = DistributedSampler(dataset, shuffle=True)
     loader = DataLoader(dataset, batch_size=config["batch_size"], shuffle=False, sampler=sampler, num_workers=2, pin_memory=True)
     
     # Model (compute_cost_matrix=False for speed)
-    model = CrossLingualOTModel(
-        model_name=config["model_name"],
-        compute_cost_matrix=False,
-        target_layers=config.get("target_layers"),
-    ).to(device)
+    model = CrossLingualOTModel(model_name=config["model_name"], compute_cost_matrix=False).to(device)
     model = DDP(model, device_ids=[local_rank])
     
     # Loss — OT/span/cons đều tắt (λ=0), chỉ L_qa + L_has_ans hoạt động.
@@ -182,20 +173,12 @@ def run_stage1(config):
             # Save best model
             if em >= best_em:
                 best_em = em
-                if config.get("checkpoint_name"):
-                    ckpt_name = config["checkpoint_name"]
-                elif "mmbert" in config["model_name"].lower():
-                    ckpt_name = "stage1_squad_best_mmbert.pt"
-                else:
-                    ckpt_name = "stage1_squad_best.pt"
-                save_path = os.path.join(config["root_dir"], "checkpoints", ckpt_name)
+                save_path = os.path.join(config["root_dir"], "checkpoints", "stage1_squad_best.pt")
                 torch.save({
                     "epoch": epoch,
                     "model_state": get_model(model).state_dict(),
                     "criterion_state": criterion.state_dict(),
                     "em": em,
-                    "model_name": config["model_name"],
-                    "target_layers": get_model(model).target_layers,
                 }, save_path)
                 log.info(f"🏆 Saved best Stage 1 checkpoint to {save_path} (EM: {em:.2f}%)")
 
@@ -203,9 +186,6 @@ def run_stage1(config):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="xlm-roberta-base", help="Pretrained model name or path")
-    parser.add_argument("--target_layers", nargs="+", type=int, default=None, help="Custom target layer indices")
-    parser.add_argument("--checkpoint_name", type=str, default="", help="Custom output checkpoint filename")
     parser.add_argument("--epochs", "--epoch", dest="epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-5)
@@ -215,9 +195,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     config = {
-        "model_name": args.model_name,
-        "target_layers": args.target_layers,
-        "checkpoint_name": args.checkpoint_name,
+        "model_name": "xlm-roberta-base",
         "squad_file": os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset/Squad2.0/train-v2.0.json"),
         "root_dir": os.path.dirname(os.path.abspath(__file__)),
         "batch_size": args.batch_size,
