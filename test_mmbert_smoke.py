@@ -122,6 +122,7 @@ def run_smoke_tests(model_name: str = "jhu-clsp/mmBERT-base", device_str: str = 
             "en_end_position": torch.tensor([7, 10], dtype=torch.long, device=device),
             "en_question_end": torch.tensor([4, 4], dtype=torch.long, device=device),
             "vi_question_end": torch.tensor([4, 4], dtype=torch.long, device=device),
+            "en_is_answerable": torch.tensor([1, 1], dtype=torch.long, device=device),
         }
         # Add some padding to test dynamic truncation
         dummy_batch["en_attention_mask"][:, 25:] = 0
@@ -204,18 +205,21 @@ def run_smoke_tests(model_name: str = "jhu-clsp/mmBERT-base", device_str: str = 
             lambda_cons=0.0,
         ).to(device)
 
-        # Forward on EN branch
+        # Forward on EN branch (matching train_stage1.py)
         out_s1 = model_s1(dummy_batch, branch="en")
-        s1_loss_dict = criterion_s1(
-            H_en=out_s1["hidden"],
-            H_vi=None,
-            batch=dummy_batch,
-            step=1,
-            en_pad_mask=out_s1["en_pad_mask"],
-            model_outputs=None,
-        )
+        T_en = out_s1["hidden"].size(1)
+        # Dummy VI tensors must have enough tokens for vi_question_end (=4)
+        T_vi_dummy = max(T_en, int(dummy_batch["vi_question_end"].max().item()) + 1)
+        model_outputs_s1 = {
+            "en_hidden": out_s1["hidden"],
+            "vi_hidden": torch.zeros(B, T_vi_dummy, model_s1.hidden_size, device=device),
+            "en_pad_mask": out_s1["en_pad_mask"],
+            "vi_pad_mask": torch.ones(B, T_vi_dummy, dtype=torch.bool, device=device),
+            "cost_matrix": torch.zeros(B, T_en, T_vi_dummy, device=device),
+        }
+        s1_loss_dict = criterion_s1(model_outputs_s1, dummy_batch)
 
-        total_loss = s1_loss_dict["total_loss"]
+        total_loss = s1_loss_dict["total"]
         print(f"  ✓ Stage 1 forward passed. Total Loss: {total_loss.item():.4f}")
 
         # Backward pass
@@ -253,19 +257,11 @@ def run_smoke_tests(model_name: str = "jhu-clsp/mmBERT-base", device_str: str = 
         ).to(device)
 
         out_s2 = model_s2(dummy_batch, branch="both")
-        s2_loss_dict = criterion_s2(
-            H_en=out_s2["en_hidden"],
-            H_vi=out_s2["vi_hidden"],
-            batch=dummy_batch,
-            step=1,
-            en_pad_mask=out_s2["en_pad_mask"],
-            vi_pad_mask=out_s2["vi_pad_mask"],
-            model_outputs=out_s2,
-        )
+        s2_loss_dict = criterion_s2(out_s2, dummy_batch)
 
-        total_loss_s2 = s2_loss_dict["total_loss"]
+        total_loss_s2 = s2_loss_dict["total"]
         print(f"  ✓ Stage 2 forward passed. Total Loss: {total_loss_s2.item():.4f} "
-              f"(L_ot: {s2_loss_dict['loss_ot'].item():.4f}, L_qa: {s2_loss_dict['loss_qa'].item():.4f})")
+              f"(L_ot: {s2_loss_dict['ot'].item():.4f}, L_qa: {s2_loss_dict['qa'].item():.4f})")
 
         # Backward pass
         total_loss_s2.backward()

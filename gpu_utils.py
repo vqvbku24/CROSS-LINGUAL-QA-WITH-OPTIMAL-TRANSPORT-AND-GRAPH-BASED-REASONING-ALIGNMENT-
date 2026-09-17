@@ -20,11 +20,19 @@ def setup_ddp():
     Returns (local_rank, world_size).
     """
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+            os.environ.setdefault("RANK", "0")
+            os.environ.setdefault("WORLD_SIZE", "1")
+            os.environ.setdefault("LOCAL_RANK", "0")
+            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            os.environ.setdefault("MASTER_PORT", "29500")
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = dist.get_world_size()
-    torch.cuda.set_device(local_rank)
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
 
     if local_rank == 0:
         log.info(f"DDP initialized: world_size={world_size}")

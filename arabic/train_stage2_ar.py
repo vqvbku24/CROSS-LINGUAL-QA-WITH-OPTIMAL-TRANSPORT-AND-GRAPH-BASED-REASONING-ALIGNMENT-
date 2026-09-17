@@ -157,6 +157,40 @@ def save_stage2_checkpoint(path, epoch, global_step, model, criterion, optimizer
     log.info(f'  Checkpoint saved: {path}')
 
 
+def upload_checkpoint_to_hf(ckpt_path: str, config: dict):
+    if not is_main_process() or not config.get('hf_repo_id'):
+        return
+    token = os.environ.get('HF_TOKEN')
+    if not token:
+        token_file = os.path.join(config.get('root_dir', '.'), '.hf_token')
+        if os.path.exists(token_file):
+            try:
+                with open(token_file, 'r', encoding='utf-8') as f:
+                    token = f.read().strip()
+            except Exception:
+                pass
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=token)
+        try:
+            rel_dir = os.path.relpath(config['output_dir'], config.get('root_dir', '.'))
+            if rel_dir.startswith('..'):
+                rel_dir = os.path.basename(os.path.normpath(config['output_dir']))
+        except Exception:
+            rel_dir = os.path.basename(os.path.normpath(config['output_dir']))
+        path_in_repo = os.path.join(rel_dir, os.path.basename(ckpt_path)).replace('\\', '/')
+        log.info(f'  [HF Hub] Uploading {os.path.basename(ckpt_path)} -> {path_in_repo} ({config["hf_repo_id"]})...')
+        api.upload_file(
+            path_or_fileobj=ckpt_path,
+            path_in_repo=path_in_repo,
+            repo_id=config['hf_repo_id'],
+            repo_type='model',
+        )
+        log.info(f'  [HF Hub] ✅ Uploaded successfully: {path_in_repo}')
+    except Exception as e:
+        log.error(f'  [HF Hub] ⚠ Upload checkpoint error (local file still safe): {e}')
+
+
 def compute_en_em_baseline(model, criterion, tokenizer, config, device):
     import importlib.util
     eval_file = os.path.join(config['root_dir'], 'phase4-evaluation', 'quick_eval.py')
@@ -612,21 +646,25 @@ def run_stage2_ar(config: dict):
             if epoch % config['save_every'] == 0:
                 ckpt_out = os.path.join(config['output_dir'], f'stage2_ar_epoch_{epoch:03d}.pt')
                 save_stage2_checkpoint(ckpt_out, epoch, global_step, model, criterion, optimizer, scheduler, config, ar_em, best_ar_em, patience_count)
+                if config.get('hf_repo_id'):
+                    upload_checkpoint_to_hf(ckpt_out, config)
 
-            # Early stopping
-            if epoch >= 4:
-                if ar_em > best_ar_em + config['min_delta_em']:
-                    best_ar_em     = ar_em
-                    patience_count = 0
-                    best_path = os.path.join(config['output_dir'], 'stage2_ar_best.pt')
-                    save_stage2_checkpoint(best_path, epoch, global_step, model, criterion, optimizer, scheduler, config, ar_em, best_ar_em, patience_count)
-                    log.info(f'  ★ New best AR EM={ar_em:.2f}% — saved {best_path}')
-                else:
-                    patience_count += 1
-                    log.info(f'  No improvement. Patience {patience_count}/{config["patience"]}')
-                    if patience_count >= config['patience']:
-                        log.info(f'Early stopping at epoch {epoch} — best AR EM={best_ar_em:.2f}%')
-                        should_break = True
+            # Best checkpoint tracking & Early stopping
+            is_new_best = ar_em > best_ar_em + config['min_delta_em']
+            best_path = os.path.join(config['output_dir'], 'stage2_ar_best.pt')
+            if is_new_best or not os.path.exists(best_path):
+                best_ar_em     = max(ar_em, best_ar_em)
+                patience_count = 0
+                save_stage2_checkpoint(best_path, epoch, global_step, model, criterion, optimizer, scheduler, config, ar_em, best_ar_em, patience_count)
+                log.info(f'  ★ New best AR EM={ar_em:.2f}% — saved {best_path}')
+                if config.get('hf_repo_id'):
+                    upload_checkpoint_to_hf(best_path, config)
+            elif epoch >= 4:
+                patience_count += 1
+                log.info(f'  No improvement. Patience {patience_count}/{config["patience"]}')
+                if patience_count >= config['patience']:
+                    log.info(f'Early stopping at epoch {epoch} — best AR EM={best_ar_em:.2f}%')
+                    should_break = True
             else:
                 log.info(f'  Epoch {epoch} < 4. Early stopping monitoring suspended.')
 

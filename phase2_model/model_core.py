@@ -107,6 +107,8 @@ class CrossLingualOTModel(nn.Module):
             )
 
         self.backbone.hidden_size = self.hidden_size
+        if hasattr(self.backbone, "config"):
+            self.backbone.config.output_hidden_states = True
         self.backbone.print_trainable_parameters()
 
     # ──────────────────────────────────────────────────────────
@@ -134,7 +136,11 @@ class CrossLingualOTModel(nn.Module):
             branch="vi":   dict with hidden, vi_pad_mask, vi_seq_len
         """
         if branch == "en":
-            out = self.backbone(batch["en_input_ids"], batch["en_attention_mask"])
+            out = self.backbone(
+                input_ids=batch["en_input_ids"],
+                attention_mask=batch["en_attention_mask"],
+                output_hidden_states=True,
+            )
             stacked = torch.stack([out.hidden_states[i] for i in self.target_layers], dim=0)
             weights = torch.softmax(self.layer_weights, dim=0).view(len(self.target_layers), 1, 1, 1)
             H = (stacked * weights).sum(dim=0)
@@ -142,7 +148,11 @@ class CrossLingualOTModel(nn.Module):
             return {"hidden": H, "en_pad_mask": pad_mask}
 
         if branch == "vi":
-            out = self.backbone(batch["vi_input_ids"], batch["vi_attention_mask"])
+            out = self.backbone(
+                input_ids=batch["vi_input_ids"],
+                attention_mask=batch["vi_attention_mask"],
+                output_hidden_states=True,
+            )
             stacked = torch.stack([out.hidden_states[i] for i in self.target_layers], dim=0)
             weights = torch.softmax(self.layer_weights, dim=0).view(len(self.target_layers), 1, 1, 1)
             H = (stacked * weights).sum(dim=0)
@@ -151,8 +161,16 @@ class CrossLingualOTModel(nn.Module):
 
         # ── branch="both" — Stage 1 behavior (unchanged) ────────────────
         # ── 1. Shared Backbone ─────────────────────────────────────
-        out_en = self.backbone(batch["en_input_ids"], batch["en_attention_mask"])
-        out_vi = self.backbone(batch["vi_input_ids"], batch["vi_attention_mask"])
+        out_en = self.backbone(
+            input_ids=batch["en_input_ids"],
+            attention_mask=batch["en_attention_mask"],
+            output_hidden_states=True,
+        )
+        out_vi = self.backbone(
+            input_ids=batch["vi_input_ids"],
+            attention_mask=batch["vi_attention_mask"],
+            output_hidden_states=True,
+        )
 
         # ── 2. Mix Intermediate Layers ─────────────────────────────
         stacked_en = torch.stack([out_en.hidden_states[i] for i in self.target_layers], dim=0)

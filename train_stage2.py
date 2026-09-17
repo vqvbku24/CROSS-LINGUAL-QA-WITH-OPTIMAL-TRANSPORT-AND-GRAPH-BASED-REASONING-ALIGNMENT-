@@ -433,6 +433,25 @@ def run_stage2(config: dict):
 
     os.makedirs(config["output_dir"], exist_ok=True)
 
+    # ── 1. Inspect Stage 1 checkpoint metadata ───────────────────
+    ckpt_path = config["stage1_ckpt"]
+    if not os.path.isabs(ckpt_path):
+        ckpt_path = os.path.join(config["root_dir"], ckpt_path)
+
+    if os.path.exists(ckpt_path):
+        try:
+            ckpt_meta = torch.load(ckpt_path, map_location="cpu")
+            if "model_name" in ckpt_meta and config.get("model_name") == STAGE2_CONFIG["model_name"]:
+                config["model_name"] = ckpt_meta["model_name"]
+                if is_main_process():
+                    log.info(f"Auto-detected model_name from Stage 1 checkpoint: {config['model_name']}")
+            if "target_layers" in ckpt_meta and config.get("target_layers") is None:
+                config["target_layers"] = ckpt_meta["target_layers"]
+                if is_main_process():
+                    log.info(f"Auto-detected target_layers from Stage 1 checkpoint: {config['target_layers']}")
+        except Exception as e:
+            log.warning(f"Could not pre-read checkpoint metadata: {e}")
+
     # ── Load model and criterion ─────────────────────────────────
     from phase2_model.model_core import CrossLingualOTModel
     from phase3_loss.losses import OTAlignmentLoss, Stage2Loss
@@ -445,11 +464,7 @@ def run_stage2(config: dict):
         hidden_size=get_model(model).hidden_size,
     ).to(device)
 
-    # ── 1. Load Stage 1 checkpoint (trước khi bọc LoRA, keys khớp 1-1) ───────────────
-    ckpt_path = config["stage1_ckpt"]
-    if not os.path.isabs(ckpt_path):
-        ckpt_path = os.path.join(config["root_dir"], ckpt_path)
-
+    # ── Load Stage 1 weights (trước khi bọc LoRA, keys khớp 1-1) ───
     en_em_baseline = load_stage1_checkpoint(ckpt_path, model, criterion, device)
 
     # ── 2. Apply LoRA ───────────────────────────────────────────────

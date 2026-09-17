@@ -2,41 +2,45 @@ import os
 from dotenv import load_dotenv
 from huggingface_hub import HfApi
 
+
 def main():
-    # Nạp biến môi trường từ .env
     load_dotenv()
+
     token = os.environ.get("HF_TOKEN")
     if not token:
-        print("❌ Không tìm thấy HF_TOKEN trong biến môi trường hoặc file .env")
+        print("❌ Không tìm thấy HF_TOKEN")
         return
-    
+
     api = HfApi(token=token)
+
     repo_id = "vinhvo1205/Sinkhorn_2_stages"
-    
-    # Các thư mục chứa checkpoint cần upload
-    folders_to_upload = [
-        "checkpoints"
-    ]
-    
-    print(f"Bắt đầu đồng bộ các checkpoints lên repo: {repo_id}")
-    
-    for folder in folders_to_upload:
-        if os.path.exists(folder) and os.path.isdir(folder):
-            print(f"\n➤ Đang upload thư mục '{folder}'...")
-            try:
-                api.upload_folder(
-                    folder_path=folder,
-                    path_in_repo=folder, # Upload vào đúng thư mục cùng tên trên HF Hub
-                    repo_id=repo_id,
-                    repo_type="model"
-                )
-                print(f"✅ Đã upload thành công thư mục '{folder}'")
-            except Exception as e:
-                print(f"❌ Lỗi khi upload '{folder}': {e}")
-        else:
-            print(f"\n⚠️ Thư mục '{folder}' không tồn tại trong máy, bỏ qua.")
-            
-    print("\n🎉 Đã hoàn tất quá trình kiểm tra và upload!")
+
+    local_file = "dataset/IndicSQuAD/train_hindi.json"
+    path_in_repo = "dataset/IndicSQuAD/train_hindi.json"
+
+    if not os.path.isfile(local_file):
+        print(f"❌ Không tìm thấy file: {local_file}")
+        return
+
+    print(f"➤ Đang upload: {local_file}")
+    print(f"➤ Repo: {repo_id}")
+    print(f"➤ Path trên HF: {path_in_repo}")
+
+    try:
+        api.upload_file(
+            path_or_fileobj=local_file,
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message="Upload IndicSQuAD Hindi training data",
+        )
+
+        print("✅ Upload thành công!")
+
+    except Exception as e:
+        print(f"❌ Upload thất bại:")
+        print(f"   {type(e).__name__}: {e}")
+
 
 if __name__ == "__main__":
     main()

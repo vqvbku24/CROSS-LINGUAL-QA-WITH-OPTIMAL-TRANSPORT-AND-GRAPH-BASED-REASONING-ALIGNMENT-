@@ -1,4 +1,4 @@
-﻿FROM pytorch/pytorch:2.12.1-cuda12.6-cudnn9-runtime
+FROM pytorch/pytorch:2.12.1-cuda12.6-cudnn9-runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git vim nano wget curl ca-certificates \
